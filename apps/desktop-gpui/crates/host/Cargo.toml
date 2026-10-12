@@ -18,7 +18,7 @@ thiserror = "2"
 # client, same versions as the app's.
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # Store answers too large to keep in memory wait in unlinked spool files.
 tempfile = "3"
 
@@ -31,7 +31,7 @@ libc = "0.2"
 # console-ctrl handler the binary's graceful shutdown uses). None of this
 # compiles into non-Windows builds.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
