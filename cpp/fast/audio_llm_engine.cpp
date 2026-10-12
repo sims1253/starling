@@ -1199,7 +1199,7 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
 bool AudioLlmEngine::Impl::alloc_static(std::string& err) {
     const size_t cache_elems = (size_t)NL * NKV * MAXPOS * HDIM;
     n_part = 0;
-    for (const GMat& g : head.parts) n_part += ceil_div(g.N, K.gemv_rows(g.N));
+    for (const GMat& g : head.parts) n_part += ceil_div(g.N, K.gemv_rows(g.N, g.K));
     auto mk = [&](vk::Buffer& b, size_t bytes, vk::Mem kind = vk::Mem::Device) {
         return ctx->create_buffer(b, bytes, kind, err);
     };
@@ -1321,7 +1321,7 @@ bool AudioLlmEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off,
         if (!K.gemv(rc, ar, g, x, vk::Ref(part), R(final_norm), vk::Ref(state),
                     head_bias.empty() ? vk::Ref() : R(head_bias[c]), 3, a, err))
             return false;
-        off += ceil_div(g.N, K.gemv_rows(g.N));
+        off += ceil_div(g.N, K.gemv_rows(g.N, g.K));
     }
     return true;
 }

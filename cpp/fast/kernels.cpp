@@ -182,6 +182,10 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
         gemv_tgt_wgs = ~0u;   // no adaptive growth
         gemv_min_wgs = 0;     // and no shrink-to-256-workgroups floor: rows=16
                               // measured best at N=2048 with just 128 WGs
+        // ...but at least 16 rows per row slot (rows 64 at K = 1024, 32 at
+        // K = 2048), kept at >= 64 workgroups: Qwen3-0.6B decode 39.8 ->
+        // 31.1 ms/step, MOSS 74.7 -> 72.6 (RESEARCH_LOG P4-2).
+        gemv_rpp_min = 16;
     } else if (ctx.info().vendor_id == 0x1002 && !tune_forced) {
         // AMD (measured on a RADV RENOIR iGPU, MOSS q4e8 decode): cap rows at
         // 16 with no growth — the grow-to-384-WGs rule took the big-N GEMVs
@@ -215,6 +219,7 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
             tile_pinned_ = true;
         }
     }
+    if (const char* e = std::getenv("STARLING_FAST_GEMV_RPP")) gemv_rpp_min = (uint32_t)std::atoi(e);
     if (const char* e = std::getenv("STARLING_FAST_GEMV_ROWS")) {
         unsigned r = (unsigned)std::atoi(e);
         if (r >= 8 && r % 8 == 0) {
@@ -312,7 +317,7 @@ bool Kernels::pk_conv(vk::Recording& rec, uint32_t op, const PkConvArgs& a, uint
     return true;
 }
 
-uint32_t Kernels::gemv_rows(uint32_t N) {
+uint32_t Kernels::gemv_rows(uint32_t N, uint32_t K) {
     uint32_t rows = gemv_rows_max;
     // Grow rows for large N: every workgroup re-reads the x vector once, so
     // at rows=8 the x traffic rivals the weights (ff_up: 12.6 MB x vs
@@ -325,13 +330,35 @@ uint32_t Kernels::gemv_rows(uint32_t N) {
     // stay in cache. Per-row math is unchanged.
     if (gemv_min_wgs > 256)
         while (rows > 4 && N / rows < gemv_min_wgs) rows -= 4;
+    // Rows-per-thread floor: a thread's fixed work (its x slice, the fused
+    // RMSNorm statistic, the shared-memory reduction) is amortized over
+    // rows / RSPLIT row dots, so small K (more row slots per workgroup)
+    // needs more rows. Never below 64 workgroups (the floor would starve
+    // the small-N projections of a 0.6B model: o/down at N = 1024).
+    if (gemv_rpp_min && K) {
+        const uint32_t floor_rows = gemv_rpp_min * gemv_rsplit_target(K / 32);
+        uint32_t r = std::max(rows, floor_rows);
+        while (r > rows && N / r < 64) r /= 2;
+        rows = std::max(rows, r);
+    }
     return rows;
+}
+
+const char* Kernels::gemv_shader(GpuFmt f) const {
+    return f == GpuFmt::W4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4") : f == GpuFmt::W8 ? "gemv_w8" : "gemv_f16";
+}
+
+uint32_t Kernels::gemv_rsplit_target(uint32_t lanes) const {
+    const uint32_t target = std::max(32u, ctx_->info().subgroup_size);
+    uint32_t rs = 1;
+    while (rs < 8 && lanes * rs < target) rs *= 2;
+    return rs;
 }
 
 bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x, vk::Ref y,
                    vk::Ref g, vk::Ref state, vk::Ref bias, uint32_t epi, GemvArgs a,
                    std::string& err) {
-    const char* name = w.fmt == GpuFmt::W4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4") : w.fmt == GpuFmt::W8 ? "gemv_w8" : "gemv_f16";
+    const char* name = gemv_shader(w.fmt);
     const uint32_t lanes = w.K / 32;      // one thread per 32-wide K group
     if (w.K % 32 || a.x_off % 4 || a.x_off2 % 4 || lanes > ctx_->info().max_wg_invocations ||
         lanes > 1024) {
@@ -339,7 +366,7 @@ bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x
         return false;
     }
     // Enough workgroups to fill the GPU: fewer rows per workgroup for small N.
-    uint32_t rows = gemv_rows(w.N);
+    uint32_t rows = gemv_rows(w.N, w.K);
     // Pad the workgroup to a full subgroup with parallel row slots: GPUs
     // issue whole subgroups, so lanes < subgroup_size strands issue slots
     // (W4 K=1024: ~7 GB/s at 32 threads, ~27 at 128 on PowerVR).
@@ -629,7 +656,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
         err = "STARLING_FAST_MICRO: alt/altx cannot be combined with the rows sweep";
         return false;
     }
-    if (!rows) rows = gemv_rows(n);
+    if (!rows) rows = gemv_rows(n, k);
     std::mt19937 rng(99);
     auto rnd = [&](size_t cnt) {
         std::vector<uint32_t> w(cnt);
@@ -653,8 +680,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (!up32(wq, wv.data(), qw * 4) || (sw && !up32(ws, sv.data(), sw * 4)) ||
         !up32(x, xf.data(), xf.size() * 4) || !up32(y, y0.data(), y0.size() * 4))
         return false;
-    const char* name = bits == 4 ? (m2 ? "gemv_w4um" : w4_unpack_ ? "gemv_w4u" : "gemv_w4")
-                      : bits == 8 ? "gemv_w8" : "gemv_f16";
+    const char* name = m2 ? "gemv_w4um" : gemv_shader(bits == 4 ? GpuFmt::W4 : bits == 8 ? GpuFmt::W8 : GpuFmt::F16);
     const uint32_t lanes = k / 32;
     GemvArgs ga;
     ga.N = n;
@@ -938,7 +964,7 @@ bool Kernels::autotune(std::string& err) {
     gemv_tgt_wgs = ~0u;   // candidates are pinned; growth would blur the sweep
     for (uint32_t rows : {8u, 16u, 32u, 64u}) {
         gemv_rows_max = rows;
-        const uint32_t r = gemv_rows(F);
+        const uint32_t r = gemv_rows(F, 0);
         const vk::Pipeline* p = ctx_->pipeline("gemv_w4", {D / 32, r, 0u, 0u, 0u, 1u, D / 32}, err);
         if (!p) return false;
         vk::Recording rec(*ctx_);
