@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """WER, speed and memory of quantized GGUFs for any Starling ASR engine.
 
-The model-agnostic sibling of benchmarks/wer_quant.py (Parakeet fixtures)
-and fast_engine/wer_engines.py (Parakeet/MOSS engine variants): every
-``label=path`` GGUF is transcribed in its own fresh process through the
-flat C API, over a clip directory written by fast_engine/export_fleurs.py
-(WAVs + refs.json). Per GGUF it reports corpus WER (benchmarks/wer.py
+The model-agnostic sibling of fast_engine/wer_engines.py (Parakeet/MOSS
+engine variants): every ``label=path`` GGUF is transcribed in its own fresh
+process through the flat C API, over a clip directory written by fast_engine/export_fleurs.py
+(WAVs + refs.json). Per GGUF it reports corpus WER (fast_engine/wer.py
 normalization), mean per-clip WER, wall time, real-time factor, load time,
 peak RSS and file size, and keeps every hypothesis in the JSON so two runs
-can be compared clip by clip (compare_wer.py).
+can be compared clip by clip (compare_wer.py). With STARLING_IMATRIX set,
+each process also collects an importance matrix (written at exit).
 
 Usage:
   wer_models.py --lib build/host/libstarling_ggml.so --model qwen3_06 \
