@@ -27,6 +27,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <thread>
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -478,17 +479,14 @@ std::unique_ptr<AudioLlmEngine::Impl> make_impl(Spec sp, const ggml::ModelLoader
     const double t_ctx = ms_since(t0);
     if (!I->K.init(*I->ctx, err)) return nullptr;
     const double t_kinit = ms_since(t0);
-    if (!I->load(ml, err)) return nullptr;
-    const double t_weights = ms_since(t0);
-    if (!I->alloc_static(err)) return nullptr;
+    if (!I->load(ml, err)) return nullptr;   // weights and the static buffers
     if (env_on("STARLING_FAST_FORCE_FAIL")) {   // tests: the ggml fallback after a full fast load
         err = "fast " + std::string(I->sp.tag) + ": forced failure (STARLING_FAST_FORCE_FAIL)";
         return nullptr;
     }
     if (env_on("STARLING_FAST_TIMING"))
-        std::fprintf(stderr, "[fast-%s] create: device %.1f ms, kernels %.1f ms, weights %.1f ms, "
-                             "static buffers %.1f ms\n", I->sp.tag, t_ctx, t_kinit - t_ctx,
-                     t_weights - t_kinit, ms_since(t0) - t_weights);
+        std::fprintf(stderr, "[fast-%s] create: device %.1f ms, kernels %.1f ms, weights+buffers %.1f ms\n",
+                     I->sp.tag, t_ctx, t_kinit - t_ctx, ms_since(t0) - t_kinit);
     return I;
 }
 } // namespace
@@ -1124,7 +1122,21 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         rope_tab = ar.add_f32(tab);
     }
     const double t_pack = ms_since(t_load0);
-    if (!ar.finalize(*ctx, err)) return false;
+    // The static buffers (KV caches: ~0.5 GB on Qwen3-0.6B) are created
+    // alongside the weight fill; the driver zeroes both allocations.
+    std::string serr;
+    bool static_ok = false;
+    std::thread st([&] {
+        try {
+            static_ok = alloc_static(serr);
+        } catch (const std::exception& e) {
+            serr = e.what();
+        }
+    });
+    const bool weights_ok = ar.finalize(*ctx, err);
+    st.join();
+    if (!weights_ok) return false;
+    if (!static_ok) { err = serr; return false; }
     if (env_on("STARLING_FAST_TIMING"))
         std::fprintf(stderr, "[fast-%s] load: plan %.1f ms, repack+upload %.1f ms\n", sp.tag, t_pack,
                      ms_since(t_load0) - t_pack);
