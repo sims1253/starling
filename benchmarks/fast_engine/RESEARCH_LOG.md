@@ -1090,3 +1090,75 @@ identical. (Three amdgpu compute-ring timeouts hit one host FLEURS batch
 mid-run — VK_ERROR_DEVICE_LOST for the remaining clips; a rerun of the
 same binary and clips was clean and is the one reported.) Energy was not measured: the phone was on AC power the whole
 session (the charge-counter method needs a discharging battery).
+
+## P5: encoder and prefill GEMMs on the Pixel 10 Pro (2026-10-12, branch gpu-gemm, #380)
+
+Goal: enc+prefill, the largest remaining gap after P4 (Qwen3-ASR-0.6B
+short: 1.14 s of a 2.16 s wall). Base: `t3/optimize-phone-model-serving`
+(da359585, then 46cb1a38 after fast-load merged). Protocol as P4 (screen
+off, shell wake hold, `flock`, interleaved rounds with the order reversed,
+medians); every keep is bit-exact and transcripts are identical on the
+phone and the host for all seven models.
+
+**Where enc+prefill went** (`STARLING_FAST_SKIP` label ablation, new;
+Qwen3-0.6B, base, short / medium ms): LLM linears 570 / 1321 (qkv, o,
+gate/up, down), encoder linears 222 / 465, conv2+conv3 199 / 490, LLM
+attention 103 / 305, encoder attention 35 / 57, norms ~0. Every GEMM ran
+at ~170–250 GFLOPS (LLM linears 196, encoder 169, conv 246 on the final
+build). Parakeet medium (2.0 s): feed forwards 1180 ms (58 %), q/k/v/o/pos
+277, pointwise convs 225, attention 142, depthwise conv + norms 15,
+subsampling 58.
+
+**What limits the GEMM** (`STARLING_FAST_MICRO` probes, new: `gemmx` times
+a prefill GEMM at a real shape with a CPU reference and a bitwise
+comparison; `alu2` prices register-operand FMAs; all probes now warm the
+GPU clock for 100 ms — the governor idles at 396 MHz and polls every 20 ms):
+
+| # | Probe / hypothesis | Result |
+| --- | --- | --- |
+| P5-1 | f32 peak: `alu` (immediate operands) at 48 groups said ~500 GFLOPS | 48 groups is under-occupied: 280+ groups reach **1.3–1.45 TFLOPS** (1536 FLOP/clk × 1.094 GHz = 1.68). The GEMMs sit at ~13 % of it. |
+| P5-2 | Register-operand FMAs (`alu2`, a 4×8 outer product per k) | 0.6–1.0 TFLOPS (noisy; 8×8 and constants a little higher). Not the limit. |
+| P5-3 | Ablate the GEMM itself (diagnostic builds): no tile loads / no shared reads in the product loop / neither | products alone ~330 GFLOPS, with loads 200; removing the shared reads from the product loop barely moved it (the compiler keeps them). |
+| P5-4 | The product loop with operands from shared memory (`alu2` modes 4/5, gemm.comp's addressing) | **~400 GFLOPS** with packed f16 pairs, ~300 with f32 words, vs 800–1000 on registers: the GEMM is bound by shared-memory reads in the product loop, and the tile loads + barriers take it from ~400 to ~200. |
+| P5-5 | f16 products: packed `fma(f16vec2)` (the RADV path) | −30 % (as in 2026-09). |
+| P5-6 | `dot(f16vec4)` with k-major shared tiles (one uvec2 per 4 k, 4× fewer product instructions; the `f16dot` probe says only 378 G MAC/s at full occupancy) | W4 ±, W8 +25 %, conv +15 % at BK 32 — less than P5-10, and not bit-exact (f16 accumulation per tile). discard |
+| P5-7 | f32 shared tiles (no unpack in the product loop) | −30 % (twice the shared bytes). discard |
+| P5-8 | Register double-buffering of the next tile (global loads issued before the products) | −15 % (down projection +20 %): the extra registers cost occupancy. discard |
+| P5-9 | Broadcast kernel: each thread owns whole weight columns, dequantizes its weights in registers, A broadcast from a tiny shared tile; with and without double-buffered A and prefetched weights | bit-exact, but 0.75–1.1× of the tile kernel at every shape (one session showed +25 % that did not reproduce). discard |
+| P5-10 | **Half-depth k-tiles (BK 32 → 16)**: half the shared tiles (10 → 5 KiB) and half the tile-load registers per thread | isolated W4 +3..+40 %, W8 +24..+43 %, conv +37 %; BK 8 gains less (more barriers). In context: Qwen3-0.6B enc+prefill −12 % short / −15.5 % medium, Parakeet encoder −20 %. Bit-exact (each output's k order is unchanged). **keep** (PowerVR default; BK is now a spec constant, `STARLING_FAST_BK`) |
+| P5-11 | Tile shapes at BK 16 (32,128,8,4 / 64,128,4,8 / 64,128,8,8 / 32,256,4,8 / 16,128,2,8 / 128,128,8,8@8) | isolated mixed (32,128,8,4 +4..20 % on W4, 64,128,4,8 +29 % on W8 gate/up); in context 32,128,8,4 −1.5 % medium / ±0 short, 64,128,4,8 +15 % and +24 % (Parakeet). discard |
+| P5-12 | Unorm-trick dequant in the tile loads (`unpackUnorm4x8`, the GEMV trick) | ± and not bit-exact (q/255 rounding). discard |
+| P5-13 | **Causal prefill attention**: skip score tiles above the diagonal, stop P·V at the last visible key | medium −1.9 %, short ±0 (S ≈ 112 is a handful of tiles). Bit-exact. **keep** |
+| P5-14 | Hoist the implicit-im2col divisions out of the conv k loop (cache the row decomposition per row parity) | +1.4 % (the cache costs registers). discard |
+| P5-15 | B as 4-bit codes in shared memory, dequantized per thread (`alu2` modes 6/7: half the product-loop shared bytes, 8 extra FMAs per k) | product loop ~490 vs ~410 GFLOPS (+20 %) with the f16 rounding kept — the remaining lever for the W4 linears, estimated +10–15 % in context; not built. |
+
+After P5-10/13 (Qwen3-0.6B short, 984 ms): LLM qkv 134, o 71, gate/up
+198, down 102, LLM attention 72, rope/KV 23, encoder linears 199, encoder
+attention 34, conv 136.
+
+Before → after on the phone (interleaved, same session; enc+prefill and
+wall per transcription, medians of 4; Voxtral 2 per clip and binary):
+
+| model | short enc+prefill | medium enc+prefill | short wall | medium wall |
+| --- | --- | --- | --- | --- |
+| Qwen3-ASR-0.6B q4e8 | 1142 → 983 ms | 2860 → 2388 ms | 2.16 → 1.99 s | 5.75 → 5.27 s |
+| Qwen3-ASR-1.7B q4e8-imx | 2405 → 2302 ms | 5947 → 5546 ms | 4.79 → 4.66 s | 12.60 → 12.31 s |
+| MOSS q4e8 | 3008 → 2743 ms | 7034 → 6342 ms | 5.09 → 4.83 s | 13.01 → 12.33 s |
+| ARK-0.6B q4k | 3389 → 2845 ms | 9951 → 8675 ms | 4.44 → 3.86 s | 13.13 → 11.83 s |
+| Granite dynq4 | 3726 → 3274 ms | 9622 → 7858 ms | 6.25 → 5.79 s | 15.04 → 13.24 s |
+| Voxtral q4k | 9.09 → 8.6 s | 18.2 → 16.5 s | 22.0 → 21.3 s | 54.6 → 51.9 s |
+| Parakeet (encoder) | 737 → 626 ms | 1996 → 1620 ms | 0.88 → 0.80 s | 2.22 → 1.86 s |
+
+Decode unchanged (same ms/token within ±1 %). RADV (host, base vs final,
+medians of 2 warm runs): enc+prefill −1 % to +3 % on all seven models
+(BK stays 32 there; only the causal skip applies), transcripts identical.
+In the same window the ggml CPU engine (6 threads) took 3.5 s short and
+11–14.5 s medium wall on Qwen3-0.6B — far slower than the ~0.6 s CPU
+prefill quoted from earlier sessions, so CPU contention from other phone
+work is likely and that comparison needs a quiet re-measurement. Energy
+was not measured (phone on AC).
+
+Remaining levers, in order: P5-15 (4-bit B tiles, the LLM and encoder W4
+linears are ~70 % of Qwen3 enc+prefill); a flash-style fused prefill
+attention (LLM attention + RoPE/KV ~10 %); ARK's 32-layer global-attention
+Whisper encoder (enc+prefill 2.8 / 8.7 s) deserves its own ablation.

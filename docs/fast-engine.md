@@ -39,8 +39,9 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR and AMD, which otherwise ship measured defaults) |
 | `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR and AMD) |
 | `STARLING_FAST_W8U=0/1` | W8 decode GEMVs through xor 0x80 + `unpackUnorm4x8` (default on for PowerVR) |
-| `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |
-| `STARLING_FAST_TILE=BM,BN,TM,TN` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile / GEMV rows |
+| `STARLING_FAST_MICRO=...` | run isolated kernel probes at load, `;`-separated (`bits,N,K[,reps[,rows]]` GEMV, `gemmx,M,N,K,kind,...` prefill GEMM, `norm,...`, `alu,...`, `alu2,...`, `idot,...`; see `Kernels::micro`) |
+| `STARLING_FAST_TILE=BM,BN,TM,TN[,BK]` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile (BK: k per tile, 32/16/8) / GEMV rows |
+| `STARLING_FAST_BK=8/16/32` | GEMM k-tile depth only (default 16 on PowerVR, 32 elsewhere) |
 | `STARLING_FAST_GEMV_RPP=n` | minimum GEMV rows per row slot, kept at ≥ 64 workgroups (default 16 on PowerVR, off elsewhere; `0` = off) |
 | `STARLING_FAST_KSTEP=n` | audio-LLM decode tokens per submission (default 16) |
 | `STARLING_FAST_{ARK,GRANITE,VOXTRAL}_HOST_ENCODER=1` | keep that model's audio encoder on ggml; the fast engine takes its rows (decoder only) |
@@ -53,6 +54,7 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_GGUF_READAHEAD=1` | stream the mapped GGUF from storage in the background (`posix_fadvise` WILLNEED; default off — see *Model load*) |
 | `STARLING_FAST_FORCE_FAIL=1` | tests: fail the fast engine after a full load, so `auto` exercises the ggml fallback on consumed weights |
 | `STARLING_FAST_DECODE_SKIP=qkv,attn,o,up,down,lm[,empty][,bar]` | diagnostic: drop those decode dispatches (EOS off; `empty` puts a one-workgroup no-op in their place, `bar` drops the barriers) to price each kernel class by difference |
+| `STARLING_FAST_SKIP=label[,prefix*]` | diagnostic: drop every dispatch recorded under those labels (`enc_qkv`, `llm_ff_up`, `conv_pw2`, `enc_*`, …; results are garbage) to price encoder/prefill work by difference |
 | `STARLING_FAST_FULL_BARRIER=1` | every recorded barrier in the wide compute+transfer form (default: scoped to the commands it orders) |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
 
@@ -194,7 +196,7 @@ stores the choice.
 
 | Shader | Role |
 | --- | --- |
-| `gemm.comp` | tiled GEMM, B = W4/W8/F16/F16ᵀ, f16-packed shared tiles, batched heads/windows, implicit-GEMM 3×3/s2 convs (MOSS), fused epilogues |
+| `gemm.comp` | tiled GEMM, B = W4/W8/F16/F16ᵀ, f16-packed shared tiles 32 or 16 deep, batched heads/windows, causal tile skipping, implicit-GEMM 3×3/s2 convs (MOSS), fused epilogues |
 | `gemv.comp` | decode matrix-vector, x kept in registers per K slice, optional fused RMSNorm, residual / SwiGLU / argmax-partial epilogues |
 | `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup; 16-byte key loads, value mix in four position groups) |
 | `attn_decode_split.comp`, `attn_split_combine.comp` | the same, split over KV chunks (one workgroup per head and chunk), then a per-head merge of the partial softmaxes |
@@ -272,8 +274,8 @@ near-tie words and punctuation, in both directions.
 
 Tuned on-device (see `benchmarks/fast_engine/RESEARCH_LOG.md` for the
 experiment log and `AUTORESEARCH.md` for the method). Vendor-keyed defaults
-for PowerVR: GEMM tile 32,128,4,8 (a full 128-thread subgroup with BN = 128),
-f32 GEMM products, GEMV rows 16 pinned (measured best-or-tied at every MOSS
+for PowerVR: GEMM tile 32,128,4,8 (a full 128-thread subgroup with BN = 128)
+with 16-deep k-tiles (RESEARCH_LOG P5), f32 GEMM products, GEMV rows 16 pinned (measured best-or-tied at every MOSS
 decode shape — rows=8 cost 15–31 % on the small-N GEMVs whose per-workgroup
 x re-read rivals the weights; RESEARCH_LOG P1-8) with RSPLIT row slots
 padding workgroups to a whole subgroup, raised to at least 16 rows per row
@@ -361,6 +363,44 @@ interleaved in one session per model (screen off, wake hold), medians of
 host. Every GEMV now streams 21–30 G weights/s; what remains is the GEMV
 plateau below, not dispatch overhead. The ggml CPU engine decodes
 Qwen3-0.6B at ~22 ms/token on 6 threads.
+
+**Encoder and prefill (2026-10-12, RESEARCH_LOG P5).** Priced by
+`STARLING_FAST_SKIP` ablation on Qwen3-ASR-0.6B, enc+prefill is GEMMs
+end to end: the LLM linears ~50 %, the encoder linears ~20 %, the two
+3×3 conv GEMMs ~17 %, attention ~12 %, norms ~0; on Parakeet the feed
+forwards are 58 %. Every one of them ran at ~200 GFLOPS whatever the
+tile shape, kernel variant or operand kind, against a measured f32 peak
+of ~1.4 TFLOPS (`alu` probe, ≥ 280 workgroups). The probes located the
+limit: the register-tiled product loop itself, with its operands read
+from shared memory as the GEMM does, caps at ~400 GFLOPS (packed f16
+operands; ~300 with f32 words, ~800–1000 with the same FMAs on register
+operands; `alu2` modes 0/4/5), and the tile loads and barriers take the
+rest. What paid is occupancy: 16-deep k-tiles halve the shared tiles and
+each thread's tile-load registers, +20–40 % per GEMM isolated (BK = 8
+pays less, more barriers), and the causal prefill attention now skips
+the score tiles above the diagonal and the P·V products past it. Both
+are bit-exact: transcripts identical before and after on the phone and
+the host for all seven models.
+
+| Model (enc+prefill short / medium; wall) | before | after | wall short / medium after |
+| --- | --- | --- | --- |
+| Qwen3-ASR-0.6B q4e8 | 1.14 / 2.86 s | **0.98 / 2.39 s** | 1.99 / 5.27 s (was 2.16 / 5.75) |
+| Qwen3-ASR-1.7B q4e8-imx | 2.40 / 5.95 s | **2.30 / 5.55 s** | 4.66 / 12.31 s (was 4.79 / 12.60) |
+| MOSS q4e8 | 3.01 / 7.03 s | **2.74 / 6.34 s** | 4.83 / 12.33 s (was 5.09 / 13.01) |
+| ARK-0.6B q4k | 3.39 / 9.95 s | **2.84 / 8.67 s** | 3.86 / 11.83 s (was 4.44 / 13.13) |
+| Granite dynq4 | 3.73 / 9.62 s | **3.27 / 7.86 s** | 5.79 / 13.24 s (was 6.25 / 15.04) |
+| Voxtral q4k | 9.09 / 18.2 s | **8.6 / 16.5 s** | 21.3 / 51.9 s (was 22.0 / 54.6) |
+| Parakeet (encoder) | 0.74 / 2.00 s | **0.63 / 1.62 s** | 0.80 / 1.86 s (was 0.88 / 2.22) |
+
+Before = `t3/optimize-phone-model-serving` 46cb1a38; interleaved, two
+rounds with the order reversed in the second, screen off, wake hold,
+medians of 4 (Voxtral: 2 per clip and binary). RADV unchanged (BK stays
+32 there; ±3 %). Measured not to pay on this GPU: f16 products (packed
+FMAs −30 %, `dot(f16vec4)` with k-major tiles ±), f32 shared tiles
+(−30 %), register prefetch of the next tile (−15 %), a broadcast kernel
+that keeps whole weight columns in registers (± 10 %), cheaper unorm
+dequant in the tile loads (±), larger or smaller register tiles, 256-
+thread workgroups, and hoisting the conv im2col divisions (+1 %).
 
 **Model load (2026-10-12).** Load used to read the whole GGUF into
 anonymous memory, repack every matrix into host vectors, allocate the
