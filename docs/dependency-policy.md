@@ -1,5 +1,8 @@
 # Dependency policy
 
+For the October 2026 update batch, compatibility fixes, and feature adoption
+recommendations, see [October dependency updates](dependency-updates-2026-10.md).
+
 Starling builds from five ecosystems (uv, CMake with vendored sources and a
 submodule, Gradle, Swift, Cargo) plus GitHub Actions tooling. This document
 defines what counts as a dependency change, what evidence a change needs, how
@@ -103,6 +106,7 @@ added here in the same PR that introduces them.
 
 | Exception | Rationale | Removal condition |
 | --- | --- | --- |
+| Local xattr 0.2.3 Cargo patch | GPUI's zed-async-tar requires xattr ^0.2, whose Linux/Android ENOATTR alias was removed in libc 0.2.190; the vendored crate uses ENODATA and retains both licenses | When the archive dependency accepts a maintained xattr version or an upstream 0.2.x compatibility release exists; see apps/desktop-gpui/vendor/xattr/STARLING-PATCH.md |
 | Floating `>=` ranges in the root `pyproject.toml` | Tooling only (converters, golden capture, tests), independent of the production native path; `uv.lock` still pins exact versions for any given checkout | When a tool needs a reproducible pin beyond the lock |
 | CI-resolved tools (`brew install xcodegen`, `uv --with openapi-spec-validator`) | Test-only tooling; failures surface immediately in the same job | Follow-up: pin versions once a lockfile-equivalent mechanism exists (see gaps) |
 
