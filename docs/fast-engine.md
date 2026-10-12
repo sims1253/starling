@@ -50,7 +50,7 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_MAPPED_WEIGHTS=0/1` | repack straight into mapped device memory (default where it is CPU-cached: UMA phones) / fill one host staging buffer per device buffer and copy |
 | `STARLING_FAST_ALLOC_THREADS=n` | threads creating the mapped weight buffers while the fill runs (default 2) |
 | `STARLING_GGUF_MMAP=0` | read the GGUF into anonymous memory instead of mapping it (any engine; A/B only) |
-| `STARLING_GGUF_READAHEAD=0/1` | never / always start the background readahead of the mapped GGUF (default: only when under 90 % of it is in the page cache) |
+| `STARLING_GGUF_READAHEAD=1` | stream the mapped GGUF from storage in the background (`posix_fadvise` WILLNEED; default off — see *Model load*) |
 | `STARLING_FAST_FORCE_FAIL=1` | tests: fail the fast engine after a full load, so `auto` exercises the ggml fallback on consumed weights |
 | `STARLING_FAST_DECODE_SKIP=qkv,attn,o,up,down,lm[,empty][,bar]` | diagnostic: drop those decode dispatches (EOS off; `empty` puts a one-workgroup no-op in their place, `bar` drops the barriers) to price each kernel class by difference |
 | `STARLING_FAST_FULL_BARRIER=1` | every recorded barrier in the wide compute+transfer form (default: scoped to the commands it orders) |
@@ -73,8 +73,7 @@ cheap affine format is the right trade.
 **Loading streams the GGUF into device memory once.** The runtime loader
 maps the GGUF privately instead of reading it (`ModelLoader::weight_data`),
 so nothing is copied before the engine starts and pages load on first
-touch (a background readahead streams files that are not already in the
-page cache). The engines then *plan* every weight: a matrix is a
+touch, from all fill threads at once. The engines then *plan* every weight: a matrix is a
 `MatSpec` — source rows plus a destination row mapping (gate/up and GLU
 interleaves, q/k/v concatenation, Voxtral's RoPE permutation, embedding
 chunks) and a scale folded into the group scales (Granite's multipliers).
@@ -378,17 +377,19 @@ cache first (`POSIX_FADV_DONTNEED`; no root needed).
 
 | Model (GPU weights) | warm load before → after | cold load before → after | peak RSS before → after | MemAvailable drop before → after |
 | --- | --- | --- | --- | --- |
-| Parakeet q4_k_m-shrink16 (585 MiB) | 2.04 s → **0.33 s** | 2.17 s → **0.58 s** | 1182 → **111 MiB** | 1.7 → 0.6 GB |
-| Qwen3-ASR-0.6B q4e8 (557 MiB) | 2.18 s → **0.42 s** | 1.85 s → **0.75 s** | 1319 → **147 MiB** | 1.6 → 0.7 GB |
-| ARK-0.6B q4k (1037 MiB) | 3.75 s → **0.85 s** | 3.05 s → **1.40 s** | 2145 → **130 MiB** | 2.9 → 1.1 GB |
-| MOSS q4e8 (1612 MiB) | 7.39 s → **0.78 s** | 5.44 s → **2.20 s** | 3508 → **186 MiB** | 4.8 → 1.9 GB |
-| Granite dynq4 (2546 MiB) | 11.1 s → **1.60 s** | 12.6 s → **2.63 s** | 4615 → **321 MiB** | 6.6 → 2.7 GB |
-| Voxtral q4k (3845 MiB) | 20.1 s → **4.1 s** (2.5 s 2nd round) | 13.8 s → **5.3 s** | 6967 → **118 MiB** | 9.2 → 4.1 GB |
+| Parakeet q4_k_m-shrink16 (585 MiB) | 2.04 s → **0.33–0.35 s** | 2.17 s → **0.58–0.73 s** | 1182 → **111–113 MiB** | 1.7 → 0.6 GB |
+| Qwen3-ASR-0.6B q4e8 (557 MiB) | 2.18 s → **0.42–0.76 s** | 1.85 s → **0.71–0.75 s** | 1319 → **147–151 MiB** | 1.6 → 0.7 GB |
+| ARK-0.6B q4k (1037 MiB) | 3.75 s → **0.73–0.85 s** | 3.05 s → **1.40–2.22 s** | 2145 → **130–136 MiB** | 2.9 → 1.1 GB |
+| MOSS q4e8 (1612 MiB) | 7.39 s → **0.78–0.88 s** | 5.44 s → **2.20–2.54 s** | 3508 → **186–190 MiB** | 4.8 → 1.9 GB |
+| Granite dynq4 (2546 MiB) | 11.1 s → **1.38–1.60 s** | 12.6 s → **2.63–2.72 s** | 4615 → **321–324 MiB** | 6.6 → 2.7 GB |
+| Voxtral q4k (3845 MiB) | 20.1 s → **1.98–4.1 s** | 13.8 s → **3.38–5.3 s** | 6967 → **113–119 MiB** | 9.2 → 4.1 GB |
 
 Pixel 10 Pro, screen off with the wake hold, `starling-bench` load line
-(the whole `starling_ggml_load`: GGUF, tokenizer, engine); first of two
-interleaved rounds (base, then this branch, cold then warm per binary;
-the second round, warmer, was 20–60 % slower for both). Transcripts of
+(the whole `starling_ggml_load`: GGUF, tokenizer, engine). Before = the
+first of two interleaved rounds (base, then this branch, cold then warm
+per binary; the second, warmer round was 20–60 % slower for both); after
+= the range over two sweeps of the final code (cold-load spread is mostly
+storage). Transcripts of
 short and medium are identical before and after on all six models, on
 the phone and on the RADV host. Cold = the GGUF evicted from the page
 cache first: storage reads ~1 GB/s here, so a cold load is now mostly
@@ -404,15 +405,29 @@ CPU time past the allocation is the Q5_K → W8 requantization. Two
 allocator threads instead of one: Granite ~0.4 s and Voxtral ~1.9 s
 faster (STARLING_FAST_ALLOC_THREADS A/B).
 
+Pipeline creation is not part of the load: pipelines are built while the
+first pass is recorded. With the pipeline cache in `STARLING_FAST_CACHE_DIR`
+populated, the first transcription costs ~0.3 s extra on Parakeet and
+nothing measurable on Granite; with an empty cache directory (first
+launch, or a cleared app cache) it costs ~7 s on Parakeet and ~6.6 s on
+Granite — worth keeping the cache directory out of anything the OS
+trims. The ggml fallback is unaffected by the fast engine having
+consumed (and dropped) the mapped GGUF pages: `STARLING_ENGINE=auto` with
+`STARLING_FAST_FORCE_FAIL=1` gives the ggml transcripts on the phone
+(Parakeet, Qwen3) and on the host (all six models).
+
 Measured and not kept: a CPU-cached (non-coherent) memory type for the
 weights (no gain once the copy was gone; the coherent write-combined
 type takes plain sequential stores at ~13 GB/s); `MADV_POPULATE_WRITE`
 on the mapped buffers (the driver's mapping refuses it, and its pages are
 already present); staging uploads on PowerVR (585 MiB took 9.8 s — the
-mapped path stays the default there); background readahead of a GGUF
-that is already cached (walking its pages contends with the fill's page
-faults: host warm Qwen3 0.82 → 0.52 s without it, hence the mincore
-gate); an inlined f32→f16 conversion (5.0 → 3.3 ns per value, too small
+mapped path stays the default there); a background readahead of the
+GGUF (`posix_fadvise` WILLNEED from a thread: on cold Pixel loads it
+never beat the fill's own parallel page faults and often queued the
+header parse behind it — Qwen3 0.94–1.0 s without, 1.0–1.7 s with;
+Granite 1.95–2.16 s vs 2.26–2.86 s — and over a cached file walking its
+pages contends with the faults: host warm Qwen3 0.82 → 0.52 s without;
+`STARLING_GGUF_READAHEAD=1` keeps it as an option); an inlined f32→f16 conversion (5.0 → 3.3 ns per value, too small
 to matter); lazily reading GGUF string arrays (2 ms). A repacked-weight
 cache on disk was not built: on a warm Granite load it could save at
 most the ~0.7 s the fill runs past the allocation (the fill would become
