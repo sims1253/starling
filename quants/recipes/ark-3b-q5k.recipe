@@ -1,0 +1,15 @@
+# starling-quantize recipe: ARK-ASR-3B, "quality" (2635 MB). Every linear
+# Q5_K, tied embedding/lm_head Q6_K. ~2163 MB read per decoded token.
+#
+# Measured (2026-10-12, FLEURS test, 100 clips per language, paired bootstrap
+# vs BF16): en 6.08 % vs 6.13 % (clip -0.05 pt [-0.30, +0.16]). German is not
+# gateable (see ark-3b-q4k.recipe); on the clips both decode in German it is
+# +0.37 pt [-0.34, +1.35], close to Q8_0's +0.23 [-0.40, +1.15]. Matrix and
+# gate: docs/quantization.md, "Phone recipes".
+#
+#   build/starling-quantize --input models/ark-asr-3b-bf16-exact.gguf \
+#       --output models/ark-asr-3b-q5k.gguf \
+#       --recipe quants/recipes/ark-3b-q5k.recipe \
+#       --imatrix models/ark-calib160.imx
+default q5_k
+^llm\.embed\.weight$ q6_k

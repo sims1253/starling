@@ -1,0 +1,21 @@
+# starling-quantize recipe: MOSS-Transcribe-preview-2B, phone "compact"
+# (1397 MB vs 1553 MB for moss-q4e8-fullimx). Every linear Q4_0 and the tied
+# embedding/lm_head Q4_0; enc.conv_out stays BF16 (the fast engine stores it
+# as F16 whatever its GGUF type). Q4_0 maps losslessly onto the fast engine's
+# W4. ~968 MB read per decoded token (-14 % vs q4e8).
+#
+# Needs the FLEURS matrix, which covers the tied head (moss-full.imx has no
+# entry for it): with the same matrix a Q4_0 head is +0.05 pt vs Q8_0 (clip
+# +0.21 [-0.35, +0.84]).
+#
+# Measured (2026-10-12, FLEURS test en, 100 clips, paired bootstrap vs BF16):
+# 8.02 % vs 8.11 % (clip -0.18 pt [-1.11, +0.75]). German is not gateable:
+# MOSS mostly translates German speech, ~100 % WER even at BF16. Matrix and
+# gate: docs/quantization.md, "Phone recipes".
+#
+#   build/starling-quantize --input models/moss-transcribe-preview-2b-bf16-exact.gguf \
+#       --output models/moss-transcribe-preview-2b-q4e4-cal.gguf \
+#       --recipe quants/recipes/moss-q4e4-cal.recipe \
+#       --imatrix models/moss-calib160.imx --f32-1d
+default q4_0
+^llm\.embed\.weight$ q4_0

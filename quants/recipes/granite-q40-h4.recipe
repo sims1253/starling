@@ -1,0 +1,19 @@
+# starling-quantize recipe: Granite-Speech-4.1-2B, phone (1472 MB vs 2627 MB
+# all-Q8_0). Every linear Q4_0 (4x8 i8mm repack on arm64): encoder including
+# the opt-in conformer conv_up/down, projector, decoder, the untied lm_head
+# and the embedding. enc.out_mid (348 wide) stays BF16. ~918 MB read per
+# decoded token.
+#
+# Measured (2026-10-12, FLEURS test, 100 clips per language, paired bootstrap
+# vs all-Q8_0): en 5.52 % vs 6.18 % (clip -0.43 pt [-1.16, +0.24]), de 5.82 %
+# vs 5.78 % (+0.01 pt [-0.54, +0.62]). Same bytes and gate result as
+# granite-q4k-h4.recipe; the phone decides between the two kernels. Matrix
+# and gate: docs/quantization.md, "Phone recipes".
+#
+#   build/starling-quantize --input models/granite-speech-4.1-2b-bf16-exact.gguf \
+#       --output models/granite-speech-4.1-2b-q40-h4.gguf \
+#       --recipe quants/recipes/granite-q40-h4.recipe \
+#       --imatrix models/granite-calib160.imx --f32-1d
+default q4_0
+^llm\.embed\.weight$ q4_0
+conv_(up|down)\.weight$ q4_0

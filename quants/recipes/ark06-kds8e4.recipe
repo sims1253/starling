@@ -1,0 +1,22 @@
+# starling-quantize recipe: ARK-ASR-0.6B, phone "compact" (732 MB vs 2309 MB
+# BF16). Encoder Q4_K (1280/5120-wide rows); adapter, decoder attention v/o
+# and ffn.down Q8_0 (the decoder group carries the quality: the same group at
+# Q8_0 in the encoder bought nothing); the other decoder linears Q4_0
+# (896-wide: no K-quants); tied embedding/lm_head Q4_0. ~347 MB read per
+# decoded token.
+#
+# Measured (2026-10-12, FLEURS test, 100 clips per language, paired bootstrap
+# vs BF16): en 4.90 % vs 4.81 % (clip +0.08 pt [-0.29, +0.40]), de 6.85 % vs
+# 6.97 % (-0.36 pt [-1.44, +0.40]). Matrix and gate: docs/quantization.md,
+# "Phone recipes".
+#
+#   build/starling-quantize --input models/ark-asr-0.6b-bf16-exact.gguf \
+#       --output models/ark-asr-0.6b-kds8e4.gguf \
+#       --recipe quants/recipes/ark06-kds8e4.recipe \
+#       --imatrix models/ark06-calib160.imx
+default q4_0
+^enc\. q4_k
+^adapter\. q8_0
+^llm\.embed\.weight$ q4_0
+^llm\.blk\.[0-9]+\.attn\.(v|o)\.weight$ q8_0
+^llm\.blk\.[0-9]+\.ffn\.down\.weight$ q8_0

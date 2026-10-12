@@ -463,6 +463,22 @@ only records matmuls with F32 activations, and on a BF16 source the qwen
 trunks feed BF16 activations to every LLM linear, so the matrix stays
 nearly empty.
 
+```bash
+# 160 validation clips: export both languages, then merge the WAVs and the
+# two refs.json maps into one directory (calib_en_de)
+python benchmarks/fast_engine/export_fleurs.py --split validation --cfg en_us --n 100 --out calib_en
+python benchmarks/fast_engine/export_fleurs.py --split validation --cfg de_de --n 60 --out calib_de
+# all-Q8_0 file: every linear plus the embedding at Q8_0
+printf 'default q8_0\n^llm\\.embed\\.weight$ q8_0\n' > /tmp/q8.recipe
+build/starling-quantize --input models/qwen3-asr-0.6b-bf16-exact.gguf \
+    --output models/qwen3-asr-0.6b-q8_0.gguf --recipe /tmp/q8.recipe
+STARLING_IMATRIX=models/qwen3_06-calib160.imx STARLING_GGML_DEVICE=cpu \
+    python benchmarks/quant_phone/wer_models.py --lib build/libstarling_ggml.so \
+    --model qwen3_06 --clips calib_en_de --json /dev/null q8=models/qwen3-asr-0.6b-q8_0.gguf
+```
+
+The matrix is written when the process exits.
+
 **Phone measurement.** `benchmarks/quant_phone/phone_quant_bench.sh` runs
 on a host with adb. It starts each process only once the skin temperature
 is back near idle. Variants alternate ABBA across rounds. Energy per
@@ -505,6 +521,65 @@ Pixel 10 Pro, q4pw vs q4_k_m-shrink16 (medians over ABBA rounds):
 The fixture transcripts are identical. On the notebook's Radeon (RADV),
 transcripts are also identical and latency is within 8 %. The catalog
 entry is `parakeet-q4pw-phone`.
+
+### The LLM-decoder models
+
+Every finalist below passes the gate against its reference. The catalog
+id is the recipe name plus `-phone`, except for the two ARK-3B entries. The
+phone-sized layout differs per model:
+
+- **Qwen3-ASR:** the decoder needs Q5_K/Q6_K. Every decoder at about
+  4.5 bpw (Q4_K, Q4_0, or Q4_K with Q5_K/Q6_K bumps) failed German by
+  +0.5 to +1.5 pt.
+- **ARK-0.6B and Granite:** they hold up at 4 bit. ARK-0.6B needs its
+  decoder attention v/o and ffn.down at Q8_0.
+
+"MB/token" estimates the bytes read per decoded token: the decoder
+linears plus the head.
+
+| model | recipe | MB | MB/token | reference | en WER (paired Δ [95 % CI]) | de WER (paired Δ [95 % CI]) |
+|-------|--------|---:|---------:|-----------|-----------------------------|-----------------------------|
+| Qwen3-ASR-0.6B | `qwen3-0.6b-k56x8e6` | 663 | 454 | BF16 5.23 / 6.59 | 5.04 (−0.02 [−0.61, +0.57]) | 6.59 (−0.01 [−0.74, +0.64]) |
+| Qwen3-ASR-0.6B | `qwen3-0.6b-k6x8e8` | 736 | 527 | BF16 | 5.04 (−0.04 [−0.58, +0.50]) | 6.72 (+0.09 [−0.30, +0.52]) |
+| Qwen3-ASR-1.7B | `qwen3-1.7b-k56x6e6` | 1567 | 1294 | all-Q8_0 3.91 / 3.91 | 3.77 (−0.13 [−0.43, +0.17]) | 3.91 (+0.04 [−0.42, +0.50]) |
+| Qwen3-ASR-1.7B | `qwen3-1.7b-k6x8e8` | 1835 | 1487 | all-Q8_0 | 3.77 (−0.10 [−0.52, +0.24]) | 3.61 (−0.20 [−0.55, +0.13]) |
+| ARK-ASR-0.6B | `ark06-kds8e4` | 732 | 347 | BF16 4.81 / 6.97 | 4.90 (+0.08 [−0.29, +0.40]) | 6.85 (−0.36 [−1.44, +0.40]) |
+| ARK-ASR-0.6B | `ark06-kds8` | 806 | 421 | BF16 | 4.86 (+0.06 [−0.11, +0.26]) | 6.63 (−0.46 [−1.54, +0.31]) |
+| ARK-ASR-3B | `ark-3b-q4k` | 2125 | 1736 | BF16 6.13 / — | 6.36 (+0.32 [−0.11, +0.82]) | not gateable |
+| ARK-ASR-3B | `ark-3b-q5k` | 2635 | 2163 | BF16 | 6.08 (−0.05 [−0.30, +0.16]) | not gateable |
+| Granite-Speech-4.1-2B | `granite-q40-h4` | 1472 | 918 | all-Q8_0 6.18 / 5.78 | 5.52 (−0.43 [−1.16, +0.24]) | 5.82 (+0.01 [−0.54, +0.62]) |
+| Granite-Speech-4.1-2B | `granite-q4k-h4` | 1472 | 918 | all-Q8_0 | 6.22 (+0.11 [−0.45, +0.76]) | 5.82 (−0.28 [−1.03, +0.37]) |
+| MOSS-Transcribe-2B | `moss-q4e4-cal` | 1397 | 968 | BF16 8.11 / — | 8.02 (−0.18 [−1.11, +0.75]) | not gateable |
+| MOSS-Transcribe-2B | `moss-q4e8-fullimx` (existing) | 1553 | 1123 | BF16 | 7.59 (−0.68 [−1.75, +0.31]) | not gateable |
+
+- **German is not gateable for MOSS and ARK-3B.** Both models answer many
+  German clips in English, even at BF16. MOSS scores about 100 % WER on
+  German. ARK-3B answers about 46 % of German clips in English (de WER
+  ≈ 49 %).
+  - On the clips where both files decode German, `ark-3b-q5k` stays as
+    close to BF16 as Q8_0 does.
+  - On the same clips, `ark-3b-q4k` loses +1.27 pt [+0.09, +2.66].
+- **Narrow rows.** The Qwen3-0.6B encoder and the ARK-0.6B decoder are
+  896 wide, so K-quants do not apply there. Q4_0 on the Qwen3-0.6B encoder
+  cost +0.9 pt in German.
+- **Tied heads.** Q4_0 heads are cheap only with a matrix that covers the
+  head.
+  - With the FLEURS matrix, the MOSS Q4_0 head is +0.05 pt against Q8_0.
+  - `moss-full.imx` has no entry for the head.
+  - On ARK-0.6B a Q4_0 head cost 0.1–0.6 pt in every screened pair, and
+    `ark06-kds8e4` still passes.
+- **Granite.** The two recipes have identical bytes and both pass. Pick the
+  one whose kernel is faster on the phone (Q4_0 4x8 or Q4_K 8x8). On a
+  30-clip German BF16 spot check, Q4_K sat closer to BF16.
+- **Loops.** One ARK-3B Q4_K_M file looped on one English clip and scored
+  15 % WER. Screen for repetition loops, not only the mean.
+- **Vulkan.** On the notebook's Radeon (RADV), the Qwen3, Granite and MOSS
+  finalists give the same fixture transcripts as on its CPU.
+- **Fast engine.** The MOSS finalists use only Q4_0 and Q8_0, which the
+  fast engine maps losslessly. It stores `enc.conv_out` as F16 whatever
+  its GGUF type, so quantizing that tensor shrinks only the download.
+- **Reproducibility.** Rebuilding from these recipes with the recorded
+  matrices reproduces the evaluated tensors bit for bit.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 

@@ -1,0 +1,19 @@
+# starling-quantize recipe: ARK-ASR-0.6B, phone "quality" (806 MB):
+# ark06-kds8e4 with the tied embedding/lm_head at Q8_0 (a Q4_0 head cost
+# 0.1-0.6 pt in every screened pair). ~421 MB read per decoded token.
+#
+# Measured (2026-10-12, FLEURS test, 100 clips per language, paired bootstrap
+# vs BF16): en 4.86 % vs 4.81 % (clip +0.06 pt [-0.11, +0.26]), de 6.63 % vs
+# 6.97 % (-0.46 pt [-1.54, +0.31]). Matrix and gate: docs/quantization.md,
+# "Phone recipes".
+#
+#   build/starling-quantize --input models/ark-asr-0.6b-bf16-exact.gguf \
+#       --output models/ark-asr-0.6b-kds8.gguf \
+#       --recipe quants/recipes/ark06-kds8.recipe \
+#       --imatrix models/ark06-calib160.imx
+default q4_0
+^enc\. q4_k
+^adapter\. q8_0
+^llm\.embed\.weight$ q8_0
+^llm\.blk\.[0-9]+\.attn\.(v|o)\.weight$ q8_0
+^llm\.blk\.[0-9]+\.ffn\.down\.weight$ q8_0
