@@ -584,6 +584,52 @@ linears plus the head.
 - **Reproducibility.** Rebuilding from these recipes with the recorded
   matrices reproduces the evaluated tensors bit for bit.
 
+### Pixel 10 Pro results for the LLM-decoder models (2026-10-12)
+
+Run with `phone_quant_bench.sh`: 2 ABBA rounds per group, short (7.4 s) and
+medium (22.3 s) fixtures, 6 threads. Each process starts with the live skin
+temperature under idle + 1 °C and the big cores under 50 °C. The phone was
+on the charger, so there is no energy column. The bench process never
+swapped: every `VmSwap` sample was 0 kB, with about 7 GB still available.
+Android's swap is zram holding idle background apps. The "previous" files
+are the earlier dynq4/q4 quants. Times are medians of the two rounds,
+except where a single throttled round is flagged.
+
+| model | file | MB | engine | load | short | medium | CPU s | peak RSS |
+|-------|------|---:|--------|-----:|------:|-------:|------:|---------:|
+| Granite 2B | previous dynq4 | 1857 | ggml CPU | 1.5 s | 11.5 s | 92.7 s | 808 | 1944 MB |
+| Granite 2B | **granite-q40-h4** | 1472 | ggml CPU | 0.7 s | 6.1 s | **17.0 s** | 264 | 1575 MB |
+| Granite 2B | granite-q4k-h4 | 1472 | ggml CPU | 0.7 s | 6.6 s | 18.8 s | 284 | 1576 MB |
+| ARK 0.6B | previous q4k | 903 | ggml CPU | 2.6 s | 7.9 s | 32.7 s | 398 | 1191 MB |
+| ARK 0.6B | **ark06-kds8e4** | 732 | ggml CPU | 2.0 s | 6.8 s | 31.4 s | 374 | 1029 MB |
+| ARK 0.6B | ark06-kds8 | 806 | ggml CPU | 0.5 s | 6.7 s | 31.3 s | 372 | 1099 MB |
+| Qwen3 0.6B | previous q4e8 | 532 | ggml CPU | 0.9 s | 5.5 s | 20.4 s¹ | — | 1546 MB |
+| Qwen3 0.6B | **qwen3-0.6b-k56x8e6** | 663 | ggml CPU | 1.4 s | 6.0 s | 21.8 s | 314 | 1672 MB |
+| Qwen3 0.6B | qwen3-0.6b-k6x8e8 | 736 | ggml CPU | 1.6 s | 6.3 s | 22.2 s | 316 | 1741 MB |
+| Qwen3 1.7B | previous dynq4 | 1328 | ggml CPU | 1.7 s | 7.5 s | 23.8 s | 361 | 2307 MB |
+| Qwen3 1.7B | **qwen3-1.7b-k56x6e6** | 1567 | ggml CPU | 0.7 s | 7.7 s | 25.2 s | 379 | 2535 MB |
+| Qwen3 1.7B | qwen3-1.7b-k6x8e8 | 1835 | ggml CPU | 0.9 s | 8.0 s | 26.0 s | 388 | 2790 MB |
+| MOSS 2B | moss-q4e8-fullimx | 1553 | fast Vulkan | 4.5 s | 5.5 s | 14.8 s | 14 | 3509 MB |
+| MOSS 2B | **moss-q4e4-cal** | 1397 | fast Vulkan | 3.4 s | 5.4 s | 14.3 s | 11 | 3051 MB |
+| MOSS 2B | moss-q4e8-fullimx | 1553 | ggml CPU | 1.6 s | 6.2 s | 21.1 s | 311 | 2146 MB |
+| MOSS 2B | moss-q4e4-cal | 1397 | ggml CPU | 4.0 s | 6.0 s | 20.6 s | 308 | 1997 MB |
+
+¹ Round 1 only. Round 2 throttled mid-run (68.7 s).
+
+- **Granite.** The previous file kept 368 MB of conformer convs in BF16,
+  which ggml's CPU backend runs through a scalar loop on arm64. The opt-in
+  Q4_0 convs make Granite 5.4× faster and usable on the phone. Q4_0 beats
+  Q4_K by 9 %.
+- **Qwen3.** The finalists are about 5 % slower than the previous 4-bit
+  files and use about 230 MB more RAM. In exchange they remove the German
+  loss of those layouts (+0.5 to +1.6 pt on the host).
+- **ARK 0.6B and MOSS.** The compact files are faster and smaller on every
+  axis.
+- **ARK 3B.** It is not practical on the phone CPU. The same `ark-3b-q4k`
+  file took 40–158 s for the 22.3 s fixture across four cool-started runs,
+  throttling within a run. ARK 0.6B and Qwen3 1.7B are the better on-device
+  choices.
+
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
 The historical numbers below use the CPU path. The dated Vulkan
