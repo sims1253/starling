@@ -52,7 +52,6 @@ def main() -> int:
     base = results[a.base]
     bclip = per_clip(refs, base["names"], base["hyps"])
     bhyp = dict(zip(base["names"], base["hyps"]))
-    rng = random.Random(0)
     for label, r in results.items():
         if label == a.base:
             continue
@@ -60,6 +59,7 @@ def main() -> int:
         common = [n for n in r["names"] if n in bclip]
         diffs = [cclip[n] - bclip[n] for n in common]
         mean = sum(diffs) / len(diffs)
+        rng = random.Random(0)  # per candidate: its CI must not depend on the other labels
         boots = sorted(sum(rng.choice(diffs) for _ in diffs) / len(diffs) for _ in range(10000))
         lo, hi = boots[249], boots[9749]
         changed = sum(dict(zip(r["names"], r["hyps"]))[n] != bhyp[n] for n in common)
