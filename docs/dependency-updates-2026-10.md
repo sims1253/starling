@@ -109,7 +109,7 @@ exercise a maintainer-triggered review before changing model/timeout settings.
   corrects CUT_BUFFER atom names and supports libloading 0.9. It removes abstract
   Unix sockets and moves to raw-window-handle 0.6. Check filesystem X11 socket
   access when diagnosing Linux connection failures. No new UI feature required.
-- [windows-sys 0.61.2](https://github.com/microsoft/windows-rs/releases/tag/0.61.2)
+- [windows-sys 0.61.2](https://docs.rs/windows-sys/0.61.2/windows_sys/core/type.BOOL.html)
   requires the BOOL import migration above; preserve native named-pipe tests.
 - [libc 0.2.190](https://github.com/rust-lang/libc/releases/tag/0.2.190) removes
   old deprecated APIs. Its unstable 32-bit time64 configuration is relevant only
