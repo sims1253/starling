@@ -217,7 +217,12 @@ public:
                   uint32_t gx, uint32_t gy = 1, uint32_t gz = 1);
     // Profiling label for the following dispatches (defaults to the shader).
     void label(const char* l) { label_ = l ? l : ""; }
-    // Compute->compute (and transfer) memory barrier.
+    // Memory + execution barrier between everything recorded before and
+    // after it. Emitted lazily at the next command, scoped to what it
+    // orders: compute -> compute unless a copy/fill precedes it (source
+    // gains the transfer stage) or follows it (destination is transfer).
+    // PowerVR prices the wide compute|transfer form measurably higher
+    // (decode -4..6 %). STARLING_FAST_FULL_BARRIER=1 keeps the wide form.
     void barrier();
     void copy(const Buffer& src, VkDeviceSize soff, const Buffer& dst,
               VkDeviceSize doff, VkDeviceSize bytes);
@@ -247,6 +252,9 @@ private:
     uint32_t n_queries_ = 0, max_queries_ = 0;
     std::vector<std::string> q_labels_;
     std::string label_;
+    bool bar_pending_ = false;   // barrier() called, not yet emitted
+    bool bar_xfer_src_ = false;  // a copy/fill since the last emitted barrier
+    void emit_barrier(bool dst_xfer);
     VkDescriptorSet alloc_set(const Pipeline& p);
 };
 

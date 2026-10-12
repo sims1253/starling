@@ -893,7 +893,10 @@ void Recording::begin() {
 }
 
 void Recording::end() {
-    if (cb_) ctx_.fn_.vkEndCommandBuffer(cb_);
+    if (!cb_) return;
+    // A trailing barrier orders this recording against later submissions.
+    if (bar_pending_) emit_barrier(true);
+    ctx_.fn_.vkEndCommandBuffer(cb_);
 }
 
 void Recording::split() {
@@ -977,6 +980,7 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
         writes[i].pBufferInfo = &infos[i];
     }
     f.vkUpdateDescriptorSets(ctx_.dev_, p.n_bindings, writes.data(), 0, nullptr);
+    emit_barrier(false);
     f.vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
     f.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
     uint8_t pc[kPushBytes] = {};
@@ -991,27 +995,43 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
 }
 
 void Recording::barrier() {
-    if (!cb_) return;
+    if (cb_) bar_pending_ = true;
+}
+
+void Recording::emit_barrier(bool dst_xfer) {
+    if (!bar_pending_) return;
+    bar_pending_ = false;
+    static const bool full = [] {
+        const char* e = std::getenv("STARLING_FAST_FULL_BARRIER");
+        return e && e[0] == '1';
+    }();
+    const bool src_xfer = bar_xfer_src_ || full;
+    dst_xfer = dst_xfer || full;
+    bar_xfer_src_ = false;
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | (src_xfer ? VK_ACCESS_TRANSFER_WRITE_BIT : 0u);
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                       (dst_xfer ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0u);
     ctx_.fn_.vkCmdPipelineBarrier(cb_,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (src_xfer ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u),
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (dst_xfer ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u),
         0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
 void Recording::copy(const Buffer& src, VkDeviceSize soff, const Buffer& dst,
                      VkDeviceSize doff, VkDeviceSize bytes) {
     if (!cb_) return;
+    emit_barrier(true);
     VkBufferCopy c{soff, doff, bytes};
     ctx_.fn_.vkCmdCopyBuffer(cb_, src.buf, dst.buf, 1, &c);
+    bar_xfer_src_ = true;
 }
 
 void Recording::fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, uint32_t value) {
     if (!cb_) return;
+    emit_barrier(true);
     ctx_.fn_.vkCmdFillBuffer(cb_, dst.buf, off, bytes, value);
+    bar_xfer_src_ = true;
 }
 
 bool Recording::submit_and_wait(std::string& err, uint64_t stall_budget_ms) {
