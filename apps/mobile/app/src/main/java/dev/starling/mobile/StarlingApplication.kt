@@ -10,6 +10,7 @@ import android.os.PowerManager
 import android.util.Log
 import dev.starling.mobile.audio.LoopingWavSource
 import dev.starling.mobile.audio.PcmSource
+import dev.starling.mobile.engine.ModelKind
 import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
@@ -285,18 +286,17 @@ class StarlingApplication : Application() {
      * a lower bound on its resident size, so loading it with less memory
      * available would only end with the process killed mid-load. Advisory
      * only: free memory can still drop between this check and the load, and
-     * the working-set allowance is an estimate for the Parakeet 0.6B class.
+     * the working-set allowance on top of the weights is a per-kind estimate
+     * ([ModelKind.workingSetBytes]: the Parakeet 0.6B class, or an
+     * LLM-decoder model with its KV cache).
      */
-    private fun memoryGate(modelBytes: Long): String? {
+    private fun memoryGate(modelBytes: Long, kind: ModelKind): String? {
         val manager = getSystemService(ActivityManager::class.java) ?: return null
         val info = ActivityManager.MemoryInfo().also(manager::getMemoryInfo)
-        if (info.availMem >= modelBytes + MODEL_WORKING_SET_BYTES) return null
+        val required = kind.requiredMemoryBytes(modelBytes)
+        if (info.availMem >= required) return null
         val mb = 1024 * 1024
-        return getString(
-            R.string.on_device_memory_error,
-            (modelBytes + MODEL_WORKING_SET_BYTES) / mb,
-            info.availMem / mb,
-        )
+        return getString(R.string.on_device_memory_error, required / mb, info.availMem / mb)
     }
 
     /**
@@ -321,9 +321,6 @@ class StarlingApplication : Application() {
 
     internal companion object {
         private const val TAG = "StarlingApplication"
-
-        /** Activations and graph buffers on top of the weights. */
-        const val MODEL_WORKING_SET_BYTES = 128L * 1024 * 1024
 
         /** Upper bound on one wake-lock hold (one native load, window or free). */
         private const val WAKE_LOCK_TIMEOUT_MS = 10L * 60 * 1000

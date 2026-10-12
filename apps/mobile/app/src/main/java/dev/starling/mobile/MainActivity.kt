@@ -37,6 +37,7 @@ import dev.starling.mobile.data.TranscriptRevision
 import dev.starling.mobile.data.TranscriptSource
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.ModelCatalog
+import dev.starling.mobile.engine.ModelDownload
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.BackendSettings
@@ -62,6 +63,7 @@ class MainActivity : Activity() {
     private lateinit var engineOnDeviceInput: RadioButton
     private lateinit var onDeviceStatus: TextView
     private lateinit var downloadModelButton: Button
+    private lateinit var downloadOtherModelButton: Button
     private lateinit var installedModelsHeading: TextView
     private lateinit var installedModelsHelp: TextView
     private lateinit var installedModelsContainer: LinearLayout
@@ -149,8 +151,10 @@ class MainActivity : Activity() {
         downloadModelButton = findViewById(R.id.download_model_button)
         downloadModelButton.setOnClickListener {
             val downloads = application.modelDownloads
-            if (downloads.isRunning) downloads.cancel() else downloads.start(ModelCatalog.RECOMMENDED_PARAKEET)
+            if (downloads.isRunning) downloads.cancel() else downloads.start(downloadTarget())
         }
+        downloadOtherModelButton = findViewById(R.id.download_other_model_button)
+        downloadOtherModelButton.setOnClickListener { chooseDownload() }
         recordButton.setOnClickListener {
             if (activeRecording == null) requestOrStartRecording() else stopAndQueueRecording()
         }
@@ -234,9 +238,40 @@ class MainActivity : Activity() {
         renderDownload(state)
     }
 
+    /**
+     * What the main download button fetches: a paused download of any catalog
+     * model resumes first, otherwise the recommended model.
+     */
+    private fun downloadTarget(): ModelDownload {
+        val downloads = application.modelDownloads
+        return downloads.spec?.takeIf { downloads.resumableBytes(it) > 0 } ?: ModelCatalog.RECOMMENDED_PARAKEET
+    }
+
+    /** Lists every catalog model (installed ones marked) and downloads the chosen one. */
+    private fun chooseDownload() {
+        val downloads = application.modelDownloads
+        if (downloads.isRunning) return
+        val installed = application.onDeviceEngine.installedModels().map { it.name }.toSet()
+        val specs = ModelCatalog.ALL
+        val rows = specs.map { spec ->
+            val row = if (spec.fileName in installed) R.string.download_other_row_installed else R.string.download_other_row
+            getString(row, spec.label, mb(spec.sizeBytes))
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle(R.string.download_other_title)
+            .setItems(rows) { _, which ->
+                val spec = specs[which]
+                if (spec.fileName !in installed && !downloads.isRunning) downloads.start(spec)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
     private fun renderDownload(state: ModelDownloadController.State) {
-        val spec = ModelCatalog.RECOMMENDED_PARAKEET
+        val downloads = application.modelDownloads
+        val spec = if (downloads.isRunning) downloads.spec ?: downloadTarget() else downloadTarget()
         val totalMb = mb(spec.sizeBytes)
+        downloadOtherModelButton.visibility = if (downloads.isRunning) View.GONE else View.VISIBLE
         // Listed only once the download is not running: progress ticks
         // never touch the model directory.
         val models by lazy { application.onDeviceEngine.installedModels() }
@@ -248,7 +283,7 @@ class MainActivity : Activity() {
                     getString(R.string.on_device_verifying)
                 } else {
                     val percent = if (state.total > 0) (state.bytes * 100 / state.total).toInt() else 0
-                    getString(R.string.on_device_downloading, percent, mb(state.bytes), totalMb)
+                    getString(R.string.on_device_downloading, percent, mb(state.bytes), totalMb, spec.label)
                 }
                 return
             }
@@ -269,7 +304,7 @@ class MainActivity : Activity() {
         renderInstalledModels(models)
         val partialMb = mb(application.modelDownloads.resumableBytes(spec))
         downloadModelButton.text = if (partialMb > 0) {
-            getString(R.string.resume_download, partialMb, totalMb)
+            getString(R.string.resume_download, partialMb, totalMb, spec.label)
         } else {
             getString(R.string.download_model, totalMb)
         }
@@ -473,7 +508,7 @@ class MainActivity : Activity() {
                 when (result) {
                     is OnDeviceEngine.ImportResult.Imported -> {
                         refreshOnDeviceStatus()
-                        showMessage(getString(R.string.on_device_imported))
+                        showMessage(getString(R.string.on_device_imported, result.model))
                     }
                     is OnDeviceEngine.ImportResult.Rejected -> {
                         Log.w(TAG, "model import rejected at ${result.stage}: ${result.reason}")
@@ -513,12 +548,13 @@ class MainActivity : Activity() {
     private fun isRecommended(model: OnDeviceEngine.InstalledModel): Boolean =
         model.name == ModelCatalog.RECOMMENDED_PARAKEET.fileName
 
-    /** Catalog models by their label; anything else by its file name. */
+    /** Catalog models by their label (the recommended one marked); anything else by its file name. */
     private fun modelDisplayName(model: OnDeviceEngine.InstalledModel): String {
+        val catalog = ModelCatalog.forFileName(model.name) ?: return model.name
         return if (isRecommended(model)) {
-            getString(R.string.recommended_model_name, ModelCatalog.RECOMMENDED_PARAKEET.label)
+            getString(R.string.recommended_model_name, catalog.label)
         } else {
-            model.name
+            catalog.label
         }
     }
 
@@ -528,7 +564,6 @@ class MainActivity : Activity() {
      * model is installed (a running or paused download still shows it).
      */
     private fun renderInstalledModels(models: List<OnDeviceEngine.InstalledModel>) {
-        val recommended = ModelCatalog.RECOMMENDED_PARAKEET
         val visibility = if (models.isEmpty()) View.GONE else View.VISIBLE
         installedModelsHeading.visibility = visibility
         installedModelsHelp.visibility = visibility
@@ -567,7 +602,7 @@ class MainActivity : Activity() {
         val recommendedInstalled = models.any(::isRecommended)
         val downloads = application.modelDownloads
         downloadModelButton.visibility = if (
-            recommendedInstalled && !downloads.isRunning && downloads.resumableBytes(recommended) == 0L
+            recommendedInstalled && !downloads.isRunning && downloads.resumableBytes(downloadTarget()) == 0L
         ) {
             View.GONE
         } else {

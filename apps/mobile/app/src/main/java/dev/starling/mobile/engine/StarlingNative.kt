@@ -16,8 +16,12 @@ object StarlingNative {
 
     external fun abiVersion(): Int
 
-    /** Loads STARLING_GGML_PARAKEET_TDT from [ggufPath]; 0 on failure. */
-    external fun load(ggufPath: String): Long
+    /**
+     * Loads [ggufPath] as the engine [kind] (a starling_ggml_model value,
+     * [ModelKind.nativeKind]); 0 on failure, including a kind the app does
+     * not support.
+     */
+    external fun load(ggufPath: String, kind: Int): Long
 
     /** Mono float32 samples in [-1, 1] at [sampleRate] Hz; null on failure. */
     external fun transcribe(handle: Long, samples: FloatArray, sampleRate: Int): String?

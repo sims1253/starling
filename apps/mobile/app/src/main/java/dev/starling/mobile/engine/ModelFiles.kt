@@ -9,8 +9,7 @@ object ModelFiles {
 
     const val GGUF_MAGIC_SIZE = 4
 
-    /** Longest architecture tag echoed into the user-facing rejection message. */
-    private const val MAX_ARCHITECTURE_DISPLAY_CHARS = 40
+    private const val TOO_SMALL = "This file is too small to be a speech model."
 
     /**
      * Null when [sizeBytes] and the first [header.size] bytes look like a
@@ -21,7 +20,7 @@ object ModelFiles {
      */
     fun validate(sizeBytes: Long, header: ByteArray): String? {
         if (sizeBytes < MIN_MODEL_BYTES) {
-            return "This file is too small to be a Parakeet model."
+            return TOO_SMALL
         }
         val magic = "GGUF".toByteArray(Charsets.US_ASCII)
         if (header.size < magic.size || !header.copyOfRange(0, magic.size).contentEquals(magic)) {
@@ -31,35 +30,34 @@ object ModelFiles {
     }
 
     /**
-     * Deep pre-promotion check of a fully staged model [file] (B08): size,
-     * a bounded parse of the GGUF metadata and tensor-info sections, and
-     * the model family. Null when the file may be promoted; otherwise a
-     * short user-facing reason. One open: [GgufMetadata.parse] reads and
-     * checks the magic and version itself, so no separate header pre-read
-     * (two opens could observe different file states).
+     * Deep check of a model [file]: size, a bounded parse of the GGUF
+     * metadata and tensor-info sections, and the model kind
+     * ([ModelKind.detect]). One open: [GgufMetadata.parse] reads and checks
+     * the magic and version itself, so no separate header pre-read (two
+     * opens could observe different file states). Runs before promotion
+     * ([validateStaged]) and again at each load, where the kind picks the
+     * engine.
      *
-     * Family rule: every GGUF dialect the native engine loads (native
-     * parakeet.*, parakeet.cpp/CrispASR, and transcribe.cpp stt.parakeet.* —
-     * see cpp/parakeet/compat.cpp) carries metadata keys under "parakeet."
-     * or "stt.parakeet.". An unrelated GGUF (a llama-class chat model, a
-     * whisper model, ...) carries none, and is rejected here before it can
-     * replace the active model. Intentionally conservative divergence from
-     * the native loader: a hypothetical hand-built model with neither key
-     * family but loadable tensor names would be rejected at import rather
+     * Intentionally conservative divergence from the native loader: a
+     * hypothetical hand-built model without the metadata [ModelKind.detect]
+     * reads, but with loadable tensor names, is rejected at import rather
      * than after replacing the last usable model.
      */
-    fun validateStaged(file: File): String? {
+    fun inspect(file: File): ModelKind.Detection {
         if (file.length() < MIN_MODEL_BYTES) {
-            return "This file is too small to be a Parakeet model."
+            return ModelKind.Detection.Unsupported(TOO_SMALL)
         }
-        val metadata = GgufMetadata.parse(file) ?: return "This model file is corrupt or truncated."
-        val parakeetFamily = metadata.keys.any { it.startsWith("parakeet.") || it.startsWith("stt.parakeet.") }
-        if (!parakeetFamily) {
-            // Corruption-controlled up to the 4 MiB parse budget; cap what
-            // reaches the user-facing message.
-            val architecture = metadata.strings["general.architecture"]?.take(MAX_ARCHITECTURE_DISPLAY_CHARS)
-            return "This GGUF (${architecture ?: "no architecture tag"}) is not a Parakeet model."
-        }
-        return null
+        val metadata = GgufMetadata.parse(file)
+            ?: return ModelKind.Detection.Unsupported("This model file is corrupt or truncated.")
+        return ModelKind.detect(metadata)
     }
+
+    /**
+     * Pre-promotion check of a fully staged model [file] (B08): null when it
+     * may be promoted; otherwise [inspect]'s short user-facing reason. An
+     * unrelated GGUF (a llama-class chat model, a whisper model, the S1 text
+     * model, ...) is rejected here, before it can replace the active model.
+     */
+    fun validateStaged(file: File): String? =
+        (inspect(file) as? ModelKind.Detection.Unsupported)?.reason
 }

@@ -25,7 +25,7 @@ class ModelFilesTest {
 
     @Test
     fun `rejects undersized files even with correct magic`() {
-        assertNotNull(ModelFiles.validate(1024, "GGUF".toByteArray()))
+        assertEquals("This file is too small to be a speech model.", ModelFiles.validate(1024, "GGUF".toByteArray()))
     }
 
     // ---- validateStaged (deep, staged-file contract) ----------------------
@@ -70,7 +70,7 @@ class ModelFilesTest {
         val reason = ModelFiles.validateStaged(unrelatedGguf(longTag))
 
         assertTrue(reason!!.startsWith("This GGUF ("))
-        val echoed = reason.removePrefix("This GGUF (").removeSuffix(") is not a Parakeet model.")
+        val echoed = reason.removePrefix("This GGUF (").removeSuffix(") is not a supported speech model.")
         assertEquals(
             "only the first 40 characters of a corruption-controlled tag may reach the message",
             40,
@@ -82,8 +82,56 @@ class ModelFilesTest {
     @Test
     fun `short architecture tags are echoed in full`() {
         assertEquals(
-            "This GGUF (llama) is not a Parakeet model.",
+            "This GGUF (llama) is not a supported speech model.",
             ModelFiles.validateStaged(unrelatedGguf("llama")),
+        )
+    }
+
+    private fun stagedOf(header: ByteArray, sizeBytes: Long = ModelFiles.MIN_MODEL_BYTES): File {
+        val file = Files.createTempDirectory("starling-modelfiles").resolve("staged.gguf").toFile()
+        RandomAccessFile(file, "rw").use { handled ->
+            handled.write(header)
+            handled.setLength(sizeBytes)
+        }
+        return file
+    }
+
+    @Test
+    fun `accepts every speech model kind and reports what it found`() {
+        assertNull(ModelFiles.validateStaged(stagedOf(ModelKindTest.gguf("parakeet.preprocessor.normalize" to "per_feature"))))
+        for ((architecture, kind) in listOf(
+            "moss_transcribe" to ModelKind.MOSS,
+            "ark" to ModelKind.ARK,
+            "granite" to ModelKind.GRANITE,
+            "qwen3" to ModelKind.QWEN3,
+            "voxtral" to ModelKind.VOXTRAL,
+        )) {
+            val staged = stagedOf(ModelKindTest.gguf("general.architecture" to architecture))
+            assertNull(architecture, ModelFiles.validateStaged(staged))
+            assertEquals(
+                ModelKind.Detection.Supported(kind, kind.label),
+                ModelFiles.inspect(staged),
+            )
+        }
+    }
+
+    @Test
+    fun `rejection messages name the problem`() {
+        assertEquals(
+            "This file is too small to be a speech model.",
+            ModelFiles.validateStaged(stagedOf(ModelKindTest.gguf("general.architecture" to "qwen3"), 1024)),
+        )
+        assertEquals(
+            "This model file is corrupt or truncated.",
+            ModelFiles.validateStaged(stagedOf("GGUF".toByteArray() + u32(9))),
+        )
+        assertEquals(
+            "S1-mini is a text model, not a speech model.",
+            ModelFiles.validateStaged(stagedOf(ModelKindTest.gguf("general.architecture" to "s1"))),
+        )
+        assertEquals(
+            "This GGUF (no architecture tag) is not a supported speech model.",
+            ModelFiles.validateStaged(stagedOf(ModelKindTest.gguf("general.name" to "mystery"))),
         )
     }
 }

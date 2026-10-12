@@ -16,23 +16,27 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Owns the on-device Parakeet engine: the installed GGUFs, which one is
- * active, the native model context, and its warmup. Every `*.gguf` in
+ * Owns the on-device speech engine: the installed GGUFs, which one is
+ * active, the native model context, and its warmup. Each GGUF loads as the
+ * [ModelKind] its metadata names (Parakeet or one of the LLM-decoder speech
+ * models), detected at import and again at every load. Every `*.gguf` in
  * [modelDir] is an installed model (imports keep their file name, downloads
  * their catalog name); the active one is named in [ACTIVE_FILE_NAME], and
  * falls back to the first installed model when that file is missing or
  * names a deleted model. The model loads on first use, or ahead of it
  * through [prepare] (the [ModelLifetime] preload), and then stays resident
- * (hundreds of MB for a 0.6B q4 model) until [releaseWhenIdle] drops it
- * under memory pressure or [releaseIfIdle] drops it after the idle policy's
- * timeout; the next use reloads it. All calls are serialized; the engine
+ * (hundreds of MB for a 0.6B q4 model, GBs for the larger kinds) until
+ * [releaseWhenIdle] drops it under memory pressure or [releaseIfIdle] drops
+ * it after the idle policy's timeout; the next use reloads it. All calls are serialized; the engine
  * additionally mutexes inside the C API. [observer] learns about loads,
  * unloads, failures, and the end of each use, so the lifetime policy and the
  * UI never have to take the engine lock to know where the model stands.
  *
- * [memoryGate] is consulted before each load with the model's size and
- * returns a reason to refuse it (not enough free memory), so a load that
- * cannot fit fails with an explanation instead of the process being killed.
+ * [memoryGate] is consulted before each load with the model's size and kind
+ * (the kind sets the working set on top of the weights, see
+ * [ModelKind.workingSetBytes]) and returns a reason to refuse it (not
+ * enough free memory), so a load that cannot fit fails with an explanation
+ * instead of the process being killed.
  * [nativeSupport] decides whether this CPU can run the native library at all
  * (see [NativeSupport]); it is checked before the library is first loaded.
  * [keepAwake] holds the CPU awake (a partial wake lock in the app) around
@@ -41,7 +45,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class OnDeviceEngine(
     private val modelDir: File,
-    private val memoryGate: (modelBytes: Long) -> String? = { null },
+    private val memoryGate: (modelBytes: Long, kind: ModelKind) -> String? = { _, _ -> null },
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
     private val keepAwake: () -> AutoCloseable = { AutoCloseable {} },
 ) : OnDeviceStreamSession.LiveEngine {
@@ -49,7 +53,8 @@ class OnDeviceEngine(
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
 
     sealed interface ImportResult {
-        data class Imported(val sizeBytes: Long, val name: String) : ImportResult
+        /** [model] names what was imported ([ModelKind.Detection.Supported.displayName]). */
+        data class Imported(val sizeBytes: Long, val name: String, val model: String) : ImportResult
         data class Rejected(val reason: String, val stage: ImportStage) : ImportResult
     }
 
@@ -273,8 +278,8 @@ class OnDeviceEngine(
      *    interrupted import can never corrupt another import's staging) and
      *    fsynced, so a later promotion can never publish a half-written file;
      * 3. the staged file is validated (magic, size, bounded GGUF metadata +
-     *    tensor-info parse including the data-section size, Parakeet model
-     *    family) BEFORE the active model is touched;
+     *    tensor-info parse including the data-section size, a supported
+     *    [ModelKind]) BEFORE the active model is touched;
      * 4. promotion is a single atomic rename over the target — the previous
      *    model is never deleted first, so any failure at any earlier stage
      *    (or the rename itself) leaves the last usable model in place.
@@ -376,9 +381,10 @@ class OnDeviceEngine(
             // Validation reads only the staging file, so it runs outside the
             // engine lock; a concurrent transcription keeps serving the
             // previous model meanwhile.
-            val rejection = ModelFiles.validateStaged(staged)
-            if (rejection != null) {
-                return ImportResult.Rejected(rejection, ImportStage.VALIDATE)
+            val model = when (val detection = ModelFiles.inspect(staged)) {
+                is ModelKind.Detection.Unsupported ->
+                    return ImportResult.Rejected(detection.reason, ImportStage.VALIDATE)
+                is ModelKind.Detection.Supported -> detection.displayName
             }
 
             val modelFile = target()
@@ -401,7 +407,7 @@ class OnDeviceEngine(
             // A fresh import is what the user wants to use next. The model is
             // installed even if this marker write fails.
             runCatching { writeActiveName(modelFile.name) }
-            return ImportResult.Imported(size, modelFile.name)
+            return ImportResult.Imported(size, modelFile.name, model)
         } finally {
             // Every path that reaches here without a rename-based promotion
             // leaves the staged file behind: rejection, failed promotion, a
@@ -504,7 +510,7 @@ class OnDeviceEngine(
      */
     private fun ensureLoadedLocked(active: File? = activeModelFile()): String? {
         val modelFile = active
-            ?: return "Download or import a Parakeet model first to transcribe on this device."
+            ?: return "Download or import a speech model first to transcribe on this device."
         // The user picked another model since this one was loaded. A live
         // session keeps the loaded one: a mid-recording reload of hundreds
         // of MB would stall the stream (the switch follows the session).
@@ -528,7 +534,17 @@ class OnDeviceEngine(
             loadError = reason
             return "The on-device engine cannot run here: $reason"
         }
-        memoryGate(modelFile.length())?.let { reason ->
+        // The kind picks the engine, so it is read from the file being
+        // loaded (bounded, like the import's check) rather than remembered:
+        // a file replaced since its import still loads as what it is.
+        val kind = when (val detection = ModelFiles.inspect(modelFile)) {
+            is ModelKind.Detection.Unsupported -> {
+                loadError = detection.reason
+                return detection.reason
+            }
+            is ModelKind.Detection.Supported -> detection.kind
+        }
+        memoryGate(modelFile.length(), kind)?.let { reason ->
             loadError = reason
             return "The on-device model was not loaded: $reason"
         }
@@ -540,7 +556,7 @@ class OnDeviceEngine(
             loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
             return "The on-device engine is incompatible: $loadError"
         }
-        val loaded = StarlingNative.load(modelFile.absolutePath)
+        val loaded = StarlingNative.load(modelFile.absolutePath, kind.nativeKind)
         if (loaded == 0L) {
             val reason = StarlingNative.lastError(0L) ?: "the model could not be loaded"
             loadError = reason

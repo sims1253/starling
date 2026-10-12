@@ -3,6 +3,7 @@ package dev.starling.mobile
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import dev.starling.mobile.engine.ModelCatalog
 import dev.starling.mobile.engine.ModelDownload
 import dev.starling.mobile.engine.ModelDownloader
 import dev.starling.mobile.engine.OnDeviceEngine
@@ -31,6 +32,14 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
 
     val isRunning: Boolean get() = state is State.Running
 
+    /**
+     * The model of the running or most recently started download. Main
+     * thread. After process death, the catalog model whose partial is on
+     * disk (start() keeps at most one), so it is still offered for a resume.
+     */
+    var spec: ModelDownload? = ModelCatalog.ALL.firstOrNull { engine.downloadFile(it).length() > 0 }
+        private set
+
     /** Bytes already on disk from an earlier, unfinished attempt. */
     fun resumableBytes(spec: ModelDownload): Long =
         engine.downloadFile(spec).length().coerceAtMost(spec.sizeBytes)
@@ -49,6 +58,7 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
         if (isRunning) return
         val job = ModelDownloader()
         downloader = job
+        this.spec = spec
         publish(State.Running(resumableBytes(spec), spec.sizeBytes, verifying = false))
         Thread({ run(job, spec) }, "starling-model-download").apply { isDaemon = true }.start()
     }
@@ -59,6 +69,12 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
     }
 
     private fun run(job: ModelDownloader, spec: ModelDownload) {
+        // One partial at a time: another model's unfinished download (up to
+        // ~1.5 GB) would otherwise stay on disk with nothing resuming it.
+        // Here, off the main thread: unlinking that much can take a while.
+        for (other in ModelCatalog.ALL) {
+            if (other.sha256 != spec.sha256) engine.downloadFile(other).delete()
+        }
         val partial = engine.downloadFile(spec)
         val result = runCatching {
             job.download(spec, partial) { bytes, total, verifying ->
