@@ -147,22 +147,30 @@ bool BpeTokenizer::load(const ModelLoader& m, std::string& e) {
     for (size_t i = 0; i < b.size(); ++i) {
         put(byte_encoder_utf8_[(uint8_t) b[i]], (uint32_t) cs[i]);
     }
-    for (size_t i = 0; i < tokens_.size(); ++i) {
-        if (!types_.empty() && types_[i] == 3) special_ids_[tokens_[i]] = (int32_t) i;
-        else if (!token_ids_.count(tokens_[i])) token_ids_[tokens_[i]] = (int32_t) i;
-    }
-    // Merge ranks ("left right" pairs). Absent merges disable encode().
-    std::vector<std::string> merges;
-    if (m.kv_arr_str("tokenizer.ggml.merges", merges)) {
-        for (size_t r = 0; r < merges.size(); ++r) {
-            const std::string& s = merges[r];
+    // Merge ranks ("left right" pairs), kept raw until the first encode().
+    // Absent merges disable encode().
+    enc_ = std::make_shared<Encoder>();
+    m.kv_arr_str("tokenizer.ggml.merges", enc_->merges);
+    return true;
+}
+
+const BpeTokenizer::Encoder& BpeTokenizer::encoder() const {
+    Encoder& E = *enc_;
+    std::call_once(E.once, [&] {
+        for (size_t i = 0; i < tokens_.size(); ++i) {
+            if (!types_.empty() && types_[i] == 3) E.special_ids[tokens_[i]] = (int32_t) i;
+            else if (!E.token_ids.count(tokens_[i])) E.token_ids[tokens_[i]] = (int32_t) i;
+        }
+        for (size_t r = 0; r < E.merges.size(); ++r) {
+            const std::string& s = E.merges[r];
             size_t sp = s.find(' ');
             if (sp == std::string::npos || s.find(' ', sp + 1) != std::string::npos)
                 continue;
-            merge_ranks_[{s.substr(0, sp), s.substr(sp + 1)}] = (int32_t) r;
+            E.merge_ranks[{s.substr(0, sp), s.substr(sp + 1)}] = (int32_t) r;
         }
-    }
-    return true;
+        std::vector<std::string>().swap(E.merges);
+    });
+    return E;
 }
 
 std::string BpeTokenizer::decode(const std::vector<int32_t>& ids, bool skip) const {
@@ -258,7 +266,8 @@ std::string cps_to_utf8(const std::vector<uint32_t>& v, size_t from, size_t to) 
 
 bool BpeTokenizer::encode(const std::string& text, std::vector<int32_t>& ids,
                           std::string& e) const {
-    if (merge_ranks_.empty() || token_ids_.empty()) {
+    const Encoder& E = encoder();
+    if (E.merge_ranks.empty() || E.token_ids.empty()) {
         e = "tokenizer has no merges/pieces (GGUF lacks tokenizer.ggml.merges)";
         return false;
     }
@@ -276,8 +285,8 @@ bool BpeTokenizer::encode(const std::string& text, std::vector<int32_t>& ids,
             size_t best_i = sym.size();
             int32_t best_rank = -1;
             for (size_t k = 0; k + 1 < sym.size(); ++k) {
-                auto it = merge_ranks_.find({sym[k], sym[k + 1]});
-                if (it != merge_ranks_.end() &&
+                auto it = E.merge_ranks.find({sym[k], sym[k + 1]});
+                if (it != E.merge_ranks.end() &&
                     (best_rank < 0 || it->second < best_rank)) {
                     best_rank = it->second;
                     best_i = k;
@@ -288,8 +297,8 @@ bool BpeTokenizer::encode(const std::string& text, std::vector<int32_t>& ids,
             sym.erase(sym.begin() + (std::ptrdiff_t) best_i + 1);
         }
         for (const std::string& s : sym) {
-            auto it = token_ids_.find(s);
-            if (it == token_ids_.end()) {
+            auto it = E.token_ids.find(s);
+            if (it == E.token_ids.end()) {
                 e = "BPE piece not in vocabulary: " + s;
                 return false;
             }
@@ -303,7 +312,7 @@ bool BpeTokenizer::encode(const std::string& text, std::vector<int32_t>& ids,
         // Special-token LONGEST match first (all-ASCII template tokens).
         int32_t special_id = -1;
         size_t special_len = 0;
-        for (const auto& [s, id] : special_ids_) {
+        for (const auto& [s, id] : E.special_ids) {
             const size_t len = s.size();
             if (len <= special_len || i + len > v.size()) continue;
             bool ok = true;

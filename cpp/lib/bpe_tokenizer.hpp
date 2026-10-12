@@ -13,6 +13,8 @@
 #include "runtime/model_loader.hpp"
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -46,11 +48,19 @@ private:
     std::vector<std::string> tokens_;
     std::vector<int32_t> types_;  // 3 == unused/special, skipped when skip_special
     std::unordered_map<uint32_t, uint8_t> byte_decoder_;
-    // Encoder-side tables (built when tokenizer.ggml.merges is present).
+    // Encoder-side tables, built on the first encode(): only s1 encodes, and
+    // building them (~150k pieces and merges) dominated every other model's
+    // tokenizer load. Shared between copies; immutable once built.
+    struct Encoder {
+        std::once_flag once;
+        std::vector<std::string> merges;  // "left right", in rank order (consumed by the build)
+        std::unordered_map<std::string, int32_t> token_ids;  // byte-level piece -> id
+        std::map<std::pair<std::string, std::string>, int32_t> merge_ranks;  // pair -> rank
+        std::unordered_map<std::string, int32_t> special_ids;  // special string -> id
+    };
     std::string byte_encoder_utf8_[256];  // byte -> byte-level unicode char (UTF-8)
-    std::unordered_map<std::string, int32_t> token_ids_;  // byte-level piece -> id
-    std::map<std::pair<std::string, std::string>, int32_t> merge_ranks_;  // pair -> rank
-    std::unordered_map<std::string, int32_t> special_ids_;  // special string -> id
+    std::shared_ptr<Encoder> enc_ = std::make_shared<Encoder>();
+    const Encoder& encoder() const;
 };
 
 } // namespace starling::ggml::lib
