@@ -20,10 +20,16 @@ TYPES = gguf.GGMLQuantizationType
 PW1 = "encoder.layers.0.conv.pointwise_conv1.weight"
 
 
-def imatrix_entry(name: str, width: int) -> bytes:
+def imatrix_entry(name: str, width: int, values=None) -> bytes:
     raw = name.encode()
+    values = np.ones(width) if values is None else values
     return (struct.pack("<I", len(raw)) + raw + struct.pack("<IQ", width, 1)
-            + np.ones(width, dtype="<f4").tobytes())
+            + np.asarray(values, dtype="<f4").tobytes())
+
+
+def imatrix_file(path: Path, *entries: bytes) -> Path:
+    path.write_bytes(b"STLGIMX1" + struct.pack("<II", 1, len(entries)) + b"".join(entries))
+    return path
 
 
 @pytest.fixture
@@ -35,12 +41,10 @@ def quantize(tmp_path):
         pytest.skip("build starling-quantize or set STARLING_QUANTIZE_BIN")
     # The collector records a weight the engine casts/reshapes first under
     # ggml's derived name; the quantizer must use it for the weight itself.
-    imatrix = tmp_path / "imatrix.imx"
-    imatrix.write_bytes(b"STLGIMX1" + struct.pack("<II", 1, 1)
-                        + imatrix_entry(PW1 + " (copy) (reshaped)", 256))
+    default_imatrix = imatrix_file(tmp_path / "imatrix.imx", imatrix_entry(PW1 + " (copy) (reshaped)", 256))
     calls = 0
 
-    def run(arch, tensors, recipe):
+    def run(arch, tensors, recipe, imatrix=None, payload=False):
         nonlocal calls
         calls += 1
         source, output = tmp_path / f"in{calls}.gguf", tmp_path / f"out{calls}.gguf"
@@ -55,9 +59,11 @@ def quantize(tmp_path):
         recipe_path = tmp_path / f"recipe{calls}"
         recipe_path.write_text(recipe)
         done = subprocess.run([str(binary), "--input", str(source), "--output", str(output),
-                               "--recipe", str(recipe_path), "--imatrix", str(imatrix)],
+                               "--recipe", str(recipe_path), "--imatrix", str(imatrix or default_imatrix)],
                               check=True, capture_output=True, text=True)
         reader = gguf.GGUFReader(str(output))
+        if payload:
+            return {t.name: bytes(t.data.tobytes()) for t in reader.tensors}, done.stderr
         return {t.name: (t.tensor_type, tuple(int(x) for x in t.shape)) for t in reader.tensors}, done.stderr
 
     return run
@@ -103,6 +109,25 @@ def test_pointwise_conv_is_flattened_only_when_quantized(quantize):
     assert f16[PW1] == (TYPES.F16, (1, 256, 512))
     assert q4[PW1] == (TYPES.Q4_0, (256, 512))
     assert "(1 by derived name)" in stderr
+
+
+def test_derived_name_imatrix_weights_the_quantization(quantize, tmp_path):
+    # A strongly non-uniform matrix under the derived name must change the
+    # Q4_0 payload compared with the same matrix filed under another name
+    # (which leaves the tensor unweighted), and an identical matrix under the
+    # derived and the plain name must give the same bytes.
+    rng = np.random.default_rng(3)
+    values = np.exp(rng.normal(0.0, 3.0, 256))
+    recipe = f"default q4_0\n{PW1}$ q4_0\n"
+    derived = imatrix_file(tmp_path / "derived.imx", imatrix_entry(PW1 + " (copy) (reshaped)", 256, values))
+    plain = imatrix_file(tmp_path / "plain.imx", imatrix_entry(PW1, 256, values))
+    other = imatrix_file(tmp_path / "other.imx", imatrix_entry("unrelated.weight", 256, values))
+    by_derived, stderr = quantize("parakeet_tdt", PARAKEET, recipe, imatrix=derived, payload=True)
+    by_plain, _ = quantize("parakeet_tdt", PARAKEET, recipe, imatrix=plain, payload=True)
+    unweighted, _ = quantize("parakeet_tdt", PARAKEET, recipe, imatrix=other, payload=True)
+    assert "(1 by derived name)" in stderr
+    assert by_derived[PW1] == by_plain[PW1]
+    assert by_derived[PW1] != unweighted[PW1]
 
 
 def test_conv_named_linears_opt_in_per_architecture(quantize):
