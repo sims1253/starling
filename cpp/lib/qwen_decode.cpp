@@ -62,9 +62,9 @@ const char* lm_head_name(const QwenDecodeSpec& s) {
     return s.tied_lm_head ? "llm.embed.weight" : "llm.lm_head.weight";
 }
 
-// lm_head GEMM under gemm_act's quantized-weight rule (see graph_helpers.hpp):
-// bf16 activations against unquantized heads, F32 against block-quantized
-// ones (ggml's quantized matmul asserts F32 src1).
+// lm_head GEMM under gemm_act's rule (see graph_helpers.hpp): bf16
+// activations against a bf16 head, F32 against every other type (ggml's
+// quantized and F16/F32 CPU matmuls assert F32 src1).
 ggml_tensor* lm_head_gemm(ggml_context* c, const ModelLoader& ml,
                           const QwenDecodeSpec& s, ggml_tensor* x) {
     ggml_tensor* w = wb(c, ml, lm_head_name(s));
