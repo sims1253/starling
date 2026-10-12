@@ -7,6 +7,7 @@ members = [
     "crates/app",
     "crates/insertion",
 ]
+exclude = ["vendor/xattr"]
 resolver = "2"
 
 # The FLAC codec (#342) runs over whole takes — tens of millions of
@@ -18,3 +19,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.md-5]
 opt-level = 3
+
+# GPUI's zed-async-tar still requires xattr ^0.2, which uses an errno alias
+# removed by libc 0.2.190. See vendor/xattr/STARLING-PATCH.md for removal.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
