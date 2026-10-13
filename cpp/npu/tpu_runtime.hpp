@@ -8,6 +8,8 @@
 // AHardwareBuffer-backed I/O.
 #pragma once
 
+#include "artifact_format.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -27,18 +29,11 @@ std::string vendor_version();
 // Compiles a whole .tflite (single subgraph, fully supported) on the device.
 bool compile_tflite(const void* tflite, size_t size, std::vector<uint8_t>& bytecode, std::string& err);
 
-// Artifact: a 4 KiB header followed by the bytecode at `bytecode_offset`.
-struct ArtifactInfo {
-    std::string function;                  // signature key the bytecode exports
-    std::string key;                       // what the graph computes (model family + shapes), checked by the loader
-    std::vector<uint64_t> in_bytes, out_bytes;
-    std::string vendor;                    // thrGetVendorApiVersion() at compile time
-    uint64_t model_hash = 0;               // fingerprint of the model it belongs to (see gguf_fingerprint)
-    uint64_t tflite_hash = 0;              // FNV-1a of the compiled .tflite (provenance)
-    uint64_t bytecode_offset = 0, bytecode_size = 0;
-};
+// Artifact: a 4 KiB header followed by the bytecode (artifact_format.hpp).
 bool write_artifact(const std::string& path, const ArtifactInfo& info, const std::vector<uint8_t>& bytecode,
                     std::string& err);
+// Reads and validates the header (bytecode within the file, see
+// parse_artifact_header).
 bool read_artifact_info(const std::string& path, ArtifactInfo& info, std::string& err);
 uint64_t fnv1a(const void* data, size_t size);
 
@@ -49,7 +44,7 @@ public:
     TpuModel(const TpuModel&) = delete;
     TpuModel& operator=(const TpuModel&) = delete;
 
-    bool open(const std::string& artifact_path, std::string& err);   // mmaps the artifact
+    bool open(const std::string& artifact_path, std::string& err);   // validates, then mmaps the artifact
     // Host access to the I/O buffers (AHardwareBuffer BLOBs, also importable
     // into Vulkan as external memory).
     bool write_input(size_t i, const void* data, size_t bytes, std::string& err);

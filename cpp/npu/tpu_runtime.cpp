@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -101,20 +102,22 @@ const char* edge_name(std::vector<std::string>& names, size_t i) {
     return names[i].c_str();
 }
 
-constexpr char kMagic[8] = {'S', 'T', 'N', 'P', 'U', 'v', '3', '\0'};
-constexpr size_t kHeader = 4096;
-
-struct RawHeader {
-    char magic[8];
-    uint32_t n_in, n_out;
-    uint64_t in_bytes[64], out_bytes[64];
-    char function[64];
-    char vendor[64];
-    char key[256];
-    uint64_t model_hash, tflite_hash;
-    uint64_t bytecode_offset, bytecode_size;
-};
-static_assert(sizeof(RawHeader) < kHeader, "header fits");
+// Reads the header of the open artifact `fd` and checks it against the size
+// of that same file.
+bool read_artifact_fd(int fd, const std::string& path, ArtifactInfo& info, std::string& err) {
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        err = "cannot stat " + path;
+        return false;
+    }
+    ArtifactHeader h{};
+    const ssize_t got = ::pread(fd, &h, sizeof h, 0);
+    if (!parse_artifact_header(&h, got > 0 ? (size_t)got : 0, (uint64_t)st.st_size, info, err)) {
+        err += ": " + path;
+        return false;
+    }
+    return true;
+}
 
 }  // namespace
 
@@ -179,12 +182,12 @@ bool compile_tflite(const void* tflite, size_t size, std::vector<uint8_t>& bytec
 bool write_artifact(const std::string& path, const ArtifactInfo& info, const std::vector<uint8_t>& bytecode,
                     std::string& err) {
     if (info.in_bytes.size() > 64 || info.out_bytes.size() > 64 || info.function.size() >= 64 ||
-        info.key.size() >= 256) {
-        err = "artifact: too many I/Os or function name too long";
+        info.key.size() >= 256 || bytecode.empty()) {
+        err = "artifact: too many I/Os, function name or key too long, or no bytecode";
         return false;
     }
-    RawHeader h{};
-    std::memcpy(h.magic, kMagic, 8);
+    ArtifactHeader h{};
+    std::memcpy(h.magic, kArtifactMagic, sizeof h.magic);
     h.n_in = (uint32_t)info.in_bytes.size();
     h.n_out = (uint32_t)info.out_bytes.size();
     for (size_t i = 0; i < info.in_bytes.size(); ++i) h.in_bytes[i] = info.in_bytes[i];
@@ -194,7 +197,7 @@ bool write_artifact(const std::string& path, const ArtifactInfo& info, const std
     std::snprintf(h.key, sizeof h.key, "%s", info.key.c_str());
     h.model_hash = info.model_hash;
     h.tflite_hash = info.tflite_hash;
-    h.bytecode_offset = kHeader;
+    h.bytecode_offset = kArtifactHeaderBytes;
     h.bytecode_size = bytecode.size();
     const std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -202,7 +205,7 @@ bool write_artifact(const std::string& path, const ArtifactInfo& info, const std
         err = "cannot write " + tmp;
         return false;
     }
-    std::vector<uint8_t> head(kHeader, 0);
+    std::vector<uint8_t> head(kArtifactHeaderBytes, 0);
     std::memcpy(head.data(), &h, sizeof h);
     bool ok = std::fwrite(head.data(), 1, head.size(), f) == head.size() &&
               std::fwrite(bytecode.data(), 1, bytecode.size(), f) == bytecode.size();
@@ -218,30 +221,14 @@ bool write_artifact(const std::string& path, const ArtifactInfo& info, const std
 }
 
 bool read_artifact_info(const std::string& path, ArtifactInfo& info, std::string& err) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         err = "cannot open " + path;
         return false;
     }
-    RawHeader h{};
-    size_t got = std::fread(&h, 1, sizeof h, f);
-    std::fclose(f);
-    if (got != sizeof h || std::memcmp(h.magic, kMagic, 8) != 0 || h.n_in > 64 || h.n_out > 64) {
-        err = "not a Starling NPU artifact: " + path;
-        return false;
-    }
-    info = ArtifactInfo{};
-    h.function[63] = h.vendor[63] = h.key[255] = 0;
-    info.function = h.function;
-    info.vendor = h.vendor;
-    info.key = h.key;
-    info.tflite_hash = h.tflite_hash;
-    info.in_bytes.assign(h.in_bytes, h.in_bytes + h.n_in);
-    info.out_bytes.assign(h.out_bytes, h.out_bytes + h.n_out);
-    info.model_hash = h.model_hash;
-    info.bytecode_offset = h.bytecode_offset;
-    info.bytecode_size = h.bytecode_size;
-    return true;
+    const bool ok = read_artifact_fd(fd, path, info, err);
+    ::close(fd);
+    return ok;
 }
 
 TpuModel::~TpuModel() { close(); }
@@ -301,7 +288,23 @@ bool TpuModel::open(const std::string& path, std::string& err) {
     sb_ = load_southbound(err);
     if (!sb_) return false;
     const SouthBound* s = sb_;
-    if (!read_artifact_info(path, info_, err)) return false;
+    // Header and size come from the one fd that gets mapped, so a truncated
+    // (or swapped) file is rejected here instead of faulting in the firmware.
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        err = "cannot open " + path;
+        return false;
+    }
+    fd_ = fd;
+    if (!read_artifact_fd(fd, path, info_, err)) return false;
+    // The bytecode stays in the mapped file (no copy).
+    map_len_ = (size_t)(info_.bytecode_offset + info_.bytecode_size);
+    map_ = mmap(nullptr, map_len_, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_ == MAP_FAILED) {
+        map_ = nullptr;
+        err = "mmap failed";
+        return false;
+    }
 
     auto* ctx = s->context_create();
     if (!ctx) {
@@ -316,23 +319,9 @@ bool TpuModel::open(const std::string& path, std::string& err) {
     }
 
     ThrSqContainerHandle sq = 0;
-    ThrStatus st = kThrStatusFail;
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        err = "cannot open " + path;
-        return false;
-    }
-    fd_ = fd;
-    // The bytecode stays in the mapped file (no copy).
-    map_len_ = info_.bytecode_offset + info_.bytecode_size;
-    map_ = mmap(nullptr, map_len_, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (map_ == MAP_FAILED) {
-        map_ = nullptr;
-        err = "mmap failed";
-        return false;
-    }
-    st = s->load_sq_container(ctx, kThrSqContainerTypeMlModel,
-                              static_cast<const uint8_t*>(map_) + info_.bytecode_offset, info_.bytecode_size, &sq);
+    const ThrStatus st =
+        s->load_sq_container(ctx, kThrSqContainerTypeMlModel, static_cast<const uint8_t*>(map_) + info_.bytecode_offset,
+                             info_.bytecode_size, &sq);
     if (st != kThrStatusSuccess) {
         err = "loading the SQ container failed";
         return false;
