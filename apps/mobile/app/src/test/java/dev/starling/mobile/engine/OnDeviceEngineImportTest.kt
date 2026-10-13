@@ -434,6 +434,11 @@ class OnDeviceEngineImportTest {
             assertEquals(sharedDir, debug.downloadFile(spec).parentFile)
             assertTrue(debug.downloadFile(spec) != release.downloadFile(spec))
 
+            // A partial an older build paused, before partials carried a tag, resumes.
+            val legacy = File(privateDir, "download-${spec.sha256.take(16)}.part").apply { writeBytes(byteArrayOf(1)) }
+            assertEquals(legacy, debug.downloadFile(spec))
+            legacy.delete()
+
             val paused = File(privateDir, debug.downloadFile(spec).name).apply { writeBytes(byteArrayOf(1)) }
             assertEquals(paused, debug.downloadFile(spec))
         } finally {

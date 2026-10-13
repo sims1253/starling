@@ -68,7 +68,11 @@ class OnDeviceEngine(
         keepAwake: () -> AutoCloseable = { AutoCloseable {} },
     ) : this({ modelDir }, modelDir, memoryGate, nativeSupport, keepAwake)
 
-    /** What [adoptModels] did: models moved, and models it had to leave where they were. */
+    /**
+     * What [adoptModels] did: models moved (an identical copy already in
+     * place counts, its private duplicate removed), and models it had to
+     * leave where they were.
+     */
     data class Adoption(val moved: Int, val remaining: Int)
 
     /** Where in [importModel] a rejection happened; import failures report their stage. */
@@ -433,6 +437,7 @@ class OnDeviceEngine(
         val sources = from.listFiles { file -> file.isFile && isModelName(file.name) }.orEmpty()
         var moved = 0
         var remaining = 0
+        if (sources.isNotEmpty()) sweepStaleStaging(dir)
         for (source in sources) {
             // Compared outside the folder lock (it reads both files end to
             // end), then dropped under it once the shared copy is still the
@@ -456,7 +461,6 @@ class OnDeviceEngine(
                 remaining++
                 continue
             }
-            sweepStaleStaging(dir)
             val staged = stagingFile(dir)
             val placed = runCatching {
                 source.inputStream().use { input ->
@@ -514,7 +518,7 @@ class OnDeviceEngine(
                     val n = left.readNBytesCompat(x)
                     if (n != right.readNBytesCompat(y)) return false
                     if (n == 0) return true
-                    if (!x.copyOf(n).contentEquals(y.copyOf(n))) return false
+                    for (i in 0 until n) if (x[i] != y[i]) return false
                 }
             }
         }
@@ -635,11 +639,14 @@ class OnDeviceEngine(
      * Where this install's in-progress download of [spec] lives (resumable
      * across restarts). Named for [partialTag], so builds sharing the folder
      * never write or clean up each other's. A partial already in [ownDir]
-     * (paused before the models moved) is resumed there.
+     * (paused before the models moved, or by a build that named partials
+     * without the tag) is resumed there.
      */
     fun downloadFile(spec: ModelDownload): File {
-        val name = "download-${spec.sha256.take(16)}.$partialTag.part"
-        return File(ownDir, name).takeIf { it.isFile } ?: File(modelDirectory(), name)
+        val stem = "download-${spec.sha256.take(16)}"
+        val name = "$stem.$partialTag.part"
+        return listOf(File(ownDir, name), File(ownDir, "$stem.part")).firstOrNull { it.isFile }
+            ?: File(modelDirectory(), name)
     }
 
     /**
@@ -722,7 +729,9 @@ class OnDeviceEngine(
         }.orEmpty().filter { it.absoluteFile != keep?.absoluteFile }
         // A marker write in flight holds markerLock; only an orphan is removed.
         synchronized(markerLock) { File(ownDir, "$ACTIVE_FILE_NAME.tmp").delete() }
-        for (file in stale) deleteFile(file, "stale staging file")
+        // Under the folder lock, like every other deletion in a folder other
+        // builds may share.
+        if (stale.isNotEmpty()) withFolderLock(dir) { for (file in stale) deleteFile(file, "stale staging file") }
     }
 
     /** Deletes [file]; a real deletion failure (file still present) is logged, never thrown. */

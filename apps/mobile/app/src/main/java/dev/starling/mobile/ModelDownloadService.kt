@@ -42,11 +42,15 @@ class ModelDownloadService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Every start command counts, the Pause action's too: stopping with an
+        // older id would leave the service running.
+        lastStartId = startId
         if (intent?.action == ACTION_PAUSE) {
             downloads.cancel()
+            // Nothing running: no state change will come to stop the service.
+            if (!downloads.isRunning) finish(null)
             return START_NOT_STICKY
         }
-        lastStartId = startId
         // startForegroundService() obliges startForeground() even when the
         // download already ended; the service then leaves again at once.
         val started = runCatching {

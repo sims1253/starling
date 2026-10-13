@@ -276,7 +276,8 @@ class StarlingApplication : Application() {
                 onDeviceEngine.adoptModels(modelStorage.privateDir)
             } catch (t: Throwable) {
                 runCatching { Log.w(TAG, "moving models to shared storage failed", t) }
-                OnDeviceEngine.Adoption(0, modelStorage.unmovedModels())
+                // The same storage trouble can fail the count; a throw here would end the process.
+                OnDeviceEngine.Adoption(0, runCatching { modelStorage.unmovedModels() }.getOrDefault(1))
             }
             mainHandler.post {
                 movingModels = false
