@@ -6,9 +6,8 @@
 // weights or activations, A_CONV implicit 3x3/s2 im2col, batching over z,
 // EPI 0..5, ACT, HAS_BIAS 0..3, row_valid, alpha, mdiv/ldc_mhi, causal skip).
 //
-// Work split: one thread per row m of A, NB = 16 (or 8, -DNB=8, for small
-// grids) output columns per workgroup (x), WG rows per workgroup (y; WG = the
-// subgroup size). For every
+// Work split: one thread per row m of A, NB = 16 output columns per
+// workgroup (x), WG rows per workgroup (y; WG = the subgroup size). For every
 // 8-deep k chunk, lane j < NB of each subgroup loads the 8 weights of column
 // n0 + j and dequantizes them to f32; subgroupBroadcast(w, j) hands them to
 // every lane as uniform operands, and each thread accumulates
@@ -32,9 +31,7 @@ layout(constant_id = 2) const uint ACT = 0;
 layout(constant_id = 3) const uint HAS_BIAS = 0;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#ifndef NB
 #define NB 16
-#endif
 
 #ifdef ATEX
 layout(binding = 0) uniform usamplerBuffer a_tex;
@@ -76,13 +73,7 @@ uvec4 load_a8(uint e) {
 #endif
 }
 
-#define J8(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7)
-#define J16(X) J8(X) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
-#if NB == 8
-#define JN J8
-#else
-#define JN J16
-#endif
+#define J16(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
 
 void main() {
     const uint lane = gl_SubgroupInvocationID;
@@ -157,7 +148,7 @@ void main() {
         const vec4 a0 = vec4(unpackHalf2x16(av.x), unpackHalf2x16(av.y));
         const vec4 a1 = vec4(unpackHalf2x16(av.z), unpackHalf2x16(av.w));
 #define COL(j) acc[j] += dot(a0, subgroupBroadcast(w0, j)) + dot(a1, subgroupBroadcast(w1, j));
-        JN(COL)
+        J16(COL)
 #undef COL
     }
 

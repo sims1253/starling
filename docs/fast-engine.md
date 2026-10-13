@@ -39,7 +39,10 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR and AMD, which otherwise ship measured defaults) |
 | `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR and AMD) |
 | `STARLING_FAST_W8U=0/1` | W8 decode GEMVs through xor 0x80 + `unpackUnorm4x8` (default on for PowerVR) |
-| `STARLING_FAST_MICRO=...` | run isolated kernel probes at load, `;`-separated (`bits,N,K[,reps[,rows]]` GEMV, `gemmx,M,N,K,kind,...` prefill GEMM, `norm,...`, `alu,...`, `alu2,...`, `idot,...`; see `Kernels::micro`) |
+| `STARLING_FAST_MICRO=...` | run isolated kernel probes at load, `;`-separated (`bits,N,K[,reps[,rows]]` GEMV, `gemmx,M,N,K,kind[,reps[,f\|h\|g\|-]]` prefill GEMM — `g` = `gemm_sg.comp` —, `norm,...`, `alu,...`, `alu2,...`, `idot,...`; see `Kernels::micro`) |
+| `STARLING_FAST_SG=0/1` | encoder/prefill GEMMs through the subgroup-broadcast kernel `gemm_sg.comp` (default on for PowerVR where compute shaders have subgroup broadcast and ≥ 16-lane subgroups; off elsewhere) |
+| `STARLING_FAST_SG_TEX=0` | `gemm_sg` reads A from the storage buffer instead of through texel-buffer views (the texture path) |
+| `STARLING_FAST_SG_TEXEL_MAX=n` | tests: cap `gemm_sg`'s texel views at `n` texels, so hosts with huge limits exercise the row-blocked views PowerVR's 65536 needs |
 | `STARLING_FAST_TILE=BM,BN,TM,TN[,BK]` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile (BK: k per tile, 32/16/8) / GEMV rows |
 | `STARLING_FAST_BK=8/16/32` | GEMM k-tile depth only (default 16 on PowerVR, 32 elsewhere) |
 | `STARLING_FAST_GEMV_RPP=n` | minimum GEMV rows per row slot, kept at ≥ 64 workgroups (default 16 on PowerVR, off elsewhere; `0` = off) |
@@ -222,6 +225,7 @@ dir `Android/data/<pkg>/files/npu` (any build: `adb push`). Measured in
 | Shader | Role |
 | --- | --- |
 | `gemm.comp` | tiled GEMM, B = W4/W8/F16/F16ᵀ, f16-packed shared tiles 32 or 16 deep, batched heads/windows, causal tile skipping, implicit-GEMM 3×3/s2 convs (MOSS), fused epilogues |
+| `gemm_sg.comp` | the same GEMMs (all but F16ᵀ) without shared memory, for PowerVR: one row of A per lane, 16 columns per subgroup-sized workgroup, weights dequantized by 16 lanes and shared with `subgroupBroadcast`, A through texel-buffer views (row-blocked under `maxTexelBufferElements`), same epilogues |
 | `gemv.comp` | decode matrix-vector, x kept in registers per K slice, optional fused RMSNorm, residual / SwiGLU / argmax-partial epilogues |
 | `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup; 16-byte key loads, value mix in four position groups) |
 | `attn_decode_split.comp`, `attn_split_combine.comp` | the same, split over KV chunks (one workgroup per head and chunk), then a per-head merge of the partial softmaxes |
@@ -233,7 +237,8 @@ dir `Android/data/<pkg>/files/npu` (any build: `adb push`). Measured in
 | `embed_rows.comp`, `dec_next.comp` | embedding lookup; on-device greedy step (argmax, EOS, next embedding), both optionally adding the position's audio row (Voxtral) |
 
 Shaders use only Vulkan 1.1 core features (16-bit values are packed in 32-bit
-words); the packed-f16 variants additionally need `shaderFloat16`.
+words); the packed-f16 variants additionally need `shaderFloat16`, and
+`gemm_sg.comp` the subgroup ballot (broadcast) operations in compute shaders.
 
 ## Validation
 

@@ -247,9 +247,7 @@ public:
     // operand through the texture path where the view limits allow.
     bool sg_gemm_ = false;
     bool sg_tex_ = true;
-    // Columns per gemm_sg workgroup: 16, or 8 when a 16-column grid would
-    // have fewer than sg_min_wgs_ workgroups (STARLING_FAST_SG_NB=8/16 pins).
-    uint32_t sg_nb_ = 0, sg_min_wgs_ = 128;
+    uint32_t sg_texel_max_ = 0;   // texels per A view (maxTexelBufferElements; tests may lower it)
 
 private:
     bool gemm_sg(vk::Recording& rec, const GemmCall& c, std::string& err);

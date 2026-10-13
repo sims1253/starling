@@ -635,12 +635,13 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
         sg_gemm_ = sg_ok && di.vendor_id == 0x1010;
         if (const char* e = std::getenv("STARLING_FAST_SG")) sg_gemm_ = sg_ok && e[0] == '1';
         if (const char* e = std::getenv("STARLING_FAST_SG_TEX")) sg_tex_ = e[0] == '1';
-        if (const char* e = std::getenv("STARLING_FAST_SG_NB")) {
-            const int nb = std::atoi(e);
-            sg_nb_ = nb == 8 || nb == 16 ? (uint32_t)nb : 0;
-        }
-        if (const char* e = std::getenv("STARLING_FAST_SG_MIN_WGS")) sg_min_wgs_ = (uint32_t)std::atoi(e);
-        if (di.max_texel_elems < 1024) sg_tex_ = false;
+
+        // STARLING_FAST_SG_TEXEL_MAX (tests): a smaller view limit, so hosts
+        // with huge limits exercise the row-blocked views PowerVR needs.
+        sg_texel_max_ = di.max_texel_elems;
+        if (const char* e = std::getenv("STARLING_FAST_SG_TEXEL_MAX"))
+            sg_texel_max_ = std::min<uint32_t>(sg_texel_max_, (uint32_t)std::strtoul(e, nullptr, 10));
+        if (sg_texel_max_ < 1024) sg_tex_ = false;
     }
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn, bk = tile.BK;
@@ -695,31 +696,35 @@ static_assert(sizeof(SgArgs) <= vk::kPushBytes, "gemm_sg push constants");
 bool Kernels::gemm_sg(vk::Recording& rec, const GemmCall& c, std::string& err) {
     const vk::DeviceInfo& di = ctx_->info();
     const uint32_t WG = di.subgroup_size;
-    // 8 columns per workgroup where 16 would leave the GPU short of
-    // workgroups (the encoders' d x d projections); the k order of every
-    // output is the same either way.
-    uint32_t nb = sg_nb_;
-    if (!nb) nb = (uint64_t)ceil_div(c.a.N, 16) * ceil_div(c.a.M, WG) * c.batch < sg_min_wgs_ ? 8 : 16;
-    const std::string base = std::string(c.a_conv ? "gemm_sg_conv" : c.b == BKind::W4 ? "gemm_sg_w4"
-                                         : c.b == BKind::W8 ? "gemm_sg_w8" : "gemm_sg_f16") +
-                             (nb == 8 ? "_n8" : "");
-    const uint32_t gx = ceil_div(c.a.N, nb);
+    const std::string base = c.a_conv ? "gemm_sg_conv" : c.b == BKind::W4 ? "gemm_sg_w4"
+                           : c.b == BKind::W8 ? "gemm_sg_w8" : "gemm_sg_f16";
+    const uint32_t gx = ceil_div(c.a.N, 16);
     const std::vector<uint32_t> spec{WG, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode};
     auto bindings = [&](vk::Ref a) {
         return std::vector<vk::Ref>{a, or_dummy(c.Bq), or_dummy(c.Bs), or_dummy(c.C),
                                     or_dummy(c.bias), or_dummy(c.bias2), or_dummy(c.C2)};
     };
-    // Elements of A (relative to the Ref) the dispatch reads: [lo, hi).
+    // Elements of A (relative to the Ref) that rows [m0, m1) read: [lo, hi).
+    // Conv rows (chunk, to, fo) read input rows 2*to-1 .. 2*to+1 of their chunk.
+    auto conv_span = [&](uint32_t m0, uint32_t m1, uint64_t& elo, uint64_t& ehi) {
+        const uint32_t per = c.a.cv_to * c.a.cv_fo;
+        const uint64_t row_el = (uint64_t)c.a.cv_fi * c.a.cv_cin;
+        const uint32_t ca = m0 / per, ta = (m0 % per) / c.a.cv_fo;
+        const uint32_t cb = (m1 - 1) / per, tb = ((m1 - 1) % per) / c.a.cv_fo;
+        const uint64_t tia = ta ? 2u * ta - 1u : 0u, tib = std::min<uint64_t>(2u * tb + 1u, c.a.cv_ti - 1u);
+        elo = c.a.a_off + ((uint64_t)ca * c.a.cv_ti + tia) * row_el;
+        ehi = c.a.a_off + ((uint64_t)cb * c.a.cv_ti + tib + 1u) * row_el;
+    };
     const uint64_t lo = c.a.a_off;
     uint64_t hi;
     if (c.a_conv) {
-        const uint64_t chunks = ceil_div(c.a.M, c.a.cv_to * c.a.cv_fo);
-        hi = lo + chunks * c.a.cv_ti * c.a.cv_fi * c.a.cv_cin;
+        uint64_t l2;
+        conv_span(0, c.a.M, l2, hi);
     } else {
         const uint64_t zh = (c.batch - 1) / c.a.nb_lo, zl = std::min(c.batch - 1, c.a.nb_lo - 1);
         hi = lo + zh * c.a.sa_hi + zl * c.a.sa_lo + (uint64_t)(c.a.M - 1) * c.a.lda + c.a.K;
     }
-    const uint64_t max_bytes = (uint64_t)di.max_texel_elems * 16;
+    const uint64_t max_bytes = (uint64_t)sg_texel_max_ * 16;
     const uint64_t align = di.min_texel_align;
     // A texture-path dispatch of rows [m_first, m_first + rows) reading
     // elements [elo, ehi): a view from the aligned byte below elo.
@@ -744,8 +749,38 @@ bool Kernels::gemm_sg(vk::Recording& rec, const GemmCall& c, std::string& err) {
     if (sg_tex_ && c.A.buf && c.A.off % 16 == 0) {
         const VkDeviceSize a0 = c.A.off + lo * 2;
         if (c.A.off + hi * 2 - a0 / align * align <= max_bytes) return tex_dispatch(0, c.a.M, lo, hi);
+        // Conv: blocks of whole workgroups grown while their input window
+        // fits one view (Qwen3's conv2 reads 24 MiB in all, ~0.6 MiB per
+        // 128 output rows).
+        if (c.a_conv && c.batch == 1) {
+            bool ok = true;
+            std::vector<std::pair<uint32_t, uint32_t>> blocks;
+            for (uint32_t m0 = 0; m0 < c.a.M && ok;) {
+                uint32_t rows = 0;
+                for (uint32_t r = WG; ; r += WG) {
+                    const uint32_t m1 = std::min(c.a.M, m0 + r);
+                    uint64_t elo, ehi;
+                    conv_span(m0, m1, elo, ehi);
+                    const VkDeviceSize a0 = c.A.off + elo * 2;
+                    if (c.A.off + ehi * 2 - a0 / align * align > max_bytes) break;
+                    rows = m1 - m0;
+                    if (m1 == c.a.M) break;
+                }
+                if (!rows) { ok = false; break; }
+                blocks.push_back({m0, rows});
+                m0 += rows;
+            }
+            if (ok) {
+                for (const auto& b : blocks) {
+                    uint64_t elo, ehi;
+                    conv_span(b.first, b.first + b.second, elo, ehi);
+                    if (!tex_dispatch(b.first, b.second, elo, ehi)) return false;
+                }
+                return true;
+            }
+        }
         // Too large for one view: row blocks of whole workgroups, each with
-        // its own view (plain row-major A only).
+        // its own view (plain row-major A).
         if (!c.a_conv && c.batch == 1) {
             const uint64_t row_bytes = (uint64_t)c.a.lda * 2;
             const uint64_t fit = max_bytes > align + c.a.K * 2u ? (max_bytes - align - c.a.K * 2u) / row_bytes + 1 : 0;
