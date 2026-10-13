@@ -153,6 +153,10 @@ target_include_directories(starling_ggml PUBLIC ${STARLING_REPO_ROOT}/cpp/includ
 target_link_libraries(starling_ggml PUBLIC ggml)
 if(STARLING_FAST)
   target_link_libraries(starling_ggml PUBLIC ${CMAKE_DL_LIBS})
+  if(ANDROID)
+    # cpp/npu: AHardwareBuffer I/O for the Pixel TPU encoder path.
+    target_link_libraries(starling_ggml PUBLIC nativewindow)
+  endif()
 endif()
 
 if(STARLING_GGML_TESTS)
@@ -169,6 +173,9 @@ if(STARLING_GGML_TESTS)
       target_compile_definitions(${test_name} PRIVATE STARLING_HAVE_FAST=1)
       target_include_directories(${test_name} PRIVATE ${STARLING_REPO_ROOT}/cpp/fast ${STARLING_FAST_VK_INCLUDE})
       target_link_libraries(${test_name} PRIVATE ${CMAKE_DL_LIBS})
+      if(ANDROID)
+        target_link_libraries(${test_name} PRIVATE nativewindow)
+      endif()
     endif()
 
     # The stream_session_test needs the serve sources (server.cpp,

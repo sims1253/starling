@@ -14,6 +14,10 @@
 #include "qwen3/loader.hpp"
 #include "qwen3/mel.hpp"
 #include "voxtral/loader.hpp"
+#if defined(STARLING_HAVE_NPU)
+#include "encoder_contract.hpp"   // cpp/npu: Pixel TPU encoder artifacts
+#include "tpu_runtime.hpp"
+#endif
 
 #include "ggml.h"
 #include "starling_ggml.h"   // starling_ggml_stop_requested (#325 coop stop)
@@ -25,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -454,6 +459,39 @@ struct AudioLlmEngine::Impl {
     }
     bool record_decode(uint32_t steps, std::string& err);
     bool dec_ablate = false;   // STARLING_FAST_DECODE_SKIP (diagnostic)
+
+    // ---- Qwen3-ASR audio encoder on the Pixel TPU (cpp/npu) ----
+    // When an artifact compiled for this model, encoder shape and firmware
+    // is present (STARLING_NPU_DIR, else STARLING_FAST_CACHE_DIR), the audio
+    // encoder runs per attention window on the TPU and its projector rows
+    // are uploaded into the LLM's audio rows; the GPU encoder pass is
+    // skipped. STARLING_NPU=0 disables it; any NPU error drops back to the
+    // GPU encoder for good.
+#if defined(STARLING_HAVE_NPU)
+    std::unique_ptr<npu::TpuModel> npu;
+    // The artifact's open + warm-up, started before the GPU weight load and
+    // joined on first use (npu_ready).
+    std::future<std::pair<std::unique_ptr<npu::TpuModel>, std::string>> npu_pending;
+#endif
+    std::string npu_note;   // why the NPU path is (not) used, for describe()
+    double npu_ms[3] = {};  // last npu_encode: input write, TPU run, output read (ms)
+    bool npu_ready() {
+#if defined(STARLING_HAVE_NPU)
+        if (npu_pending.valid()) {
+            auto r = npu_pending.get();
+            npu = std::move(r.first);
+            npu_note = std::move(r.second);
+        }
+        return npu != nullptr;
+#else
+        return false;
+#endif
+    }
+    // Encoder rows [A][EOUT] for mel frames [0, T) on the TPU.
+    bool npu_encode(const MelView& mel, int64_t T, uint32_t A, std::vector<float>& rows, int& windows,
+                    std::string& err);
+    // Prefill with the A audio rows already in lx: text-slot lookups, then the LLM.
+    bool record_prefill_npu(uint32_t A, Rec& r, std::string& err);
     bool lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err, bool prenormed = false);
     bool dec_next(vk::Recording& rc, std::string& err);
     vk::Ref R(Arena::Id id) const { return ar.ref(id); }
@@ -468,6 +506,95 @@ AudioLlmEngine::~AudioLlmEngine() {
 }
 
 namespace {
+// ---- Qwen3-ASR encoder artifact on the Pixel TPU (cpp/npu) ----
+// Looks for qwen3-asr-enc-<fingerprint>.stnpu in STARLING_NPU_DIR (else
+// STARLING_FAST_CACHE_DIR), checks it against this model (GGUF fingerprint,
+// encoder shape, firmware version) and opens + warms it up on a worker thread
+// (joined by Impl::npu_ready on first use). Any mismatch or error leaves the
+// GPU encoder in charge; `note` says why.
+struct NpuStart {
+    std::string note;
+#if defined(STARLING_HAVE_NPU)
+    std::future<std::pair<std::unique_ptr<npu::TpuModel>, std::string>> fut;
+#endif
+};
+
+NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
+    NpuStart r;
+#if defined(STARLING_HAVE_NPU)
+    const bool verbose = env_on("STARLING_FAST_VERBOSE") || env_on("STARLING_FAST_TIMING");
+    const std::string tag = sp.tag;
+    auto note = [&](const std::string& s) {
+        r.note = s;
+        if (verbose) std::fprintf(stderr, "[fast-%s] npu: %s\n", tag.c_str(), s.c_str());
+        return std::move(r);
+    };
+    if (const char* e = std::getenv("STARLING_NPU"); e && std::strcmp(e, "0") == 0) return note("disabled (STARLING_NPU=0)");
+    // Qwen3-ASR's audio tower only (MOSS shares it but adds the adapter).
+    if (tag != "qwen3" || sp.EOUT != sp.HD || sp.n_window_infer == 0 || sp.n_window_infer % 100 != 0) return r;
+    uint64_t h = npu::kFnvBasis;
+    for (const char* name : npu::kQwen3EncFingerprintTensors) {
+        const ggml_tensor* t = ml.tensor(name);
+        if (!t || t->type != GGML_TYPE_F32 || !t->data)
+            return note(std::string("no model fingerprint (") + name + " missing or not F32)");
+        h = npu::fnv1a_update(h, t->data, ggml_nbytes(t));
+    }
+    const uint32_t frames = sp.n_window_infer, tokens = 13 * (frames / 100), nm = sp.n_mels;
+    const std::string key = npu::qwen3_enc_key(nm, frames, tokens, sp.ED, sp.EL, sp.EH, sp.EFF, sp.DS, sp.EOUT);
+    const std::string name = npu::qwen3_enc_artifact_name(h);
+    std::string dirs;
+    if (const char* d = std::getenv("STARLING_NPU_DIR"); d && *d) dirs = d;
+    else if (const char* c = std::getenv("STARLING_FAST_CACHE_DIR"); c && *c) dirs = c;
+    std::string path;
+    for (size_t b = 0; b <= dirs.size() && path.empty();) {
+        size_t e = dirs.find(':', b);
+        if (e == std::string::npos) e = dirs.size();
+        const std::string cand = dirs.substr(b, e - b) + "/" + name;
+        if (e > b && access(cand.c_str(), R_OK) == 0) path = cand;
+        b = e + 1;
+    }
+    if (path.empty()) return note("no artifact " + name + (dirs.empty() ? std::string(" (no STARLING_NPU_DIR)") : " in " + dirs));
+    npu::ArtifactInfo info;
+    std::string err;
+    if (!npu::read_artifact_info(path, info, err)) return note(err);
+    const std::vector<uint64_t> in_bytes = {(uint64_t)nm * frames * 4, (uint64_t)tokens * 4};
+    const std::vector<uint64_t> out_bytes = {(uint64_t)tokens * sp.EOUT * 4};
+    if (info.key != key || info.model_hash != h || info.in_bytes != in_bytes || info.out_bytes != out_bytes)
+        return note(path + " was built for another model ('" + info.key + "'); ignored");
+    if (!npu::load_southbound(err)) return note("TPU runtime unavailable: " + err);
+    const std::string vendor = npu::vendor_version();
+    if (info.vendor != vendor)
+        return note(path + " was compiled for TPU firmware " + info.vendor + ", this phone has " + vendor + "; recompile it");
+    r.note = "opening " + path;
+    r.fut = std::async(std::launch::async, [path, nm, frames, tokens, tag, verbose]() {
+        std::pair<std::unique_ptr<npu::TpuModel>, std::string> out;
+        auto finish = [&](const std::string& s) {
+            out.second = s;
+            if (verbose) std::fprintf(stderr, "[fast-%s] npu: %s\n", tag.c_str(), s.c_str());
+            return std::move(out);
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        auto m = std::make_unique<npu::TpuModel>();
+        std::string e;
+        if (!m->open(path, npu::LoadMode::Mmap, e)) return finish("open " + path + ": " + e);
+        const double t_open = ms_since(t0);
+        // One zero window: the first invocation pays the weight transfer.
+        std::vector<float> z((size_t)nm * frames, 0.0f);
+        if (!m->write_input(0, z.data(), z.size() * 4, e) || !m->write_input(1, z.data(), (size_t)tokens * 4, e) ||
+            !m->run(e))
+            return finish("warm-up: " + e);
+        char b[96];
+        std::snprintf(b, sizeof b, ", load %.1f ms, warm-up %.1f ms", t_open, ms_since(t0) - t_open);
+        out.first = std::move(m);
+        return finish("audio encoder on the TPU (" + path + b + ")");
+    });
+#else
+    (void)sp;
+    (void)ml;
+#endif
+    return r;
+}
+
 std::unique_ptr<AudioLlmEngine::Impl> make_impl(Spec sp, const ggml::ModelLoader& ml, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
     std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
@@ -500,8 +627,14 @@ std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const ms::MossModel& m, s
 }
 
 std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const q3::Qwen3Model& m, std::string& err) {
-    auto I = make_impl(qwen3_spec(m.config), m.loader, err);
+    Spec sp = qwen3_spec(m.config);
+    NpuStart ns = npu_start(sp, m.loader);   // TPU artifact open overlaps the GPU load
+    auto I = make_impl(std::move(sp), m.loader, err);
     if (!I) return nullptr;
+    I->npu_note = std::move(ns.note);
+#if defined(STARLING_HAVE_NPU)
+    I->npu_pending = std::move(ns.fut);
+#endif
     std::unique_ptr<AudioLlmEngine> e(new AudioLlmEngine());
     e->impl_ = std::move(I);
     return e;
@@ -564,7 +697,9 @@ std::string AudioLlmEngine::describe() const {
     char buf[256];
     std::snprintf(buf, sizeof buf, "fast/vulkan '%s' weights=%.0f MiB",
                   impl_->ctx->info().name.c_str(), impl_->ar.total_bytes() / 1048576.0);
-    return buf;
+    std::string d = buf;
+    if (impl_->npu_ready()) d += " encoder=npu";
+    return d;
 }
 
 bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
@@ -1500,6 +1635,77 @@ bool AudioLlmEngine::Impl::record_prefill_rows(int S, Rec& r, std::string& err) 
     return true;
 }
 
+bool AudioLlmEngine::Impl::record_prefill_npu(uint32_t A, Rec& r, std::string& err) {
+    const uint32_t npre = (uint32_t)sp.prefix.size();
+    const uint32_t S = npre + A + (uint32_t)sp.suffix.size();
+    r.A = (int)A;
+    r.S = (int)S;
+    r.rec = std::make_unique<vk::Recording>(*ctx);
+    vk::Recording& rc = *r.rec;
+    rc.begin();
+    // Audio rows [npre, npre + A) of lx were uploaded from the TPU output;
+    // prefix and suffix embeddings around them, as in record_prefill.
+    if (!embed_lookup(rc, npre, 0, 0, err) ||
+        !embed_lookup(rc, (uint32_t)sp.suffix.size(), npre, npre + A, err))
+        return false;
+    rc.barrier();
+    if (!record_llm(rc, S, err)) return false;
+    rc.end();
+    return true;
+}
+
+bool AudioLlmEngine::Impl::npu_encode(const MelView& mel, int64_t T, uint32_t A, std::vector<float>& rows,
+                                      int& windows, std::string& err) {
+#if defined(STARLING_HAVE_NPU)
+    // The GPU path's windows: attention over 13 * n_window_infer/100 tokens,
+    // i.e. n_window_infer mel frames; the last window is partial (zero mel
+    // past the end, padded keys masked).
+    const uint32_t F = sp.n_window_infer, WT = 13 * (F / 100), NM = sp.n_mels;
+    rows.assign((size_t)A * EOUT, 0.0f);
+    std::vector<float> in0((size_t)NM * F), in1(WT);
+    uint32_t row = 0;
+    windows = 0;
+    npu_ms[0] = npu_ms[1] = npu_ms[2] = 0;
+    for (int64_t f0 = 0; f0 < T; f0 += F) {
+        const int64_t len = std::min<int64_t>(F, T - f0);
+        const uint32_t nt = (uint32_t)audio_tokens(len);
+        if (row + nt > A) {
+            err = "window rows exceed the audio tokens";
+            return false;
+        }
+        for (uint32_t f = 0; f < NM; ++f) {
+            float* d = &in0[(size_t)f * F];
+            const ggml_bf16_t* s = &mel.data[(size_t)f * mel.stride + f0];
+            for (int64_t t = 0; t < len; ++t) d[t] = ggml_bf16_to_fp32(s[t]);
+            std::fill(d + len, d + F, 0.0f);
+        }
+        for (uint32_t j = 0; j < WT; ++j) in1[j] = j < nt ? 0.0f : -1e4f;
+        const auto ta = std::chrono::steady_clock::now();
+        if (!npu->write_input(0, in0.data(), in0.size() * 4, err) ||
+            !npu->write_input(1, in1.data(), in1.size() * 4, err))
+            return false;
+        const auto tb = std::chrono::steady_clock::now();
+        if (!npu->run(err)) return false;
+        const auto tc = std::chrono::steady_clock::now();
+        if (!npu->read_output(0, rows.data() + (size_t)row * EOUT, (size_t)nt * EOUT * 4, err)) return false;
+        npu_ms[0] += std::chrono::duration<double, std::milli>(tb - ta).count();
+        npu_ms[1] += std::chrono::duration<double, std::milli>(tc - tb).count();
+        npu_ms[2] += ms_since(tc);
+        row += nt;
+        ++windows;
+    }
+    if (row != A) {
+        err = "TPU windows produced " + std::to_string(row) + " of " + std::to_string(A) + " rows";
+        return false;
+    }
+    return true;
+#else
+    (void)mel; (void)T; (void)A; (void)rows; (void)windows;
+    err = "built without the TPU path";
+    return false;
+#endif
+}
+
 bool AudioLlmEngine::Impl::record_prefill_whisper(int L, int S, int slot0, int n_slots, Rec& r, std::string& err) {
     const uint32_t T = (uint32_t)(L + 1) / 2;            // conv2 stride 2
     const uint32_t Na = std::min<uint32_t>(T / sp.merge, (uint32_t)n_slots);
@@ -2283,6 +2489,44 @@ bool AudioLlmEngine::generate(const float* pcm, size_t n, uint32_t budget, std::
     if (S + (int)max_new > (int)I.MAXPOS) {
         err = std::string("fast ") + tag + ": generation exceeds the KV cache (audio too long)";
         return false;
+    }
+    if (I.npu_ready()) {
+        const double t_mel = ms_since(t0);
+        std::vector<float> rows;
+        int windows = 0;
+        std::string nerr;
+        if (I.npu_encode(mel, T, (uint32_t)A, rows, windows, nerr)) {
+            const double t_enc = ms_since(t0);
+            if (!I.ensure(0, 0, S, err)) return false;
+            Impl::Rec* rec =
+                I.prefill_rec({-1, A}, [&](Impl::Rec& r) { return I.record_prefill_npu((uint32_t)A, r, err); });
+            if (!rec) return false;
+            std::vector<uint32_t> idv;
+            for (int32_t v : I.sp.prefix) idv.push_back((uint32_t)v);
+            for (int32_t v : I.sp.suffix) idv.push_back((uint32_t)v);
+            if (!I.ctx->upload(I.ids, 0, idv.data(), idv.size() * 4, err) ||
+                !I.ctx->upload(I.lx, I.sp.prefix.size() * I.HD * 4, rows.data(), rows.size() * 4, err))
+                return false;
+            const double t_up = ms_since(t0);
+            int rounds = 0;
+            double t_pre = 0;
+            if (!I.run(*rec->rec, (uint32_t)S, max_new, t0, out_ids, eos, rounds, t_pre, err)) return false;
+            if (timing)
+                std::fprintf(stderr,
+                             "[fast-%s] audio=%.2fs mel=%.1fms enc+prefill=%.1fms (npu enc=%.1fms in %d windows "
+                             "[in %.1f, tpu %.1f, out %.1f], rows upload=%.1fms, llm prefill=%.1fms) decode=%.1fms "
+                             "(%zu tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",
+                             tag, n / 16000.0, t_mel, t_pre - t_mel, t_enc - t_mel, windows, I.npu_ms[0],
+                             I.npu_ms[1], I.npu_ms[2], t_up - t_enc,
+                             t_pre - t_up, ms_since(t0) - t_pre, out_ids.size(), rounds, ms_since(t0), (long long)T,
+                             A, S);
+            return true;
+        }
+        std::fprintf(stderr, "[fast-%s] npu: %s; the GPU encoder takes over\n", tag, nerr.c_str());
+        I.npu_note = "failed: " + nerr;
+#if defined(STARLING_HAVE_NPU)
+        I.npu.reset();
+#endif
     }
     if (!I.ensure(C, A, S, err)) return false;
 

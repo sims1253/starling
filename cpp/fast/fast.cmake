@@ -167,3 +167,22 @@ if(STARLING_FAST_VK_INCLUDE)
   target_include_directories(starling_ggml_core PUBLIC ${STARLING_FAST_VK_INCLUDE})
 endif()
 target_link_libraries(starling_ggml_core PUBLIC ${CMAKE_DL_LIBS})
+
+# ---- Pixel TPU encoder path (cpp/npu) ----------------------------------------
+# Android only. The TPU runtime is the phone's own libedgetpu_litert.so, opened
+# with dlopen at run time, so builds for other phones carry the code but never
+# touch a TPU; the engine then runs the GPU encoder as before.
+if(ANDROID)
+  set(STARLING_NPU_SRC ${STARLING_REPO_ROOT}/cpp/npu)
+  target_sources(starling_ggml_core PRIVATE ${STARLING_NPU_SRC}/tpu_runtime.cpp)
+  target_compile_definitions(starling_ggml_core PUBLIC STARLING_HAVE_NPU=1)
+  target_include_directories(starling_ggml_core PUBLIC ${STARLING_NPU_SRC})
+  target_link_libraries(starling_ggml_core PUBLIC nativewindow)
+  # adb-shell tool that compiles encoder artifacts on the phone
+  # (benchmarks/npu/npu_compile.sh) and benchmarks them.
+  add_executable(starling-npu-tool EXCLUDE_FROM_ALL
+    ${STARLING_NPU_SRC}/npu_tool.cpp ${STARLING_NPU_SRC}/npu_probe.cpp
+    ${STARLING_NPU_SRC}/gguf_fingerprint.cpp ${STARLING_NPU_SRC}/tpu_runtime.cpp)
+  target_link_libraries(starling-npu-tool PRIVATE nativewindow ${CMAKE_DL_LIBS})
+  set_target_properties(starling-npu-tool PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()

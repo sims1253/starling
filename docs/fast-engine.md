@@ -57,6 +57,8 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_SKIP=label[,prefix*]` | diagnostic: drop every dispatch recorded under those labels (`enc_qkv`, `llm_ff_up`, `conv_pw2`, `enc_*`, …; results are garbage) to price encoder/prefill work by difference |
 | `STARLING_FAST_FULL_BARRIER=1` | every recorded barrier in the wide compute+transfer form (default: scoped to the commands it orders) |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
+| `STARLING_NPU_DIR=dir[:dir…]` | where Qwen3-ASR's TPU encoder artifacts are looked up (default: `STARLING_FAST_CACHE_DIR`); see *Pixel TPU encoder* below |
+| `STARLING_NPU=0` | never use a TPU encoder artifact (GPU encoder) |
 
 ## Design
 
@@ -191,6 +193,29 @@ an emission, and its first-layer input projection is memoized per token.
 directory set the engine times candidate GEMM tiles and GEMV row counts on
 synthetic weights at the real shapes the first time it meets a device, and
 stores the choice.
+
+**Pixel TPU encoder (Qwen3-ASR, `cpp/npu`).** On Tensor phones the audio
+encoder can run on the TPU instead of the GPU. Nothing from Google's Tensor
+SDK is involved: the phone's own firmware library `libedgetpu_litert.so` (a
+public vendor library, opened with `dlopen` at run time; the app declares it
+with `<uses-native-library android:required="false">`) both compiles a
+`.tflite` on the device and runs the result. Compiling only works from the
+adb shell (the firmware's compile service serves just the apps on Google's
+EdgeTPU allowlist), so it is a one-time developer step,
+`benchmarks/npu/npu_compile.sh HF_MODEL PHONE_GGUF [--app PKG]`, which
+exports one encoder attention window (800 mel frames → 104 projector rows,
+fp16 weights, an additive key mask for the partial last window) from the HF
+checkpoint and writes `qwen3-asr-enc-<fingerprint>.stnpu`. The engine loads
+an artifact only if its header matches the GGUF (a hash of a few F32
+tensors), the encoder shape and the firmware's API version; it opens and
+warms it up on a worker thread during the GPU weight load, runs the encoder
+window by window on the TPU, uploads the projector rows into the LLM's audio
+rows and records a prefill without the GPU encoder pass. Without a matching
+artifact, with `STARLING_NPU=0`, or after any TPU error it runs the GPU
+encoder as before. The app looks in `files/npu` (debug builds:
+`npu_compile.sh --app dev.starling.mobile.debug`) and in its external files
+dir `Android/data/<pkg>/files/npu` (any build: `adb push`). Measured in
+`benchmarks/npu/` (`phone_npu_ab.sh`, `phone_npu_fleurs.sh`).
 
 ## Kernels
 

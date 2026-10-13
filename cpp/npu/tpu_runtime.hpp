@@ -30,9 +30,11 @@ bool compile_tflite(const void* tflite, size_t size, std::vector<uint8_t>& bytec
 // Artifact: a 4 KiB header followed by the bytecode at `bytecode_offset`.
 struct ArtifactInfo {
     std::string function;                  // signature key the bytecode exports
+    std::string key;                       // what the graph computes (model family + shapes), checked by the loader
     std::vector<uint64_t> in_bytes, out_bytes;
     std::string vendor;                    // thrGetVendorApiVersion() at compile time
-    uint64_t model_hash = 0;               // FNV-1a of the source .tflite
+    uint64_t model_hash = 0;               // fingerprint of the model it belongs to (see gguf_fingerprint)
+    uint64_t tflite_hash = 0;              // FNV-1a of the compiled .tflite (provenance)
     uint64_t bytecode_offset = 0, bytecode_size = 0;
 };
 bool write_artifact(const std::string& path, const ArtifactInfo& info, const std::vector<uint8_t>& bytecode,

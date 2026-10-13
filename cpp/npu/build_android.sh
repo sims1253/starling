@@ -11,6 +11,6 @@ OUT=${OUT:-$HERE/../../build-npu}
 mkdir -p "$OUT"
 SRC="$HERE/tpu_runtime.cpp $HERE/npu_probe.cpp"
 FLAGS="-O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter -fPIC -static-libstdc++"
-$CXX $FLAGS $SRC "$HERE/npu_tool.cpp" -lnativewindow -ldl -llog -o "$OUT/npu_tool"
+$CXX $FLAGS $SRC "$HERE/gguf_fingerprint.cpp" "$HERE/npu_tool.cpp" -lnativewindow -ldl -llog -o "$OUT/npu_tool"
 $CXX $FLAGS -shared $SRC "$HERE/jni_probe.cpp" -lnativewindow -ldl -llog -o "$OUT/libstarling_npu_probe.so"
 ls -la "$OUT/npu_tool" "$OUT/libstarling_npu_probe.so"

@@ -105,7 +105,7 @@ const char* edge_name(std::vector<std::string>& names, size_t i) {
     return names[i].c_str();
 }
 
-constexpr char kMagic[8] = {'S', 'T', 'N', 'P', 'U', 'v', '2', '\0'};
+constexpr char kMagic[8] = {'S', 'T', 'N', 'P', 'U', 'v', '3', '\0'};
 constexpr size_t kHeader = 4096;
 
 struct RawHeader {
@@ -114,7 +114,8 @@ struct RawHeader {
     uint64_t in_bytes[64], out_bytes[64];
     char function[64];
     char vendor[64];
-    uint64_t model_hash;
+    char key[256];
+    uint64_t model_hash, tflite_hash;
     uint64_t bytecode_offset, bytecode_size;
 };
 static_assert(sizeof(RawHeader) < kHeader, "header fits");
@@ -181,7 +182,8 @@ bool compile_tflite(const void* tflite, size_t size, std::vector<uint8_t>& bytec
 
 bool write_artifact(const std::string& path, const ArtifactInfo& info, const std::vector<uint8_t>& bytecode,
                     uint64_t pad, std::string& err) {
-    if (info.in_bytes.size() > 64 || info.out_bytes.size() > 64 || info.function.size() >= 64) {
+    if (info.in_bytes.size() > 64 || info.out_bytes.size() > 64 || info.function.size() >= 64 ||
+        info.key.size() >= 256) {
         err = "artifact: too many I/Os or function name too long";
         return false;
     }
@@ -193,7 +195,9 @@ bool write_artifact(const std::string& path, const ArtifactInfo& info, const std
     for (size_t i = 0; i < info.out_bytes.size(); ++i) h.out_bytes[i] = info.out_bytes[i];
     std::snprintf(h.function, sizeof h.function, "%s", info.function.c_str());
     std::snprintf(h.vendor, sizeof h.vendor, "%s", info.vendor.c_str());
+    std::snprintf(h.key, sizeof h.key, "%s", info.key.c_str());
     h.model_hash = info.model_hash;
+    h.tflite_hash = info.tflite_hash;
     h.bytecode_offset = kHeader + pad;   // pad != 0 reproduces an unaligned bytecode offset
     h.bytecode_size = bytecode.size();
     const std::string tmp = path + ".tmp";
@@ -231,9 +235,11 @@ bool read_artifact_info(const std::string& path, ArtifactInfo& info, std::string
         return false;
     }
     info = ArtifactInfo{};
-    h.function[63] = h.vendor[63] = 0;
+    h.function[63] = h.vendor[63] = h.key[255] = 0;
     info.function = h.function;
     info.vendor = h.vendor;
+    info.key = h.key;
+    info.tflite_hash = h.tflite_hash;
     info.in_bytes.assign(h.in_bytes, h.in_bytes + h.n_in);
     info.out_bytes.assign(h.out_bytes, h.out_bytes + h.n_out);
     info.model_hash = h.model_hash;

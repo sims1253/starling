@@ -42,7 +42,7 @@ std::string fmt(const char* f, double a) {
 
 std::string probe_compile(const std::string& tflite, const std::string& artifact, const std::string& function,
                           const std::vector<uint64_t>& in_bytes, const std::vector<uint64_t>& out_bytes,
-                          uint64_t pad, bool& ok) {
+                          uint64_t pad, bool& ok, const std::string& key, uint64_t model_hash) {
     ok = false;
     std::string err, r;
     double t0 = now_ms();
@@ -61,7 +61,9 @@ std::string probe_compile(const std::string& tflite, const std::string& artifact
     info.in_bytes = in_bytes;
     info.out_bytes = out_bytes;
     info.vendor = vendor_version();
-    info.model_hash = fnv1a(model.data(), model.size());
+    info.key = key;
+    info.model_hash = model_hash;
+    info.tflite_hash = fnv1a(model.data(), model.size());
     t0 = now_ms();
     if (!write_artifact(artifact, info, bc, pad, err)) return r + "write: " + err + "\n";
     r += fmt("write artifact %.1f ms", now_ms() - t0) + " -> " + artifact + "\n";
@@ -81,6 +83,7 @@ std::string probe_run(const std::string& artifact, LoadMode mode, const std::vec
     if (!m.open(artifact, mode, err)) return r + "open: " + err + "\n";
     r += fmt("artifact load (no compile) %.1f ms", now_ms() - t0) + ", fn '" + m.info().function +
          "', compiled on vendor " + m.info().vendor + "\n";
+    if (!m.info().key.empty()) r += "key '" + m.info().key + "'\n";
     for (size_t i = 0; i < m.info().in_bytes.size(); ++i) {
         std::vector<uint8_t> d(m.info().in_bytes[i], 0);
         if (i < inputs.size()) {
