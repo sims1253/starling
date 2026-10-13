@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds (device tests, agent builds) install beside the real app;
+     their own names keep the two apart in the launcher and keyboard list. -->
+<resources>
+    <string name="app_name">Starling Debug</string>
+    <string name="keyboard_name">Starling Debug Voice Input</string>
+    <string name="recognition_service_name">Starling Debug Voice Recognition</string>
+    <string name="screen_title">Starling Debug</string>
+</resources>

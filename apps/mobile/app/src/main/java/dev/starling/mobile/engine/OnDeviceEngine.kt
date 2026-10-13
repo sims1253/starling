@@ -3,14 +3,16 @@ package dev.starling.mobile.engine
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
-import dev.starling.mobile.network.InferenceResult
+import dev.starling.mobile.transcription.InferenceResult
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
+import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -20,8 +22,15 @@ import java.util.concurrent.atomic.AtomicLong
  * active, the native model context, and its warmup. Each GGUF loads as the
  * [ModelKind] its metadata names (Parakeet or one of the LLM-decoder speech
  * models), detected at import and again at every load. Every `*.gguf` in
- * [modelDir] is an installed model (imports keep their file name, downloads
- * their catalog name); the active one is named in [ACTIVE_FILE_NAME], and
+ * the directory [modelDirectory] returns is an installed model (imports
+ * keep their file name, downloads their catalog name). The directory is
+ * looked up per operation, so it can move (to shared storage once the app
+ * may use it, see ModelStorage); models still in the install's own
+ * [ownDir] stay installed until [adoptModels] moves them. Other Starling
+ * builds may share the directory: choosing a name and renaming into it, and
+ * deleting, happen under a lock file there ([withFolderLock]), download
+ * partials carry this install's [partialTag], and only stale staging files
+ * are swept. The active one is named in [ACTIVE_FILE_NAME] in [ownDir], and
  * falls back to the first installed model when that file is missing or
  * names a deleted model. The model loads on first use, or ahead of it
  * through [prepare] (the [ModelLifetime] preload), and then stays resident
@@ -44,11 +53,28 @@ import java.util.concurrent.atomic.AtomicLong
  * work outstanding wedges the Pixel's GPU driver.
  */
 class OnDeviceEngine(
-    private val modelDir: File,
+    private val modelDirectory: () -> File,
+    private val ownDir: File,
     private val memoryGate: (modelBytes: Long, kind: ModelKind) -> String? = { _, _ -> null },
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
     private val keepAwake: () -> AutoCloseable = { AutoCloseable {} },
+    private val partialTag: String = "local",
 ) : OnDeviceStreamSession.LiveEngine {
+    /** An engine whose models and active-model marker all live in [modelDir]. */
+    constructor(
+        modelDir: File,
+        memoryGate: (modelBytes: Long, kind: ModelKind) -> String? = { _, _ -> null },
+        nativeSupport: () -> String? = NativeSupport::unsupportedReason,
+        keepAwake: () -> AutoCloseable = { AutoCloseable {} },
+    ) : this({ modelDir }, modelDir, memoryGate, nativeSupport, keepAwake)
+
+    /**
+     * What [adoptModels] did: models moved (an identical copy already in
+     * place counts, its private duplicate removed), and models it had to
+     * leave where they were.
+     */
+    data class Adoption(val moved: Int, val remaining: Int)
+
     /** Where in [importModel] a rejection happened; import failures report their stage. */
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
 
@@ -91,7 +117,7 @@ class OnDeviceEngine(
     @Volatile
     var observer: Observer = object : Observer {}
 
-    private val activeFile = File(modelDir, ACTIVE_FILE_NAME)
+    private val activeFile = File(ownDir, ACTIVE_FILE_NAME)
 
     /** Guards engine state: the native handle and the model file's identity. */
     // A java.lang.Object (not Any) so prepare() can wait on it for a pinned
@@ -188,22 +214,30 @@ class OnDeviceEngine(
      * live session keeps its already-loaded model until it ends.
      */
     fun deleteModel(name: String): Boolean = synchronized(importLock) {
+        val dir = installedFile(name)?.parentFile ?: return false
         // The unlink under the engine lock, so a load never races it, and
         // under the marker lock, so a concurrent selectModel either sees the
         // file gone or has written its marker before the cleanup below.
-        // (Order: lock, then markerLock; no path takes them the other way.)
-        synchronized(lock) {
-            synchronized(markerLock) {
-                val file = installedFile(name) ?: return false
-                if (!file.delete()) return false
-                if (file == loadedFile) releaseLocked()
-                // Also drops a marker naming a model deleted earlier, so a
-                // later install under that name cannot silently become active.
-                val named = readActiveName()
-                if (named != null && installedFiles().none { it.name == named }) activeFile.delete()
+        // (Order: importLock, folder lock, lock, markerLock; no path takes
+        // them the other way.)
+        withFolderLock(dir) {
+            synchronized(lock) {
+                synchronized(markerLock) {
+                    val file = installedFile(name) ?: return false
+                    if (!file.delete()) return false
+                    if (file == loadedFile) releaseLocked()
+                    // Drops a marker naming this model — a not-yet-moved namesake
+                    // in [ownDir] must not silently take its place — or one
+                    // deleted earlier, so a later install under that name
+                    // cannot silently become active.
+                    val named = readActiveName()
+                    if (named == name || (named != null && installedFiles().none { it.name == named })) {
+                        activeFile.delete()
+                    }
+                }
             }
         }
-        fsyncModelDirectory()
+        fsyncDirectory(dir)
         true
     }
 
@@ -212,10 +246,24 @@ class OnDeviceEngine(
         if (pinnedSessions > 0) releasePending = true else unload()
     }
 
-    private fun installedFiles(): List<File> =
-        modelDir.listFiles { file ->
+    /**
+     * The models in the current directory, plus any still in [ownDir] that
+     * [adoptModels] could not move (a same-named one in the current
+     * directory wins).
+     */
+    private fun installedFiles(): List<File> {
+        val current = modelDirectory()
+        val found = modelFilesIn(current).toMutableList()
+        if (current.absoluteFile != ownDir.absoluteFile) {
+            modelFilesIn(ownDir).filterTo(found) { leftover -> found.none { it.name == leftover.name } }
+        }
+        return found.sortedBy { it.name }
+    }
+
+    private fun modelFilesIn(dir: File): List<File> =
+        dir.listFiles { file ->
             file.isFile && isModelName(file.name) && file.length() >= ModelFiles.MIN_MODEL_BYTES
-        }.orEmpty().sortedBy { it.name }
+        }.orEmpty().toList()
 
     private fun installedFile(name: String): File? =
         installedFiles().firstOrNull { it.name == name }
@@ -237,21 +285,26 @@ class OnDeviceEngine(
         return if (ModelCatalog.ALL.any { it.fileName == sanitized }) "imported-$sanitized" else sanitized
     }
 
-    /** [name], or name-2.gguf, name-3.gguf, ... : the first that is not taken. */
-    private fun freeModelFile(name: String): File {
+    /** [name] in [dir], or name-2.gguf, name-3.gguf, ... : the first that is not taken. */
+    private fun freeModelFile(dir: File, name: String): File {
         val stem = name.removeSuffix(MODEL_EXTENSION)
         return generateSequence(1) { it + 1 }
-            .map { n -> File(modelDir, if (n == 1) name else "$stem-$n$MODEL_EXTENSION") }
+            .map { n -> File(dir, if (n == 1) name else "$stem-$n$MODEL_EXTENSION") }
             .first { !it.exists() }
     }
 
     private fun readActiveName(): String? =
         runCatching { activeFile.readText(Charsets.UTF_8).trim() }.getOrNull()?.takeIf(String::isNotEmpty)
 
+    // Bumped (under markerLock) by every marker write, so adoptModels can
+    // tell whether the user picked a model while it was copying.
+    private var markerGeneration = 0L
+
     /** Atomically records [name] as the active model. */
     private fun writeActiveName(name: String) = synchronized(markerLock) {
-        modelDir.mkdirs()
-        val temporary = File(modelDir, "$ACTIVE_FILE_NAME.tmp")
+        markerGeneration++
+        ownDir.mkdirs()
+        val temporary = File(ownDir, "$ACTIVE_FILE_NAME.tmp")
         FileOutputStream(temporary).use { output ->
             output.write(name.toByteArray(Charsets.UTF_8))
             output.fd.sync()
@@ -260,7 +313,7 @@ class OnDeviceEngine(
             deleteFile(temporary, "active model marker")
             throw IOException("Unable to record the active model")
         }
-        fsyncModelDirectory()
+        fsyncDirectory(ownDir)
     }
 
     fun lastLoadError(): String? = loadError
@@ -305,10 +358,11 @@ class OnDeviceEngine(
     ): ImportResult =
         synchronized(importLock) {
             input.use { stream ->
-                sweepStaleStaging()
-                val staged = stagingFile()
+                val dir = modelDirectory()
+                sweepStaleStaging(dir)
+                val staged = stagingFile(dir)
                 val copied = runCatching {
-                    modelDir.mkdirs()
+                    dir.mkdirs()
                     FileOutputStream(staged).use { output ->
                         stream.copyTo(output, BUFFER_SIZE)
                         // Durability before promotion: the rename below must
@@ -321,7 +375,7 @@ class OnDeviceEngine(
                     deleteFile(staged, "staging file")
                     val detail = copied.exceptionOrNull()?.localizedMessage?.takeIf(String::isNotBlank)
                     return ImportResult.Rejected(
-                        "The model could not be copied to private storage" +
+                        "The model could not be copied to the model folder" +
                             (detail?.let { ": $it" } ?: "."),
                         ImportStage.COPY,
                     )
@@ -329,17 +383,19 @@ class OnDeviceEngine(
                 // An import never replaces an installed model: a clash gets a
                 // numbered name, so a same-named file cannot silently swap
                 // out a model (or pose as the catalog model).
-                publishStaged(staged, promote) { freeModelFile(importName(name)) }
+                publishStaged(staged, promote) { freeModelFile(dir, importName(name)) }
             }
         }
 
     /**
      * Imports a finished, checksum-verified download ([ModelDownloader]) as
-     * the on-device model. The file is renamed into a staging name in the
-     * model directory — no second multi-hundred-MB copy — and then goes
-     * through the same validation and atomic promotion as [importModel].
-     * [downloaded] must live in the model directory (a file elsewhere is
-     * refused and left alone); once staged it is consumed either way.
+     * the on-device model. The file is renamed into a staging name in its
+     * own directory — no second multi-hundred-MB copy — and then goes
+     * through the same validation and atomic promotion as [importModel],
+     * there. [downloaded] must live in the model directory or [ownDir] (a
+     * download that started before the models moved finishes in [ownDir];
+     * [adoptModels] moves it later); a file elsewhere is refused and left
+     * alone. Once staged it is consumed either way.
      */
     fun adoptDownloaded(downloaded: File, name: String = DEFAULT_MODEL_NAME): ImportResult =
         adoptDownloaded(downloaded, name, ::promoteByMove)
@@ -350,21 +406,178 @@ class OnDeviceEngine(
         promote: (staged: File, target: File) -> Boolean,
     ): ImportResult =
         synchronized(importLock) {
-            sweepStaleStaging()
-            val staged = stagingFile()
-            // A file outside the model directory is not ours: refuse, keep it.
-            if (downloaded.parentFile?.canonicalFile != modelDir.canonicalFile) {
-                return ImportResult.Rejected("The downloaded model is not in the model directory.", ImportStage.COPY)
-            }
+            // A file outside the model directories is not ours: refuse, keep it.
+            val dir = downloaded.parentFile?.canonicalFile
+                ?.takeIf { it == modelDirectory().canonicalFile || it == ownDir.canonicalFile }
+                ?: return ImportResult.Rejected("The downloaded model is not in the model directory.", ImportStage.COPY)
+            sweepStaleStaging(dir, keep = downloaded)
+            val staged = stagingFile(dir)
             if (!downloaded.renameTo(staged)) {
                 deleteFile(downloaded, "downloaded model")
                 return ImportResult.Rejected("The downloaded model could not be staged.", ImportStage.COPY)
             }
             // A verified download replaces an earlier copy of itself.
-            publishStaged(staged, promote) { File(modelDir, sanitizeModelName(name)) }
+            publishStaged(staged, promote) { File(dir, sanitizeModelName(name)) }
         }
 
-    private fun stagingFile() = File(modelDir, "$DEFAULT_MODEL_NAME.${UUID.randomUUID()}.importing")
+    /**
+     * Moves every model in [from] into the current model directory (once the
+     * app may use shared storage, the models it already has go with it).
+     * A model whose name is already there with the same contents (another
+     * build downloaded it too) is just removed from [from]; another clash
+     * gets a numbered name, and the active-model marker follows it. Each one
+     * is copied to a staging file, fsynced and renamed into place before its
+     * source is deleted, so a failure — including too little free space,
+     * checked first — leaves it where it was, still installed (see
+     * [installedFiles]). Blocking.
+     */
+    fun adoptModels(from: File): Adoption = synchronized(importLock) {
+        val dir = modelDirectory()
+        if (from.canonicalFile == dir.canonicalFile) return Adoption(0, 0)
+        val sources = from.listFiles { file -> file.isFile && isModelName(file.name) }.orEmpty()
+        var moved = 0
+        var remaining = 0
+        if (sources.isNotEmpty()) sweepStaleStaging(dir)
+        for (source in sources) {
+            // Compared outside the folder lock (it reads both files end to
+            // end), then dropped under it once the shared copy is still the
+            // one compared: another build may have deleted or replaced it.
+            val existing = File(dir, source.name)
+            val stamp = existing.length() to existing.lastModified()
+            val same = runCatching { existing.isFile && sameContents(existing, source) }.getOrDefault(false)
+            val duplicate = same && withFolderLock(dir) {
+                val unchanged = existing.isFile && (existing.length() to existing.lastModified()) == stamp
+                if (unchanged) dropAdopted(source, existing)
+                unchanged
+            }
+            if (duplicate) {
+                moved++
+                continue
+            }
+            val (wasActive, generation) = synchronized(markerLock) { (readActiveName() == source.name) to markerGeneration }
+            dir.mkdirs()
+            if (dir.usableSpace < source.length() + ADOPT_SPACE_MARGIN_BYTES) {
+                runCatching { Log.w(TAG, "Not enough space in $dir for ${source.name}") }
+                remaining++
+                continue
+            }
+            val staged = stagingFile(dir)
+            val placed = runCatching {
+                source.inputStream().use { input ->
+                    FileOutputStream(staged).use { output ->
+                        input.copyTo(output, BUFFER_SIZE)
+                        output.fd.sync()
+                    }
+                }
+                withFolderLock(dir) {
+                    val target = freeModelFile(dir, source.name)
+                    Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                    target
+                }.also { fsyncDirectory(dir) }
+            }
+            val target = placed.getOrNull()
+            if (target == null) {
+                deleteFile(staged, "staging file")
+                runCatching { Log.w(TAG, "Could not move ${source.name} to $dir", placed.exceptionOrNull()) }
+                remaining++
+                continue
+            }
+            // The moved model stays the active one, unless the user picked
+            // a model meanwhile.
+            if (wasActive && target.name != source.name) {
+                synchronized(markerLock) {
+                    if (markerGeneration == generation && readActiveName() == source.name) {
+                        runCatching { writeActiveName(target.name) }
+                    }
+                }
+            }
+            dropAdopted(source, target)
+            moved++
+        }
+        Adoption(moved, remaining)
+    }
+
+    /**
+     * Deletes [source] once [copy] holds the same bytes. Under the engine
+     * lock, like [deleteModel], so a load never opens a path that is going
+     * away; a model resident from [source] counts as loaded from [copy].
+     */
+    private fun dropAdopted(source: File, copy: File) = synchronized(lock) {
+        if (loadedFile == source) loadedFile = copy
+        deleteFile(source, "moved model")
+    }
+
+    /** Whether [a] and [b] hold the same bytes. */
+    private fun sameContents(a: File, b: File): Boolean {
+        if (a.length() != b.length()) return false
+        a.inputStream().buffered(BUFFER_SIZE).use { left ->
+            b.inputStream().buffered(BUFFER_SIZE).use { right ->
+                val x = ByteArray(BUFFER_SIZE)
+                val y = ByteArray(BUFFER_SIZE)
+                while (true) {
+                    val n = left.readNBytesCompat(x)
+                    if (n != right.readNBytesCompat(y)) return false
+                    if (n == 0) return true
+                    for (i in 0 until n) if (x[i] != y[i]) return false
+                }
+            }
+        }
+    }
+
+    /** Fills [buffer] as far as the stream allows; 0 at its end. */
+    private fun java.io.InputStream.readNBytesCompat(buffer: ByteArray): Int {
+        var total = 0
+        while (total < buffer.size) {
+            val read = read(buffer, total, buffer.size - total)
+            if (read < 0) break
+            total += read
+        }
+        return total
+    }
+
+    /**
+     * Runs [block] holding the lock of the model folder [dir], shared with
+     * every other Starling build (a `.lock` file there, plus an in-process
+     * monitor: Java file locks are per process). Guards what must not
+     * interleave with another build: choosing a free name and renaming into
+     * it, and deleting; it is only ever held for those short steps. Best
+     * effort: a folder that refuses the lock file, or a lock another process
+     * holds for over [FOLDER_LOCK_WAIT_MILLIS] (frozen in the background,
+     * say), runs [block] unguarded, as before sharing existed.
+     */
+    private inline fun <T> withFolderLock(dir: File, block: () -> T): T {
+        dir.mkdirs()
+        synchronized(folderMonitor(dir)) {
+            val channel = runCatching {
+                FileChannel.open(File(dir, FOLDER_LOCK_NAME).toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+            }.onFailure { e -> runCatching { Log.w(TAG, "model folder lock file unavailable in $dir", e) } }
+                .getOrNull() ?: return block()
+            try {
+                val held = runCatching { lockWithin(channel, FOLDER_LOCK_WAIT_MILLIS) }
+                    .onFailure { e -> runCatching { Log.w(TAG, "model folder lock unavailable in $dir", e) } }
+                    .getOrNull()
+                try {
+                    return block()
+                } finally {
+                    runCatching { held?.release() }
+                }
+            } finally {
+                runCatching { channel.close() }
+            }
+        }
+    }
+
+    /** [channel]'s exclusive lock, polled for up to [millis]; throws when it stays taken. */
+    private fun lockWithin(channel: FileChannel, millis: Long): java.nio.channels.FileLock {
+        val deadline = System.nanoTime() + millis * 1_000_000
+        while (true) {
+            channel.tryLock()?.let { return it }
+            if (System.nanoTime() > deadline) throw IOException("held by another process for over $millis ms")
+            Thread.sleep(FOLDER_LOCK_POLL_MILLIS)
+        }
+    }
+
+    private fun stagingFile(dir: File) = File(dir, "$DEFAULT_MODEL_NAME.${UUID.randomUUID()}.importing")
 
     /**
      * Validates [staged], promotes it to the file [target] picks, and makes
@@ -387,22 +600,27 @@ class OnDeviceEngine(
                 is ModelKind.Detection.Supported -> detection.displayName
             }
 
-            val modelFile = target()
-            synchronized(lock) {
-                // Single atomic step: rename(2) over the target replaces it
-                // or fails — the previous model is never deleted first, so a
-                // failed promotion keeps the last usable model recoverable.
-                if (!promote(staged, modelFile)) {
-                    return ImportResult.Rejected(
-                        "The model could not be moved into place; the previous model was kept.",
-                        ImportStage.PROMOTE,
-                    )
+            // The name is chosen and taken under the folder lock, so another
+            // build sharing the folder cannot pick it in between.
+            val modelFile = withFolderLock(staged.parentFile!!) {
+                val modelFile = target()
+                synchronized(lock) {
+                    // Single atomic step: rename(2) over the target replaces it
+                    // or fails — the previous model is never deleted first, so a
+                    // failed promotion keeps the last usable model recoverable.
+                    if (!promote(staged, modelFile)) {
+                        return ImportResult.Rejected(
+                            "The model could not be moved into place; the previous model was kept.",
+                            ImportStage.PROMOTE,
+                        )
+                    }
+                    fsyncDirectory(modelFile.parentFile)
+                    // The new file is already in place; a native failure here
+                    // must not mask a completed import (the next transcription
+                    // reloads from the new file anyway).
+                    runCatching { unload() }
                 }
-                fsyncModelDirectory()
-                // The new file is already in place; a native failure here
-                // must not mask a completed import (the next transcription
-                // reloads from the new file anyway).
-                runCatching { unload() }
+                modelFile
             }
             // A fresh import is what the user wants to use next. The model is
             // installed even if this marker write fails.
@@ -417,9 +635,19 @@ class OnDeviceEngine(
         }
     }
 
-    /** Where an in-progress download of [spec] lives (resumable across restarts). */
-    fun downloadFile(spec: ModelDownload): File =
-        File(modelDir, "download-${spec.sha256.take(16)}.part")
+    /**
+     * Where this install's in-progress download of [spec] lives (resumable
+     * across restarts). Named for [partialTag], so builds sharing the folder
+     * never write or clean up each other's. A partial already in [ownDir]
+     * (paused before the models moved, or by a build that named partials
+     * without the tag) is resumed there.
+     */
+    fun downloadFile(spec: ModelDownload): File {
+        val stem = "download-${spec.sha256.take(16)}"
+        val name = "$stem.$partialTag.part"
+        return listOf(File(ownDir, name), File(ownDir, "$stem.part")).firstOrNull { it.isFile }
+            ?: File(modelDirectory(), name)
+    }
 
     /**
      * Promotion: a single atomic rename over the target replaces it or
@@ -468,8 +696,8 @@ class OnDeviceEngine(
      * descriptor (O_DIRECTORY is not in android.system.OsConstants). Best
      * effort: a failure here cannot undo the completed rename.
      */
-    private fun fsyncModelDirectory() {
-        val directory = modelDir.takeIf { it.isDirectory } ?: return
+    private fun fsyncDirectory(dir: File?) {
+        val directory = dir?.takeIf { it.isDirectory } ?: return
         runCatching {
             val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY, 0)
             try {
@@ -481,18 +709,29 @@ class OnDeviceEngine(
     }
 
     /**
-     * Removes staging files left by interrupted imports, and a marker
-     * temporary left by a crash mid-write.
-     * Only ever called with [importLock] held, so no staging file can be in
-     * use.
+     * Removes staging files left by interrupted imports in [dir], download
+     * partials nobody resumed for [STALE_PARTIAL_MILLIS] (say, of a build
+     * that was uninstalled), and a marker temporary left by a crash
+     * mid-write.
+     * Only ever called with [importLock] held, so none of this engine's
+     * staging files can be in use. Another Starling build sharing [dir] may
+     * be writing one, though, so only staging files untouched for
+     * [STALE_STAGING_MILLIS] are removed.
      */
-    private fun sweepStaleStaging() {
-        val stale = modelDir.listFiles { file ->
-            file.isFile && file.name.endsWith(".importing")
-        }.orEmpty()
+    private fun sweepStaleStaging(dir: File, keep: File? = null) {
+        val cutoff = System.currentTimeMillis() - STALE_STAGING_MILLIS
+        val partialCutoff = System.currentTimeMillis() - STALE_PARTIAL_MILLIS
+        val stale = dir.listFiles { file ->
+            file.isFile && (
+                (file.name.endsWith(".importing") && file.lastModified() < cutoff) ||
+                    (file.name.startsWith("download-") && file.name.endsWith(".part") && file.lastModified() < partialCutoff)
+                )
+        }.orEmpty().filter { it.absoluteFile != keep?.absoluteFile }
         // A marker write in flight holds markerLock; only an orphan is removed.
-        synchronized(markerLock) { File(modelDir, "$ACTIVE_FILE_NAME.tmp").delete() }
-        for (file in stale) deleteFile(file, "stale staging file")
+        synchronized(markerLock) { File(ownDir, "$ACTIVE_FILE_NAME.tmp").delete() }
+        // Under the folder lock, like every other deletion in a folder other
+        // builds may share.
+        if (stale.isNotEmpty()) withFolderLock(dir) { for (file in stale) deleteFile(file, "stale staging file") }
     }
 
     /** Deletes [file]; a real deletion failure (file still present) is logged, never thrown. */
@@ -550,7 +789,9 @@ class OnDeviceEngine(
         }
         observer.loading(modelFile.name)
         NativeSupport.applyThreadDefault()
-        NativeSupport.applyFastEngineDefaults(modelFile.parentFile)
+        // The fast engine's pipeline cache and GPU-wedge marker stay with
+        // this install, not in a model folder other builds share.
+        NativeSupport.applyFastEngineDefaults(ownDir)
         val abi = StarlingNative.abiVersion()
         if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
             loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
@@ -914,6 +1155,24 @@ class OnDeviceEngine(
         private const val MODEL_EXTENSION = ".gguf"
         private const val MAX_NAME_CHARS = 120
         private val UNSAFE_NAME_CHARS = Regex("[^A-Za-z0-9._-]")
+
+        /** A staging file untouched this long belongs to no running import. */
+        private const val STALE_STAGING_MILLIS = 60L * 60 * 1000
+
+        /** A download partial untouched this long is given up. */
+        private const val STALE_PARTIAL_MILLIS = 7L * 24 * 60 * 60 * 1000
+
+        /** Free space [adoptModels] keeps beyond the model it moves. */
+        private const val ADOPT_SPACE_MARGIN_BYTES = 256L * 1024 * 1024
+
+        /** The lock file builds sharing a model folder coordinate on (hidden: not a model). */
+        private const val FOLDER_LOCK_NAME = ".lock"
+        private const val FOLDER_LOCK_WAIT_MILLIS = 30_000L
+        private const val FOLDER_LOCK_POLL_MILLIS = 50L
+
+        private val folderMonitors = java.util.concurrent.ConcurrentHashMap<String, Any>()
+
+        private fun folderMonitor(dir: File): Any = folderMonitors.getOrPut(dir.absolutePath) { Any() }
 
         /** Holds the previous model during a [moveAsideFirst] promotion. */
         private const val ASIDE_SUFFIX = ".previous"

@@ -14,8 +14,8 @@ import java.io.File
  * arm64 phone core since 2018 (Cortex-A55/A75 and newer) has both. The i8mm
  * APK variant additionally requires the int8 matrix-multiply extension.
  * A core without a required feature would crash with SIGILL inside the
- * engine, so on those devices the on-device option reports why it cannot
- * run instead; the server path is unaffected.
+ * engine, so on those devices the app reports why it cannot transcribe
+ * instead.
  */
 object NativeSupport {
     /** CPU features (as named in /proc/cpuinfo) this build's arm64 library requires. */
@@ -47,7 +47,7 @@ object NativeSupport {
             // The APK ships arm64-v8a and x86_64 only; anything else cannot
             // load the engine at all.
             else -> return "the on-device engine is built for 64-bit ARM and x86_64 only " +
-                "(this device reports $osArch). Use a Starling server instead."
+                "(this device reports $osArch)."
         }
         // Unreadable cpuinfo proves nothing either way; do not block on it.
         val text = cpuinfo ?: return null
@@ -64,9 +64,9 @@ object NativeSupport {
         val missing = required.filter { feature -> featureLines.any { feature !in it } }
         if (missing.isEmpty()) return null
         val remedy = if ("i8mm" in missing && missing.size == 1) {
-            "Install the standard Starling Mobile APK instead of the i8mm build, or use a Starling server."
+            "Install the standard Starling Mobile APK instead of the i8mm build."
         } else {
-            "Use a Starling server instead."
+            "This phone cannot run Starling's speech engine."
         }
         return "this phone's CPU lacks instructions this engine build requires " +
             "(missing: ${missing.joinToString()}). $remedy"
@@ -103,6 +103,9 @@ object NativeSupport {
      */
     fun applyFastEngineDefaults(cacheDir: File?) {
         if (cacheDir == null || !System.getenv(FAST_CACHE_ENV).isNullOrEmpty()) return
+        // The engine writes there but never creates it (a reinstall that
+        // finds its models in shared storage has no private model folder).
+        cacheDir.mkdirs()
         runCatching { Os.setenv(FAST_CACHE_ENV, cacheDir.absolutePath, false) }
     }
 

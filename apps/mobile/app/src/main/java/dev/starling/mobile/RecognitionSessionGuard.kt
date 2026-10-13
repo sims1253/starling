@@ -7,7 +7,7 @@ import dev.starling.mobile.data.Recording
 /**
  * Session-state decisions for [StarlingRecognitionService]: which client owns
  * the live session, what ends it, how its stopped capture settles (committed
- * for upload, kept locally without upload, or marked failed), and whether a
+ * for transcription, kept locally without transcription, or marked failed), and whether a
  * terminal error is delivered. Pure Kotlin in the guard-class shape of
  * InputTargetGuard so every transition is unit-testable on the JVM; the service applies the returned decisions
  * against the recordings store and the host keyboard's callback.
@@ -23,14 +23,14 @@ class RecognitionSessionGuard<T : Any> {
         /** Upload the finalized audio, then deliver one final result or error. */
         data class Finalize<out T : Any>(override val session: Session<T>) : Ending<T>
 
-        /** Keep the audio; no upload and no delivery. */
+        /** Keep the audio; no transcription and no delivery. */
         data class Abandon<out T : Any>(override val session: Session<T>) : Ending<T>
     }
 
     /** How the stopped capture of an ended session settles. */
     sealed interface Settlement {
         /**
-         * Commit the WAV and upload it; deliver the transcript when it
+         * Commit the WAV and transcribe it; deliver the transcript when it
          * returns. [stoppedForLowDisk]: the take ended itself because storage
          * ran nearly full (#342). It is still complete and still delivered
          * as the result, never as an error; the service says why it stopped.
@@ -67,7 +67,7 @@ class RecognitionSessionGuard<T : Any> {
     /** The owning client stopped: finalize the audio for transcription. */
     fun stopListening(owner: T): Ending<T>? = endIfOwned(owner) { Ending.Finalize(it) }
 
-    /** The owning client cancelled: keep the audio, skip the upload. */
+    /** The owning client cancelled: keep the audio, skip the transcription. */
     fun cancel(owner: T): Ending<T>? = endIfOwned(owner) { Ending.Abandon(it) }
 
     /** Watchdog expiry or a defensive restart: finalize whatever is live. */

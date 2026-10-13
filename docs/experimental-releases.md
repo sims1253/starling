@@ -99,11 +99,13 @@ It starts with its own settings and storage. Later experimental APKs update
 this installation and retain its recordings and model. All use the repository's
 persistent Android signing key.
 
-For offline transcription, select **This device** and tap **Download recommended
-model**. To dictate into another app, enable **Starling Experimental Voice Input**
-in Android's keyboard settings and select it. See the
-[Android guide](https://github.com/sims1253/starling/blob/master/apps/mobile/README.md)
-for server connections and speech-recognizer support.
+Tap **Download recommended model**; transcription runs on the phone. Tap
+**Keep models across reinstalls** and allow *All files access* to keep models
+in `Starling/models`, where they survive an uninstall and every Starling build
+on the phone shares them. To dictate into another app, enable **Starling
+Experimental Voice Input** in Android's keyboard settings and select it. See
+the [Android guide](https://github.com/sims1253/starling/blob/master/apps/mobile/README.md)
+for speech-recognizer support.
 
 ## Updates and bug reports
 
@@ -115,7 +117,8 @@ may want to roll back. See the desktop README for data locations.
 
 Old releases remain available. Desktop rollback means extracting the older
 app archive. Android blocks a lower version code; uninstalling allows an
-older APK but deletes that installation's recordings, settings, and model.
+older APK but deletes that installation's recordings and settings (and its
+models, unless they are kept in `Starling/models`).
 
 Each release includes `SHA256SUMS.txt` and `build-info.json`. The latter records
 the commit, version, and build URL. Include the commit, OS, server backend,

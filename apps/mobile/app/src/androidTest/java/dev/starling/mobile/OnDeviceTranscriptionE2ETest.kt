@@ -6,7 +6,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.starling.mobile.engine.ModelCatalog
 import dev.starling.mobile.engine.ModelDownloader
 import dev.starling.mobile.engine.OnDeviceEngine
-import dev.starling.mobile.network.InferenceResult
+import dev.starling.mobile.transcription.InferenceResult
 import org.junit.Assert.assertEquals
 import org.junit.Assume.assumeTrue
 import org.junit.Test

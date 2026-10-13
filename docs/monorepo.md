@@ -62,11 +62,10 @@ iOS for the simulator. Physical-device recording and distribution remain
 separate acceptance checks. A CI configuration is not evidence of a successful
 run until that workflow executes.
 
-Apps connect to a server you start yourself. They do not bundle models or start
-an inference sidecar yet. On a phone, `localhost` means the phone; use your
-computer's reachable endpoint or a development tunnel. HTTP on a trusted LAN
-requires explicit mobile opt-in. Production remote access belongs behind an
-authenticated HTTPS proxy.
+Desktop apps connect to a server you start yourself (or the one they
+bundle). The Android app transcribes on the phone only, with models it
+downloads or imports; it has no server connection. Production remote access
+to a server belongs behind an authenticated HTTPS proxy.
 
 Android implements an explicit Insert action in its voice keyboard. iOS ships
 a standalone recorder with share/copy, not a keyboard extension with microphone

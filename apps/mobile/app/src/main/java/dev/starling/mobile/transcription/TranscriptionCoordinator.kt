@@ -1,4 +1,4 @@
-package dev.starling.mobile.network
+package dev.starling.mobile.transcription
 
 import android.os.Handler
 import android.os.Looper
@@ -15,7 +15,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * Uploads only after local audio finalization and persists every outcome.
+ * Transcribes only after local audio finalization and persists every outcome.
  * Every attempt, first or retry, transcribes the same saved audio; a success
  * adds a transcript revision and a failure leaves the audio and earlier
  * revisions as they were (#356).
@@ -27,11 +27,10 @@ import java.util.concurrent.Executors
  *
  * [injectedFailure] is a debug-build test hook (StarlingApplication): when
  * it returns a reason, every attempt fails with it after Stop, as an engine
- * or server failure would, so device tests can exercise retry and recovery.
+ * failure would, so device tests can exercise retry and recovery.
  */
 class TranscriptionCoordinator(
     private val store: RecordingStore,
-    private val settings: BackendSettings,
     private val onDevice: OnDeviceBackend,
     private val injectedFailure: () -> String? = { null },
     private val onAttemptSettled: () -> Unit = {},
@@ -40,18 +39,18 @@ class TranscriptionCoordinator(
         Thread(runnable, "starling-transcription").apply { isDaemon = true }
     }
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val client = InferenceClient()
-    private val streamClient = StreamClient()
     private val activeIds = ConcurrentHashMap.newKeySet<String>()
 
     /**
      * Returns whether the request was actually queued. A duplicate call for
      * an id that is already in flight is rejected without a callback, so the
      * caller must not show a pending message before checking this result.
+     * [model] is an installed model to use instead of the active one (a
+     * retry with another model); it changes no setting.
      */
     fun transcribe(
         id: String,
-        config: BackendConfig = settings.load(),
+        model: String? = null,
         callback: (Recording) -> Unit = {},
     ): Boolean {
         // A double tap must not race two responses that overwrite the same
@@ -64,7 +63,7 @@ class TranscriptionCoordinator(
         }
         executor.execute {
             try {
-                val completed = settleOrFail(id) { transcribeAudio(queued, config) }
+                val completed = settleOrFail(id) { transcribeAudio(queued, model) }
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
@@ -75,42 +74,31 @@ class TranscriptionCoordinator(
     }
 
     /**
-     * Opens a live session for a capture that is about to start, when the
-     * configuration supports one: on-device live transcription when the
-     * on-device engine is selected and a model is imported, or a `WS /stream`
-     * session for a remote server whose endpoint passes the trusted-host
-     * policy. Returns null otherwise (no imported model or a rejected
-     * endpoint) and the caller
-     * records exactly as before, without streaming.
+     * Opens a live on-device session for a capture that is about to start,
+     * or null when no model is installed; the caller then records exactly
+     * as before, and Stop reports the missing model.
      *
      * [onEvent] is invoked on the main thread: [StreamEvent.Live] once audio
      * is accepted, growing [StreamEvent.Partial] transcripts while
-     * recording, and [StreamEvent.Interrupted] when the stream can no longer
-     * be trusted — the recording itself is never affected. Callers forward
-     * capture chunks to [StreamSession.onAudio] and must eventually call
-     * [finishStreaming] (Stop) or [StreamSession.close] (cancel/failure);
-     * nothing else is required of them. [savedAudio] is the file the capture
-     * writes (RecordingStore.partialFile); the on-device session reads audio
-     * back from it that arrived while the model was still loading.
+     * recording, and [StreamEvent.Interrupted] when the session can no
+     * longer be trusted — the recording itself is never affected. Callers
+     * forward capture chunks to [StreamSession.onAudio] and must eventually
+     * call [finishStreaming] (Stop) or [StreamSession.close]
+     * (cancel/failure); nothing else is required of them. [savedAudio] is
+     * the file the capture writes (RecordingStore.partialFile); the session
+     * reads audio back from it that arrived while the model was still
+     * loading.
      */
     fun beginStreaming(
-        config: BackendConfig = settings.load(),
         savedAudio: File? = null,
         onEvent: (StreamEvent) -> Unit = {},
-    ): StreamSession? {
-        val post: (StreamEvent) -> Unit = { event -> mainHandler.post { onEvent(event) } }
-        if (config.engine == TranscriptionEngine.ON_DEVICE) return onDevice.beginStreaming(savedAudio, post)
-        if (!streamingEligible(config)) return null
-        val url = streamUrl(config.endpoint, config.allowTrustedLanHttp) ?: return null
-        return streamClient.connect(url, post)
-    }
+    ): StreamSession? = onDevice.beginStreaming(savedAudio) { event -> mainHandler.post { onEvent(event) } }
 
     /**
      * Finalizes a live-streamed recording. Call only after the WAV has been
-     * committed to the store (durable audio before network use): commits the
-     * stream and stores its final transcript with LIVE_STREAM provenance.
-     * Whenever the stream failed at any point — connect, mid-stream, or at
-     * commit — the outcome is a batch transcription of the same saved WAV
+     * committed to the store: finishes the session and stores its final
+     * transcript with LIVE_STREAM provenance. Whenever the session failed at
+     * any point, the outcome is a batch transcription of the same saved WAV
      * through the ordinary [transcribe] code path, so the recording, retry,
      * and failure story is indistinguishable from the non-streaming flow.
      * The callback is delivered on the main thread, like [transcribe].
@@ -118,7 +106,6 @@ class TranscriptionCoordinator(
     fun finishStreaming(
         session: StreamSession,
         id: String,
-        config: BackendConfig = settings.load(),
         callback: (Recording) -> Unit = {},
     ): Boolean {
         if (!activeIds.add(id)) return false
@@ -131,33 +118,32 @@ class TranscriptionCoordinator(
             try {
                 val completed = settleOrFail(id) { when (val outcome = session.finish()) {
                     is CommitOutcome.Final -> if (injectedFailure() != null) {
-                        transcribeAudio(queued, config)
+                        transcribeAudio(queued, null)
                     } else {
                         runCatching {
                             store.markTranscribed(
                                 id,
                                 outcome.text,
                                 TranscriptionProvenance.LIVE_STREAM,
-                                source(config),
-                                model(outcome.model, config),
+                                TranscriptSource.ON_DEVICE,
+                                outcome.model ?: onDevice.activeModelName(),
                             )
                         }.getOrElse {
                             store.markFailed(id, "Transcript was received but could not be saved")
                         }
                     }
                     is CommitOutcome.Fallback ->
-                        // The stream is unusable; the durable WAV is the
-                        // source of truth, so batch-upload it like a retry.
-                        transcribeAudio(queued, config)
+                        // The session is unusable; the durable WAV is the
+                        // source of truth, so transcribe it like a retry.
+                        transcribeAudio(queued, null)
                 } }
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
                 runCatching(onAttemptSettled)
                 // Safeguard: the session this worker was handed must never
-                // outlive it, whatever finish() returned — close() settles
-                // and drops the socket, and is a no-op when the client
-                // already cleaned up on its own.
+                // outlive it, whatever finish() returned — close() is a
+                // no-op when the session already cleaned up on its own.
                 session.close()
             }
         }
@@ -171,17 +157,12 @@ class TranscriptionCoordinator(
         executor.shutdownNow()
     }
 
-    private fun transcribeAudio(queued: Recording, config: BackendConfig): Recording {
+    private fun transcribeAudio(queued: Recording, model: String?): Recording {
         val injected = injectedFailure()
         val result = if (injected != null) {
             InferenceResult.Failure(injected, false)
         } else {
-            transcribeStoredAudio(store, queued.id) { audioFile ->
-                when (config.engine) {
-                    TranscriptionEngine.ON_DEVICE -> onDevice.transcribe(audioFile, config)
-                    TranscriptionEngine.REMOTE -> client.transcribe(audioFile, config)
-                }
-            }
+            transcribeStoredAudio(store, queued.id) { audioFile -> onDevice.transcribe(audioFile, model) }
         }
         return when (result) {
             is InferenceResult.Success -> runCatching {
@@ -189,8 +170,8 @@ class TranscriptionCoordinator(
                     queued.id,
                     result.rawTranscript,
                     TranscriptionProvenance.BATCH_UPLOAD,
-                    source(config),
-                    model(result.model, config),
+                    TranscriptSource.ON_DEVICE,
+                    result.model ?: model ?: onDevice.activeModelName(),
                 )
             }.getOrElse {
                 store.markFailed(queued.id, "Transcript was received but could not be saved")
@@ -230,36 +211,11 @@ class TranscriptionCoordinator(
                 }
         }
 
-    /**
-     * The model a result names, else the configured one: an on-device
-     * stream may not report the model it ran, and the transcript's record
-     * still names one.
-     */
-    private fun model(reported: String?, config: BackendConfig): String? = reported ?: when (config.engine) {
-        TranscriptionEngine.ON_DEVICE -> config.onDeviceModel ?: onDevice.activeModelName()
-        TranscriptionEngine.REMOTE -> config.model
-    }
-
     private fun callbackFailure(id: String, message: String, callback: (Recording) -> Unit) {
         val failed = runCatching { store.markFailed(id, message) }.getOrNull()
         if (failed != null) {
             mainHandler.post { callback(failed) }
         }
-    }
-
-    companion object {
-        private fun source(config: BackendConfig): TranscriptSource = when (config.engine) {
-            TranscriptionEngine.ON_DEVICE -> TranscriptSource.ON_DEVICE
-            TranscriptionEngine.REMOTE -> TranscriptSource.SERVER
-        }
-
-        /**
-         * Remote configurations attempt `WS /stream` and fall back to batch
-         * transcription if the endpoint does not support live dictation.
-         * The on-device engine streams locally (see [beginStreaming]).
-         */
-        internal fun streamingEligible(config: BackendConfig): Boolean =
-            config.engine == TranscriptionEngine.REMOTE
     }
 }
 
@@ -267,7 +223,7 @@ class TranscriptionCoordinator(
  * One attempt of [transcribe] on the take's request audio
  * (RecordingStore.withRequestAudio). Missing, removed or damaged audio
  * fails the attempt as not retryable (the row says why); an I/O failure of
- * the engine or the network is retryable like any other transient one.
+ * the engine is retryable like any other transient one.
  */
 internal fun transcribeStoredAudio(
     store: RecordingStore,

@@ -1,5 +1,6 @@
 package dev.starling.mobile
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -13,10 +14,11 @@ import dev.starling.mobile.engine.OnDeviceEngine
  * outlives the Activity (rotation, leaving the screen). Listeners are called
  * on the main thread; a newly added listener immediately gets the current
  * state. The download itself resumes across process death through
- * [OnDeviceEngine.downloadFile], so being killed in the background only
- * pauses it.
+ * [OnDeviceEngine.downloadFile], so being killed only pauses it; while it
+ * runs, [ModelDownloadService] keeps the process in the foreground so that
+ * leaving the app does not.
  */
-class ModelDownloadController(private val engine: OnDeviceEngine) {
+class ModelDownloadController(private val context: Context, private val engine: OnDeviceEngine) {
     sealed interface State {
         data object Idle : State
         data class Running(val bytes: Long, val total: Long, val verifying: Boolean) : State
@@ -61,6 +63,7 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
         this.spec = spec
         publish(State.Running(resumableBytes(spec), spec.sizeBytes, verifying = false))
         Thread({ run(job, spec) }, "starling-model-download").apply { isDaemon = true }.start()
+        ModelDownloadService.start(context)
     }
 
     /** Stops the running download; the partial file is kept for a resume. Any thread. */
@@ -85,7 +88,8 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
             ModelDownloader.Result.Failed(error.message ?: error::class.java.simpleName)
         }
         val next = when (result) {
-            is ModelDownloader.Result.Done -> State.Finished(
+            // Paused while the checksum finished: keep the file for a resume, publish nothing.
+            is ModelDownloader.Result.Done -> if (job.isCancelled) State.Paused else State.Finished(
                 runCatching { engine.adoptDownloaded(result.file, spec.fileName) }.getOrElse { error ->
                     Log.e(TAG, "downloaded model import failed unexpectedly", error)
                     OnDeviceEngine.ImportResult.Rejected(
@@ -103,6 +107,9 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
             if (downloader !== job) return@post
             downloader = null
             publish(next)
+            // A download that started before the models moved to shared
+            // storage finished in the private folder: move it along.
+            if (next is State.Finished) (context.applicationContext as? StarlingApplication)?.moveModelsToSharedStorage()
         }
     }
 

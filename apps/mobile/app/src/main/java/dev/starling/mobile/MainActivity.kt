@@ -17,11 +17,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.core.view.ViewCompat
@@ -39,35 +36,26 @@ import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.ModelCatalog
 import dev.starling.mobile.engine.ModelDownload
 import dev.starling.mobile.engine.OnDeviceEngine
-import dev.starling.mobile.network.BackendConfig
-import dev.starling.mobile.network.BackendSettings
-import dev.starling.mobile.network.EndpointPolicy
-import dev.starling.mobile.network.EndpointValidation
-import dev.starling.mobile.network.StreamEvent
-import dev.starling.mobile.network.StreamSession
-import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.storage.AudioUpkeep
 import dev.starling.mobile.storage.ClassLimits
 import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.storage.HoldReason
 import dev.starling.mobile.storage.StorageSettings
+import dev.starling.mobile.transcription.StreamEvent
+import dev.starling.mobile.transcription.StreamSession
 import java.text.DateFormat
 import java.util.Date
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
-    private lateinit var endpointInput: EditText
-    private lateinit var allowHttpInput: CheckBox
-    private lateinit var modelInput: EditText
-    private lateinit var engineInput: RadioGroup
-    private lateinit var engineOnDeviceInput: RadioButton
     private lateinit var onDeviceStatus: TextView
     private lateinit var downloadModelButton: Button
     private lateinit var downloadOtherModelButton: Button
     private lateinit var installedModelsHeading: TextView
     private lateinit var installedModelsHelp: TextView
     private lateinit var installedModelsContainer: LinearLayout
-    private lateinit var endpointMessage: TextView
+    private lateinit var modelStorageStatus: TextView
+    private lateinit var shareModelsButton: Button
     private lateinit var recordingMessage: TextView
     private lateinit var liveTranscript: TextView
     private lateinit var recordButton: Button
@@ -122,16 +110,12 @@ class MainActivity : Activity() {
             WindowInsetsCompat.CONSUMED
         }
 
-        endpointInput = findViewById(R.id.endpoint_input)
-        allowHttpInput = findViewById(R.id.allow_http_input)
-        modelInput = findViewById(R.id.model_input)
-        engineInput = findViewById(R.id.engine_input)
-        engineOnDeviceInput = findViewById(R.id.engine_on_device)
         onDeviceStatus = findViewById(R.id.on_device_status)
         installedModelsHeading = findViewById(R.id.installed_models_heading)
         installedModelsHelp = findViewById(R.id.installed_models_help)
         installedModelsContainer = findViewById(R.id.installed_models)
-        endpointMessage = findViewById(R.id.endpoint_message)
+        modelStorageStatus = findViewById(R.id.model_storage_status)
+        shareModelsButton = findViewById(R.id.share_models_button)
         recordingMessage = findViewById(R.id.recording_message)
         liveTranscript = findViewById(R.id.live_transcript)
         recordButton = findViewById(R.id.record_button)
@@ -139,19 +123,22 @@ class MainActivity : Activity() {
         retentionReport = findViewById(R.id.retention_report)
         bindRetentionLimits()
 
-        val config = application.backendSettings.load()
-        endpointInput.setText(config.endpoint)
-        allowHttpInput.isChecked = config.allowTrustedLanHttp
-        modelInput.setText(config.model)
-        engineOnDeviceInput.isChecked = config.engine == TranscriptionEngine.ON_DEVICE
-        findViewById<RadioButton>(R.id.engine_server).isChecked =
-            config.engine == TranscriptionEngine.REMOTE
-        findViewById<Button>(R.id.save_endpoint_button).setOnClickListener { saveEndpoint() }
+        shareModelsButton.setOnClickListener {
+            // Only shown where ModelStorage.canShare.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@setOnClickListener
+            runCatching { startActivity(application.modelStorage.grantIntent()) }
+                .onFailure { Log.w(TAG, "the All files access settings could not be opened", it) }
+        }
         findViewById<Button>(R.id.import_model_button).setOnClickListener { importModel() }
         downloadModelButton = findViewById(R.id.download_model_button)
         downloadModelButton.setOnClickListener {
             val downloads = application.modelDownloads
-            if (downloads.isRunning) downloads.cancel() else downloads.start(downloadTarget())
+            if (downloads.isRunning) {
+                downloads.cancel()
+            } else {
+                askDownloadNotifications()
+                downloads.start(downloadTarget())
+            }
         }
         downloadOtherModelButton = findViewById(R.id.download_other_model_button)
         downloadOtherModelButton.setOnClickListener { chooseDownload() }
@@ -160,10 +147,6 @@ class MainActivity : Activity() {
         }
         findViewById<Button>(R.id.open_keyboard_button).setOnClickListener {
             startActivity(Intent("android.settings.INPUT_METHOD_SETTINGS"))
-        }
-        engineInput.setOnCheckedChangeListener { _, _ ->
-            // Download progress owns the status line while it runs.
-            if (!application.modelDownloads.isRunning) refreshOnDeviceStatus()
         }
         showMessage(getString(R.string.ready_to_record))
         refreshOnDeviceStatus()
@@ -212,6 +195,43 @@ class MainActivity : Activity() {
         refreshRecordings()
         // The recorder is a voice entry point: warm the selected local model.
         application.preloadOnDeviceModel()
+        // Back from the All files access switch: the models move along.
+        renderModelStorage()
+        application.moveModelsToSharedStorage { adoption ->
+            if (isDestroyed || isFinishing) return@moveModelsToSharedStorage
+            renderModelStorage()
+            if (!application.modelDownloads.isRunning) refreshOnDeviceStatus()
+            if (adoption.moved > 0 && adoption.remaining == 0) {
+                modelStorageStatus.text = resources.getQuantityString(
+                    R.plurals.models_moved,
+                    adoption.moved,
+                    adoption.moved,
+                    application.modelStorage.sharedDir.path,
+                )
+            }
+        }
+        if (application.isMovingModels) {
+            modelStorageStatus.text = getString(R.string.models_moving, application.modelStorage.sharedDir.path)
+        }
+    }
+
+    /**
+     * Where models are kept, and the way to keep them across reinstalls
+     * (ModelStorage). Not offered while a download writes into the current
+     * folder: the finished file must land where the engine looks for it.
+     */
+    private fun renderModelStorage() {
+        val storage = application.modelStorage
+        val unmoved = storage.unmovedModels()
+        modelStorageStatus.text = when {
+            storage.isShared && unmoved > 0 && !application.isMovingModels ->
+                resources.getQuantityString(R.plurals.models_not_moved, unmoved, unmoved, storage.sharedDir.path)
+            storage.isShared -> getString(R.string.models_shared, storage.sharedDir.path)
+            storage.canShare -> getString(R.string.models_private)
+            else -> getString(R.string.models_private_unsupported)
+        }
+        shareModelsButton.visibility = if (storage.canShare && !storage.isShared) View.VISIBLE else View.GONE
+        shareModelsButton.isEnabled = !application.modelDownloads.isRunning
     }
 
     override fun onStart() {
@@ -261,10 +281,30 @@ class MainActivity : Activity() {
             .setTitle(R.string.download_other_title)
             .setItems(rows) { _, which ->
                 val spec = specs[which]
-                if (spec.fileName !in installed && !downloads.isRunning) downloads.start(spec)
+                if (spec.fileName !in installed && !downloads.isRunning) {
+                    askDownloadNotifications()
+                    downloads.start(spec)
+                }
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
+    }
+
+    /**
+     * Android 13+ hides a download's progress notification until
+     * notifications are allowed; asked once, alongside the first download.
+     * The download runs in the background either way.
+     */
+    private fun askDownloadNotifications() {
+        if (Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val preferences = getSharedPreferences(PREFS_UI, MODE_PRIVATE)
+        if (preferences.getBoolean(KEY_ASKED_DOWNLOAD_NOTIFICATIONS, false)) return
+        preferences.edit().putBoolean(KEY_ASKED_DOWNLOAD_NOTIFICATIONS, true).apply()
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_DOWNLOAD_NOTIFICATIONS)
     }
 
     private fun renderDownload(state: ModelDownloadController.State) {
@@ -272,6 +312,7 @@ class MainActivity : Activity() {
         val spec = if (downloads.isRunning) downloads.spec ?: downloadTarget() else downloadTarget()
         val totalMb = mb(spec.sizeBytes)
         downloadOtherModelButton.visibility = if (downloads.isRunning) View.GONE else View.VISIBLE
+        shareModelsButton.isEnabled = !downloads.isRunning
         // Listed only once the download is not running: progress ticks
         // never touch the model directory.
         val models by lazy { application.onDeviceEngine.installedModels() }
@@ -418,37 +459,6 @@ class MainActivity : Activity() {
         },
     )
 
-    private fun saveEndpoint(): BackendConfig? {
-        val config = currentConfig() ?: return null
-        application.backendSettings.save(config)
-        endpointMessage.setText(R.string.endpoint_saved)
-        return config
-    }
-
-    private fun currentConfig(): BackendConfig? {
-        val config = BackendConfig(
-            endpoint = endpointInput.text.toString(),
-            allowTrustedLanHttp = allowHttpInput.isChecked,
-            model = modelInput.text.toString().trim(),
-            engine = if (engineOnDeviceInput.isChecked) {
-                TranscriptionEngine.ON_DEVICE
-            } else {
-                TranscriptionEngine.REMOTE
-            },
-        )
-        if (config.engine == TranscriptionEngine.REMOTE && config.model.isEmpty()) {
-            endpointMessage.setText(R.string.model_required)
-            return null
-        }
-        return when (val validation = EndpointPolicy.validate(config.endpoint, config.allowTrustedLanHttp)) {
-            is EndpointValidation.Invalid -> {
-                endpointMessage.text = validation.message
-                null
-            }
-            is EndpointValidation.Valid -> config.copy(endpoint = validation.endpoint)
-        }
-    }
-
     private fun importModel() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -531,16 +541,10 @@ class MainActivity : Activity() {
 
     private fun renderOnDeviceStatus(models: List<OnDeviceEngine.InstalledModel>) {
         val active = models.firstOrNull { it.active }
-        onDeviceStatus.text = when {
-            active == null -> getString(R.string.on_device_status_no_model)
-            engineOnDeviceInput.isChecked ->
-                getString(R.string.on_device_model_in_use, modelDisplayName(active), mb(active.sizeBytes))
-            else -> getString(
-                R.string.on_device_model_not_selected,
-                modelDisplayName(active),
-                mb(active.sizeBytes),
-                getString(R.string.engine_on_device),
-            )
+        onDeviceStatus.text = if (active == null) {
+            getString(R.string.on_device_status_no_model)
+        } else {
+            getString(R.string.on_device_model_in_use, modelDisplayName(active), mb(active.sizeBytes))
         }
     }
 
@@ -642,15 +646,6 @@ class MainActivity : Activity() {
     }
 
     private fun requestOrStartRecording() {
-        val config = currentConfig() ?: return
-        // Use what is visible in the form for this recording. This also makes
-        // recording safe when the user edits the endpoint and skips the Save
-        // button before tapping Record.
-        runCatching { application.backendSettings.save(config) }
-            .onFailure {
-                endpointMessage.setText(R.string.endpoint_save_error)
-                return
-            }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             awaitingPermission = true
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
@@ -672,12 +667,11 @@ class MainActivity : Activity() {
             return
         }
         // The live stream is an observer of the capture, never a gate on it:
-        // beginStreaming returns null whenever the configuration or endpoint
-        // does not support streaming, and the recording proceeds as before.
-        val config = application.backendSettings.load()
+        // beginStreaming returns null when no model is installed, and the
+        // recording proceeds as before.
         var session: StreamSession? = null
         val savedAudio = application.recordings.partialFile(recording)
-        session = application.transcription.beginStreaming(config, savedAudio) { event ->
+        session = application.transcription.beginStreaming(savedAudio) { event ->
             // Events from a superseded session must not rewrite the views of
             // the recording that replaced it.
             if (streamSession === session) onStreamEvent(event)
@@ -714,7 +708,7 @@ class MainActivity : Activity() {
             getString(
                 when {
                     session == null -> R.string.recording_now
-                    application.isOnDeviceModelLoading(config) -> R.string.streaming_loading
+                    application.isOnDeviceModelLoading() -> R.string.streaming_loading
                     else -> R.string.streaming_connecting
                 },
             ),
@@ -747,8 +741,8 @@ class MainActivity : Activity() {
             StreamEvent.Live -> showRecordingStatus(getString(R.string.streaming_live))
             is StreamEvent.Partial -> {
                 liveTranscript.visibility = View.VISIBLE
-                // The server's partial is a growing transcript of the whole
-                // session so far, so it replaces the previous text.
+                // A partial is a growing transcript of the whole session so
+                // far, so it replaces the previous text.
                 liveTranscript.text = event.text
             }
             is StreamEvent.Interrupted ->
@@ -778,7 +772,7 @@ class MainActivity : Activity() {
     ) {
         when (result) {
             is CaptureResult.Completed -> {
-                // The WAV is finalized and durable before any network use.
+                // The WAV is finalized and durable before it is transcribed.
                 val finalized = runCatching {
                     application.recordings.commitAudio(recording, result.durationSeconds)
                 }.getOrElse {
@@ -792,7 +786,6 @@ class MainActivity : Activity() {
                     }
                     return
                 }
-                val config = application.backendSettings.load()
                 // Why a take that ended by itself stopped stays on screen
                 // through its transcription.
                 val notice = when {
@@ -801,19 +794,19 @@ class MainActivity : Activity() {
                     else -> null
                 }
                 val settled: (Recording) -> Unit = { onTranscriptionSettled(it, notice) }
-                // With a live session, commit the stream and store its final
-                // transcript; the coordinator falls back to this same batch
-                // upload of the saved WAV whenever the stream failed.
+                // With a live session, finish it and store its final
+                // transcript; the coordinator falls back to transcribing this
+                // same saved WAV whenever the session failed.
                 val queued = if (session != null) {
-                    application.transcription.finishStreaming(session, finalized.id, config, settled)
+                    application.transcription.finishStreaming(session, finalized.id, settled)
                 } else {
-                    application.transcription.transcribe(finalized.id, config, settled)
+                    application.transcription.transcribe(finalized.id, callback = settled)
                 }
                 if (queued) updateRecordingViews { showMessage(notice ?: getString(R.string.sending_recording)) }
                 updateRecordingViews { refreshRecordings() }
             }
             is CaptureResult.Failed -> {
-                // Nothing will be transcribed; the server session and the
+                // Nothing will be transcribed; the live session and the
                 // stale live partial go with it.
                 session?.close()
                 updateRecordingViews { liveTranscript.visibility = View.GONE }
@@ -960,7 +953,7 @@ class MainActivity : Activity() {
         }
         if (recording.rawTranscript != null) {
             transcript.visibility = View.VISIBLE
-            // The exact server text is shown and retained. There is no cleanup
+            // The exact recognized text is shown and retained. There is no cleanup
             // pass that could remove words such as "not", "like", or "auth".
             transcript.text = recording.rawTranscript
         } else {
@@ -1069,31 +1062,16 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Retry, or transcribe again, with the configured engine or any other
-     * installed model (#356). The same saved audio is sent every time; the
+     * Retry, or transcribe again, with the active or any other installed
+     * model (#356). The same saved audio is transcribed every time; the
      * choice applies to this attempt only and changes no setting.
      */
     private fun chooseRetryTarget(recording: Recording) {
-        val config = application.backendSettings.load()
-        val onDevice = application.onDeviceEngine.installedModels()
+        val options = application.onDeviceEngine.installedModels()
             .sortedByDescending { it.active }
-            .map { model ->
-                getString(R.string.retry_with_on_device, modelDisplayName(model)) to
-                    config.copy(engine = TranscriptionEngine.ON_DEVICE, onDeviceModel = model.name)
-            }
-        // A server is offered once one is configured (or it is the engine).
-        val serverConfigured = config.engine == TranscriptionEngine.REMOTE ||
-            config.endpoint != BackendSettings.DEFAULT_ENDPOINT
-        val server = if (serverConfigured && config.model.isNotBlank() &&
-            EndpointPolicy.validate(config.endpoint, config.allowTrustedLanHttp) is EndpointValidation.Valid
-        ) {
-            listOf(getString(R.string.retry_with_server, config.model) to config.copy(engine = TranscriptionEngine.REMOTE))
-        } else {
-            emptyList()
-        }
-        val options = if (config.engine == TranscriptionEngine.REMOTE) server + onDevice else onDevice + server
+            .map { model -> getString(R.string.retry_with_on_device, modelDisplayName(model)) to model.name }
         if (options.size <= 1) {
-            retryRecording(recording, options.firstOrNull()?.second ?: config)
+            retryRecording(recording, options.firstOrNull()?.second)
             return
         }
         AlertDialog.Builder(this)
@@ -1103,8 +1081,8 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun retryRecording(recording: Recording, config: BackendConfig) {
-        val queued = application.transcription.transcribe(recording.id, config) {
+    private fun retryRecording(recording: Recording, model: String?) {
+        val queued = application.transcription.transcribe(recording.id, model) {
             // The Activity may have been destroyed (for example by a
             // rotation) while the request was in flight.
             if (isDestroyed || isFinishing) return@transcribe
@@ -1214,6 +1192,9 @@ class MainActivity : Activity() {
         private const val REQUEST_IMPORT_MODEL = 4002
         private const val REQUEST_KEYBOARD_MICROPHONE = 4003
         private const val REQUEST_EXPORT_RECORDING = 4004
+        private const val REQUEST_DOWNLOAD_NOTIFICATIONS = 4005
+        private const val PREFS_UI = "main_ui"
+        private const val KEY_ASKED_DOWNLOAD_NOTIFICATIONS = "asked_download_notifications"
         private const val STATE_PENDING_EXPORT = "pending_export_id"
         private const val STATE_PENDING_EXPORT_FLAC = "pending_export_flac"
 

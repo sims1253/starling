@@ -75,7 +75,7 @@ def prepare(args: argparse.Namespace) -> None:
 
 Desktop: download the one desktop archive for your platform and open the app — pick a model in the app and it downloads and verifies it in-app. The CPU and Vulkan engines ship inside the desktop archive; the app picks Vulkan when a Vulkan driver is present and otherwise CPU, and shows which it uses. Standalone server archives remain the headless/advanced option: run one and point the app at it with Manual server mode in settings. CUDA stays a separate download and is not bundled. Linux desktop requires Ubuntu 24.04 or a compatible newer system; the server alone supports Ubuntu 22.04.
 
-Android: install **Starling Experimental**, select **This device**, and download the recommended model. It installs beside Starling Mobile and retains its own data between experimental updates. Its voice keyboard is **Starling Experimental Voice Input**.
+Android: install **Starling Experimental** and download the recommended model; transcription runs on the phone. Tap **Keep models across reinstalls** to keep models in `Starling/models`, where they survive an uninstall. It installs beside Starling Mobile and retains its own data between experimental updates. Its voice keyboard is **Starling Experimental Voice Input**.
 
 CUDA packages target RTX 5090-class SM 120 GPUs only. Use Vulkan or CPU on other GPUs. Desktop packages are unsigned. These are development builds: GPU inference and phone behavior still need testing on real devices. The desktop currently delivers transcripts through Copy; see the guide for hotkey limitations.
 

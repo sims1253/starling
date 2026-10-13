@@ -1,7 +1,7 @@
 package dev.starling.mobile.engine
 
-import dev.starling.mobile.network.CommitOutcome
-import dev.starling.mobile.network.StreamEvent
+import dev.starling.mobile.transcription.CommitOutcome
+import dev.starling.mobile.transcription.StreamEvent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

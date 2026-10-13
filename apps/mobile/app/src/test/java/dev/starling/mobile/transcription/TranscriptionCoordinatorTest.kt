@@ -1,4 +1,4 @@
-package dev.starling.mobile.network
+package dev.starling.mobile.transcription
 
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.Recording

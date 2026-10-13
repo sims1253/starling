@@ -18,11 +18,9 @@ import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
-import dev.starling.mobile.network.BackendConfig
-import dev.starling.mobile.network.StreamEvent
-import dev.starling.mobile.network.StreamSession
-import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.transcription.StreamEvent
+import dev.starling.mobile.transcription.StreamSession
 import java.util.concurrent.TimeUnit
 
 /**
@@ -31,10 +29,10 @@ import java.util.concurrent.TimeUnit
  * here once Starling is selected as the voice input service, so dictation
  * works inside a normal keyboard without switching IMEs.
  *
- * With a Starling server, capture streams live and growing partials are delivered
- * through [RecognitionService.Callback.partialResults]; the final result
- * still arrives once, in [RecognitionService.Callback.results], after the
- * stream commits or — on any streaming failure — after the batch
+ * Capture is transcribed live on the device and growing partials are
+ * delivered through [RecognitionService.Callback.partialResults]; the final
+ * result still arrives once, in [RecognitionService.Callback.results], after
+ * the live session finishes or — on any failure of it — after the batch
  * transcription of the saved WAV. The audio and its outcome stay durable in
  * the recordings store, so a failed transcription remains retryable from
  * the app. Session transitions are decided by [RecognitionSessionGuard],
@@ -94,11 +92,10 @@ class StarlingRecognitionService : RecognitionService() {
         } else {
             this
         }
-        // The live stream is an observer of the capture: null means this
-        // configuration captures for the ordinary batch transcription.
-        val config = application.backendSettings.load()
+        // The live stream is an observer of the capture: null means no
+        // model is installed and the take goes to the batch transcription.
         val savedAudio = application.recordings.partialFile(recording)
-        val session = application.transcription.beginStreaming(config, savedAudio) { event ->
+        val session = application.transcription.beginStreaming(savedAudio) { event ->
             onStreamEvent(callback, event)
         }
         val error = capture.start(
@@ -196,7 +193,7 @@ class StarlingRecognitionService : RecognitionService() {
                     runCatching { Log.w(TAG, "a take stopped early: storage is nearly full") }
                     toast(getString(R.string.recording_stopped_low_disk))
                 }
-                // The WAV is finalized and durable before any network use.
+                // The WAV is finalized and durable before it is transcribed.
                 val finalized = runCatching {
                     application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
                 }.getOrNull()
@@ -208,22 +205,20 @@ class StarlingRecognitionService : RecognitionService() {
                     sessions.deliver(ending.session.owner) { it.error(SpeechRecognizer.ERROR_CLIENT) }
                     return
                 }
-                val config = application.backendSettings.load()
                 val settled: (Recording) -> Unit = { completed ->
-                    deliverSettled(ending, completed, config)
+                    deliverSettled(ending, completed)
                 }
                 if (session != null) {
-                    // Commit the live stream; any failure falls back to the
-                    // batch upload of the same saved WAV.
-                    application.transcription.finishStreaming(session, finalized.id, config, settled)
+                    // Finish the live stream; any failure falls back to
+                    // transcribing the same saved WAV.
+                    application.transcription.finishStreaming(session, finalized.id, settled)
                 } else {
-                    application.transcription.transcribe(finalized.id, config, settled)
+                    application.transcription.transcribe(finalized.id, callback = settled)
                 }
             }
             is RecognitionSessionGuard.Settlement.Keep -> {
                 // The recording itself was the user's intent; keep it, skip
-                // upload, and drop the server session so no keepalive keeps
-                // it alive after the host cancelled.
+                // transcription, and drop the live session.
                 session?.close()
                 runCatching {
                     application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
@@ -252,7 +247,6 @@ class StarlingRecognitionService : RecognitionService() {
     private fun deliverSettled(
         ending: RecognitionSessionGuard.Ending<Callback>,
         completed: Recording,
-        config: BackendConfig,
     ) {
         if (completed.status == RecordingStatus.TRANSCRIBED &&
             completed.rawTranscript != null
@@ -269,16 +263,9 @@ class StarlingRecognitionService : RecognitionService() {
             }
         } else {
             // The transcription failed but the recording is retained
-            // and retryable from the app; report the class the host
-            // keyboard can act on (network for the server path,
-            // client for a local engine problem such as a missing
-            // model).
-            val errorCode = if (config.engine == TranscriptionEngine.ON_DEVICE) {
-                SpeechRecognizer.ERROR_CLIENT
-            } else {
-                SpeechRecognizer.ERROR_NETWORK
-            }
-            sessions.deliver(ending.session.owner) { it.error(errorCode) }
+            // and retryable from the app; a local engine problem (such as
+            // a missing model) is the client's.
+            sessions.deliver(ending.session.owner) { it.error(SpeechRecognizer.ERROR_CLIENT) }
         }
     }
 

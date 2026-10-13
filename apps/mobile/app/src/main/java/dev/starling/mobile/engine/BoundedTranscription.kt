@@ -1,6 +1,6 @@
 package dev.starling.mobile.engine
 
-import dev.starling.mobile.network.InferenceResult
+import dev.starling.mobile.transcription.InferenceResult
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -191,9 +191,9 @@ class BoundedTranscription(
         }
 
         const val ABANDONED = "The on-device model stopped responding. The recording is kept; restart Starling " +
-            "to transcribe on this device again, or retry with a server."
+            "to transcribe on this device again."
         const val ENGINE_STUCK = "The on-device model is stuck on an earlier call. The recording is kept; restart " +
-            "Starling to transcribe on this device again, or retry with a server."
+            "Starling to transcribe on this device again."
         const val INTERRUPTED = "The on-device transcription was interrupted. The recording is kept; retry to " +
             "transcribe it again."
     }

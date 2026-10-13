@@ -538,8 +538,8 @@ class AudioCapture(
         /**
          * Terminal cap for a single capture: two hours of 16 kHz mono PCM16
          * (~220 MiB). The WAV RIFF sizes would only overflow after ~18.6
-         * hours, but this earlier bound also keeps the file under
-         * InferenceClient's 256 MiB upload limit with margin. A capture that
+         * hours; this earlier bound keeps one take a size the on-device
+         * engine and the history-audio limits handle. A capture that
          * reaches the cap ends like an explicit stop and is committed as a
          * completed recording.
          */

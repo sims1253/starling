@@ -19,14 +19,14 @@ enum class RecordingStatus {
  * happened; it never changes the text itself.
  */
 enum class TranscriptionProvenance {
-    /** Live `WS /stream` session: partials while recording, final on commit. */
+    /** Live session: partials while recording, final on Stop. */
     LIVE_STREAM,
 
-    /** Multipart upload of the saved WAV after the recording finished. */
+    /** Transcription of the saved WAV after the recording finished. */
     BATCH_UPLOAD,
 }
 
-/** Where a transcript was computed. */
+/** Where a transcript was computed. SERVER only names revisions from older builds. */
 enum class TranscriptSource {
     ON_DEVICE,
     SERVER,
@@ -40,7 +40,7 @@ data class TranscriptRevision(
     val text: String,
     val provenance: TranscriptionProvenance,
     val source: TranscriptSource?,
-    /** The on-device model file, or the server model name; null when unknown. */
+    /** The model file that produced it; null when unknown. */
     val model: String?,
     val createdAtMillis: Long,
 )

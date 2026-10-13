@@ -92,6 +92,31 @@ class ModelDownloaderTest {
     }
 
     @Test
+    fun aPauseBeforeTheDownloadStartsStands() {
+        val partial = File(directory, "model.part")
+        val job = ModelDownloader()
+        job.cancel()
+
+        val result = job.download(spec(), partial) { _, _, _ -> }
+
+        assertEquals(ModelDownloader.Result.Cancelled, result)
+        assertEquals("nothing was fetched", 0, server.requestCount)
+    }
+
+    @Test
+    fun aPauseWhileVerifyingKeepsTheCompleteFileAndReportsCancelled() {
+        server.enqueue(MockResponse().setBody(body(payload)))
+        val partial = File(directory, "model.part")
+        val job = ModelDownloader()
+
+        val result = job.download(spec(), partial) { _, _, verifying -> if (verifying) job.cancel() }
+
+        assertEquals(ModelDownloader.Result.Cancelled, result)
+        assertTrue(job.isCancelled)
+        assertArrayEquals(payload, partial.readBytes())
+    }
+
+    @Test
     fun checksumMismatchDiscardsTheFile() {
         server.enqueue(MockResponse().setBody(body(payload)))
         val partial = File(directory, "model.part")

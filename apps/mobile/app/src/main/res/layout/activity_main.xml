@@ -34,110 +34,10 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="28dp"
-            android:text="@string/backend_heading"
+            android:text="@string/model_heading"
             android:textColor="@color/starling_ink"
             android:textSize="18sp"
             android:textStyle="bold" />
-
-        <EditText
-            android:id="@+id/endpoint_input"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:autofillHints="none"
-            android:hint="@string/backend_endpoint_hint"
-            android:inputType="textUri"
-            android:singleLine="true"
-            android:textColor="@color/starling_ink"
-            android:textColorHint="@color/starling_muted" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:text="@string/backend_endpoint_help"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp" />
-
-        <CheckBox
-            android:id="@+id/allow_http_input"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="@string/allow_http"
-            android:textColor="@color/starling_ink" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:layout_marginTop="-4dp"
-            android:text="@string/allow_http_help"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp" />
-
-        <Button
-            android:id="@+id/save_endpoint_button"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="@string/save_endpoint" />
-
-        <TextView
-            android:id="@+id/endpoint_message"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp" />
-
-        <EditText
-            android:id="@+id/model_input"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:autofillHints="none"
-            android:hint="@string/model_hint"
-            android:inputType="text"
-            android:singleLine="true"
-            android:textColor="@color/starling_ink"
-            android:textColorHint="@color/starling_muted"
-            android:visibility="visible" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="@string/protocol_help"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
-            android:text="@string/engine_heading"
-            android:textColor="@color/starling_ink"
-            android:textSize="15sp"
-            android:textStyle="bold" />
-
-        <RadioGroup
-            android:id="@+id/engine_input"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical">
-
-            <RadioButton
-                android:id="@+id/engine_server"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/engine_server" />
-
-            <RadioButton
-                android:id="@+id/engine_on_device"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/engine_on_device" />
-        </RadioGroup>
 
         <TextView
             android:id="@+id/on_device_status"
@@ -176,6 +76,24 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical" />
+
+        <!-- Where models are kept (MainActivity.renderModelStorage). -->
+        <TextView
+            android:id="@+id/model_storage_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginTop="8dp"
+            android:textColor="@color/starling_muted"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/share_models_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/share_models"
+            android:visibility="gone" />
 
         <!-- Label set by MainActivity.renderDownload (size, resume state). -->
         <Button
@@ -223,9 +141,9 @@
             android:textColor="@color/starling_muted"
             android:textSize="14sp" />
 
-        <!-- Live partial transcript while the recording streams to a
-             Starling server; hidden when recording is plain or the stream
-             failed (the durable WAV then decides the final text). -->
+        <!-- Live partial transcript while the recording is transcribed;
+             hidden when recording is plain or the live session failed (the
+             durable WAV then decides the final text). -->
         <TextView
             android:id="@+id/live_transcript"
             android:layout_width="match_parent"

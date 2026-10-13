@@ -16,10 +16,6 @@ import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.engine.StreamDebug
 import dev.starling.mobile.engine.StreamTrace
-import dev.starling.mobile.network.BackendConfig
-import dev.starling.mobile.network.BackendSettings
-import dev.starling.mobile.network.TranscriptionCoordinator
-import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.processing.ModeCatalog
 import dev.starling.mobile.processing.ProfilesDocument
 import dev.starling.mobile.processing.SpokenCommands
@@ -31,6 +27,7 @@ import dev.starling.mobile.storage.DiskReading
 import dev.starling.mobile.storage.FreeSpaceProbe
 import dev.starling.mobile.storage.RecordingStore
 import dev.starling.mobile.storage.StorageSettings
+import dev.starling.mobile.transcription.TranscriptionCoordinator
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -41,7 +38,7 @@ import java.util.concurrent.TimeUnit
 class StarlingApplication : Application() {
     lateinit var recordings: RecordingStore
         private set
-    lateinit var backendSettings: BackendSettings
+    lateinit var modelStorage: ModelStorage
         private set
     lateinit var transcription: TranscriptionCoordinator
         private set
@@ -89,7 +86,7 @@ class StarlingApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         recordings = RecordingStore(this)
-        backendSettings = BackendSettings(this)
+        modelStorage = ModelStorage(this)
         storageSettings = StorageSettings(this)
         audioUpkeep = AudioUpkeep(
             recordings,
@@ -103,11 +100,13 @@ class StarlingApplication : Application() {
             onFailure = { t -> runCatching { Log.w(TAG, "history audio upkeep failed", t) } },
         )
         onDeviceEngine = OnDeviceEngine(
-            File(filesDir, "models"),
+            modelStorage::current,
+            modelStorage.privateDir,
+            partialTag = packageName,
             memoryGate = ::memoryGate,
             keepAwake = partialWakeLock(),
         )
-        modelDownloads = ModelDownloadController(onDeviceEngine)
+        modelDownloads = ModelDownloadController(this, onDeviceEngine)
         modelLifetime = ModelLifetime(
             engine = object : ModelLifetime.Engine {
                 override fun preload(allowed: (model: String) -> Boolean) = onDeviceEngine.preload(allowed)
@@ -127,7 +126,6 @@ class StarlingApplication : Application() {
         onDeviceEngine.observer = modelLifetime
         transcription = TranscriptionCoordinator(
             recordings,
-            backendSettings,
             OnDeviceBackend(onDeviceEngine),
             injectedFailure = if (BuildConfig.DEBUG) ::debugInjectedFailure else { -> null },
             onAttemptSettled = audioUpkeep::schedule,
@@ -139,6 +137,9 @@ class StarlingApplication : Application() {
             StreamDebug.traceSink = { if (File(filesDir, "debug/stream-trace").exists()) ::debugWriteTrace else null }
         }
         scheduleAudioUpkeep()
+        // Whatever an earlier move left behind, for every entry point (the
+        // keyboard and the recognizer start the process too).
+        moveModelsToSharedStorage()
     }
 
     /**
@@ -250,14 +251,53 @@ class StarlingApplication : Application() {
         releaseExecutor.execute { onDeviceEngine.releaseWhenIdle() }
     }
 
+    // Main thread only: whether a move runs, and who waits for its outcome.
+    private var movingModels = false
+    private val moveListeners = mutableListOf<(OnDeviceEngine.Adoption) -> Unit>()
+
+    /**
+     * Once models are kept in shared storage ([ModelStorage]), moves the
+     * ones still in app-private storage there, off the main thread (a model
+     * is hundreds of MB to GBs). Main thread. [done] gets what moved, on the
+     * main thread, also when it joins a move already running; it is not
+     * called when there is nothing to move. Models it could not move stay
+     * installed where they are.
+     */
+    fun moveModelsToSharedStorage(done: (OnDeviceEngine.Adoption) -> Unit = {}) {
+        if (movingModels) {
+            moveListeners += done
+            return
+        }
+        if (!modelStorage.isShared || modelStorage.unmovedModels() == 0) return
+        movingModels = true
+        moveListeners += done
+        Thread({
+            val moved = try {
+                onDeviceEngine.adoptModels(modelStorage.privateDir)
+            } catch (t: Throwable) {
+                runCatching { Log.w(TAG, "moving models to shared storage failed", t) }
+                // The same storage trouble can fail the count; a throw here would end the process.
+                OnDeviceEngine.Adoption(0, runCatching { modelStorage.unmovedModels() }.getOrDefault(1))
+            }
+            mainHandler.post {
+                movingModels = false
+                val listeners = moveListeners.toList()
+                moveListeners.clear()
+                for (listener in listeners) listener(moved)
+            }
+        }, "starling-model-move").apply { isDaemon = true }.start()
+    }
+
+    /** Whether [moveModelsToSharedStorage] is copying models right now. Main thread. */
+    val isMovingModels: Boolean get() = movingModels
+
     /**
      * A voice surface became active (the keyboard shown, the recognizer popup
      * or the recorder opened): start loading the selected local model so the
-     * first words of a recording do not wait for it. A no-op for the server
-     * engine; never opens the microphone, never downloads (see ModelLifetime).
+     * first words of a recording do not wait for it. Never opens the
+     * microphone, never downloads (see ModelLifetime).
      */
     fun preloadOnDeviceModel() {
-        if (backendSettings.load().engine != TranscriptionEngine.ON_DEVICE) return
         runCatching { modelLifetime.preload() }
             .onFailure { t ->
                 // runCatching around Log: it is a stub in local unit tests,
@@ -267,7 +307,7 @@ class StarlingApplication : Application() {
     }
 
     /**
-     * Whether [config] streams on-device while the model is still loading:
+     * Whether a take streams while the model is still loading:
      * the one predicate behind the voice surfaces' "loading" status (the
      * recorder, the recognizer popup and the keyboard), so they cannot
      * drift apart. True while the model is Loading, and while it is
@@ -278,8 +318,7 @@ class StarlingApplication : Application() {
      * text that will not come. Audio is saved from the first sample either
      * way.
      */
-    fun isOnDeviceModelLoading(config: BackendConfig): Boolean =
-        config.engine == TranscriptionEngine.ON_DEVICE && isLoading(modelLifetime.state())
+    fun isOnDeviceModelLoading(): Boolean = isLoading(modelLifetime.state())
 
     /**
      * Refuses a model load that clearly cannot fit: the model's file size is

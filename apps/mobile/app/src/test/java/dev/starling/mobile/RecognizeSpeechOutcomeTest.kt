@@ -5,7 +5,6 @@ import android.speech.RecognizerIntent
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
-import dev.starling.mobile.network.TranscriptionEngine
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -23,7 +22,6 @@ class RecognizeSpeechOutcomeTest {
     fun transcribedTextIsReturnedVerbatim() {
         val outcome = RecognizeSpeechOutcome.settled(
             recording(RecordingStatus.TRANSCRIBED, "  not like auth  "),
-            TranscriptionEngine.REMOTE,
         )
 
         assertEquals(Activity.RESULT_OK, outcome.resultCode)
@@ -34,7 +32,6 @@ class RecognizeSpeechOutcomeTest {
     fun blankTranscriptIsNoMatch() {
         val outcome = RecognizeSpeechOutcome.settled(
             recording(RecordingStatus.TRANSCRIBED, " "),
-            TranscriptionEngine.REMOTE,
         )
 
         assertEquals(RecognizerIntent.RESULT_NO_MATCH, outcome.resultCode)
@@ -42,25 +39,18 @@ class RecognizeSpeechOutcomeTest {
     }
 
     @Test
-    fun serverFailureIsNetworkError() {
-        val outcome = RecognizeSpeechOutcome.settled(recording(RecordingStatus.FAILED), TranscriptionEngine.REMOTE)
+    fun failureIsClientError() {
+        val outcome = RecognizeSpeechOutcome.settled(recording(RecordingStatus.FAILED))
 
-        assertEquals(RecognizerIntent.RESULT_NETWORK_ERROR, outcome.resultCode)
+        assertEquals(RecognizerIntent.RESULT_CLIENT_ERROR, outcome.resultCode)
         assertNull(outcome.transcript)
     }
 
     @Test
-    fun onDeviceFailureIsClientError() {
-        val outcome = RecognizeSpeechOutcome.settled(recording(RecordingStatus.FAILED), TranscriptionEngine.ON_DEVICE)
+    fun transcribedStatusWithoutTextIsAFailure() {
+        val outcome = RecognizeSpeechOutcome.settled(recording(RecordingStatus.TRANSCRIBED))
 
         assertEquals(RecognizerIntent.RESULT_CLIENT_ERROR, outcome.resultCode)
-    }
-
-    @Test
-    fun transcribedStatusWithoutTextIsAFailure() {
-        val outcome = RecognizeSpeechOutcome.settled(recording(RecordingStatus.TRANSCRIBED), TranscriptionEngine.REMOTE)
-
-        assertEquals(RecognizerIntent.RESULT_NETWORK_ERROR, outcome.resultCode)
     }
 
     @Test
