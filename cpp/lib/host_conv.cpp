@@ -18,15 +18,22 @@
 namespace starling::ggml::lib {
 namespace {
 
+// The register tile uses GNU vector extensions (GCC, Clang, clang-cl); other
+// compilers (MSVC) get a scalar tile with the same per-element arithmetic
+// (one f64 multiply, then one f64 add, in step order), so both produce the
+// same bits. STARLING_HOST_CONV_SCALAR forces the scalar tile (for testing it
+// on GCC/Clang).
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(STARLING_HOST_CONV_SCALAR)
+#define STARLING_HOST_CONV_VEC 1
 typedef double v2d __attribute__((vector_size(16)));
 typedef double v2du __attribute__((vector_size(16), aligned(8)));  // unaligned access
+#endif
 
 #if defined(__aarch64__)
 constexpr int64_t kMR = 4, kNR = 8;  // 16 accumulator q-registers of 32
 #else
 constexpr int64_t kMR = 4, kNR = 4;  // fits the 16 SSE registers
 #endif
-constexpr int64_t kNV = kNR / 2;
 constexpr int64_t kMc = 64;   // oc per work item (multiple of kMR)
 constexpr int64_t kTc = 64;   // t per work item (multiple of kNR)
 constexpr int64_t kKc = 64;   // input channels per chunk (3*kKc steps)
@@ -36,6 +43,22 @@ constexpr int64_t kKc = 64;   // input channels per chunk (3*kKc steps)
 // xp + col); acc: [kMR][lda] f64.
 inline void micro_tile(const double* wp, const double* xp, int64_t ldx, int64_t steps,
                        double* acc, int64_t lda) {
+#if !defined(STARLING_HOST_CONV_VEC)
+    double a[kMR][kNR];
+    for (int64_t i = 0; i < kMR; ++i)
+        for (int64_t j = 0; j < kNR; ++j) a[i][j] = acc[i * lda + j];
+    for (int64_t s = 0; s < steps; ++s) {
+        const double* xs = xp + s * ldx;
+        const double* ws = wp + s * kMR;
+        for (int64_t i = 0; i < kMR; ++i) {
+            const double wi = ws[i];
+            for (int64_t j = 0; j < kNR; ++j) a[i][j] += wi * xs[j];
+        }
+    }
+    for (int64_t i = 0; i < kMR; ++i)
+        for (int64_t j = 0; j < kNR; ++j) acc[i * lda + j] = a[i][j];
+#else
+    constexpr int64_t kNV = kNR / 2;
     // Element-wise vector loads/stores (not memcpy of whole rows) so GCC
     // keeps the accumulator tile in registers.
     v2d a[kMR][kNV];
@@ -52,6 +75,7 @@ inline void micro_tile(const double* wp, const double* xp, int64_t ldx, int64_t 
     }
     for (int64_t i = 0; i < kMR; ++i)
         for (int64_t j = 0; j < kNV; ++j) *(v2du*)(acc + i * lda + 2 * j) = a[i][j];
+#endif
 }
 
 } // namespace
