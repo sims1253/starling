@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <exception>
+#include <new>
 #include <mutex>
 #include <thread>
 #include <chrono>
@@ -376,17 +378,40 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
     auto unit_buffer = [&](const Unit& u) { return blobs_[u.mat == SIZE_MAX ? u.part : mats_[u.mat].q].buffer; };
     std::stable_sort(units.begin(), units.end(),
                      [&](const Unit& a, const Unit& b) { return unit_buffer(a) < unit_buffer(b); });
+    // Failures, exceptions included (an allocation failure while loading
+    // is recoverable: the load returns an error), stop every thread through
+    // `ok`; nothing escapes a worker or allocator thread.
     std::atomic<bool> ok{true};
     std::string first_err;
     std::mutex mu;
-    auto fail = [&](const std::string& e) {
+    auto fail = [&](const char* e) {
         std::lock_guard<std::mutex> lk(mu);
-        if (ok.exchange(false)) first_err = e;
+        if (ok.exchange(false)) {
+            try {
+                first_err = e;
+            } catch (...) {
+            }
+        }
     };
+    auto guarded = [&](auto&& body) {
+        try {
+            body();
+        } catch (const std::bad_alloc&) {
+            fail("fast engine: out of memory while loading the weights");
+        } catch (const std::exception& e) {
+            fail(e.what());
+        } catch (...) {
+            fail("fast engine: weight load failed");
+        }
+    };
+    // first_err stays empty only if copying the message itself ran out of memory.
+    auto load_error = [&] { return first_err.empty() ? std::string("fast engine: out of memory") : first_err; };
     auto run_units = [&](const std::vector<uint8_t*>& base, const std::vector<size_t>& idx) {
         parallel_for(idx.size(), [&](size_t k) {
-            std::string e;
-            if (ok && !fill_unit(units[idx[k]], base, e)) fail(e);
+            guarded([&] {
+                std::string e;
+                if (ok && !fill_unit(units[idx[k]], base, e)) fail(e.c_str());
+            });
         });
     };
     std::vector<uint8_t*> base(sizes.size(), nullptr);
@@ -404,52 +429,62 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
         std::mutex cv_mu;
         std::atomic<size_t> next{0}, next_buf{0};
         const size_t nt = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 8);
-        std::vector<std::thread> workers;
-        for (size_t t = 0; t < nt; ++t)
-            workers.emplace_back([&] {
-                for (size_t i; (i = next.fetch_add(1)) < units.size();) {
+        auto work = [&] {
+            for (size_t i; (i = next.fetch_add(1)) < units.size();) {
+                guarded([&] {
                     const size_t bi = unit_buffer(units[i]);
                     if (!ready[bi].load(std::memory_order_acquire)) {
                         std::unique_lock<std::mutex> lk(cv_mu);
                         cv.wait(lk, [&] { return ready[bi].load(std::memory_order_acquire) || abort.load(); });
                     }
                     std::string e;
-                    if (ok && !abort && !fill_unit(units[i], base, e)) fail(e);
-                }
-            });
-        auto allocate = [&] {
-            for (size_t i; ok && (i = next_buf.fetch_add(1)) < nb;) {
-                auto buf = std::make_unique<vk::Buffer>();
-                std::string e;
-                if (!ctx.create_buffer(*buf, sizes[i], vk::Mem::Device, e)) fail(e);
-                else if (!buf->host) fail("fast engine: weight buffer is not host-mapped");
-                if (!ok) break;
-                base[i] = (uint8_t*)buf->host;
-                bufs[i] = std::move(buf);
-                for (Blob& b : blobs_)
-                    if (b.buffer == i && !b.words.empty()) std::memcpy(base[i] + b.off, b.words.data(), b.words.size() * 4);
-                {
-                    std::lock_guard<std::mutex> lk(cv_mu);
-                    ready[i].store(true, std::memory_order_release);
-                }
-                cv.notify_all();
+                    if (ok && !abort && !fill_unit(units[i], base, e)) fail(e.c_str());
+                });
             }
         };
-        // Two allocator threads (this one and one more).
-        std::vector<std::thread> allocators;
-        if (nb > 1) allocators.emplace_back(allocate);
+        auto allocate = [&] {
+            for (size_t i; ok && (i = next_buf.fetch_add(1)) < nb;) {
+                guarded([&] {
+                    auto buf = std::make_unique<vk::Buffer>();
+                    std::string e;
+                    if (!ctx.create_buffer(*buf, sizes[i], vk::Mem::Device, e)) fail(e.c_str());
+                    else if (!buf->host) fail("fast engine: weight buffer is not host-mapped");
+                    if (!ok) return;
+                    base[i] = (uint8_t*)buf->host;
+                    bufs[i] = std::move(buf);
+                    for (Blob& b : blobs_)
+                        if (b.buffer == i && !b.words.empty())
+                            std::memcpy(base[i] + b.off, b.words.data(), b.words.size() * 4);
+                    {
+                        std::lock_guard<std::mutex> lk(cv_mu);
+                        ready[i].store(true, std::memory_order_release);
+                    }
+                    cv.notify_all();
+                });
+            }
+        };
+        // Workers, and two allocator threads (this one and one more). Every
+        // thread is joined on every path: a failure (or a thread that cannot
+        // be started) stops the allocators, then `abort` releases workers
+        // waiting on buffers that never came.
+        std::vector<std::thread> workers, allocators;
+        guarded([&] {
+            workers.reserve(nt);
+            for (size_t t = 0; t < nt; ++t) workers.emplace_back(work);
+            if (nb > 1) allocators.emplace_back(allocate);
+        });
         allocate();
         for (auto& t : allocators) t.join();
         t1 = std::chrono::steady_clock::now();
         if (!ok) {
             {
                 std::lock_guard<std::mutex> lk(cv_mu);
-                abort = true;   // release workers waiting on buffers that never came
+                abort = true;
             }
             cv.notify_all();
         }
         for (auto& t : workers) t.join();
-        if (!ok) { err = first_err; return false; }
+        if (!ok) { err = load_error(); return false; }
         for (size_t i = 0; i < nb; ++i) {
             total_ += sizes[i];
             ctx.flush(*bufs[i], 0, bufs[i]->size);
@@ -478,7 +513,7 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
                 if (b.buffer == bi && !b.words.empty())
                     std::memcpy(base[bi] + b.off, b.words.data(), b.words.size() * 4);
             run_units(base, by_buf[bi]);
-            if (!ok) { err = first_err; return false; }
+            if (!ok) { err = load_error(); return false; }
             if (!ctx.upload(*buffers_[bi], 0, stage.data(), (size_t)sizes[bi], err)) return false;
         }
     }
@@ -512,13 +547,32 @@ void parallel_for(size_t n, const std::function<void(size_t)>& f) {
         for (size_t i = 0; i < n; ++i) f(i);
         return;
     }
+    // The first exception (from f or from starting a thread) stops the
+    // remaining work and is rethrown here once every thread has joined.
     std::atomic<size_t> next{0};
+    std::exception_ptr first;
+    std::mutex mu;
+    auto stop = [&](std::exception_ptr e) {
+        next.store(n);
+        std::lock_guard<std::mutex> lk(mu);
+        if (!first) first = e;
+    };
     std::vector<std::thread> th;
-    for (size_t t = 0; t < nt; ++t)
-        th.emplace_back([&] {
-            for (size_t i; (i = next.fetch_add(1)) < n;) f(i);
-        });
+    try {
+        th.reserve(nt);
+        for (size_t t = 0; t < nt; ++t)
+            th.emplace_back([&] {
+                try {
+                    for (size_t i; (i = next.fetch_add(1)) < n;) f(i);
+                } catch (...) {
+                    stop(std::current_exception());
+                }
+            });
+    } catch (...) {
+        stop(std::current_exception());
+    }
     for (auto& t : th) t.join();
+    if (first) std::rethrow_exception(first);
 }
 
 GMat arena_matrix(Arena& a, HostMatrix&& m) {

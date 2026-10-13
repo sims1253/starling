@@ -32,6 +32,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <new>
 #include <thread>
 
 #if defined(__linux__)
@@ -426,9 +427,14 @@ struct AudioLlmEngine::Impl {
     bool npu_ready() {
 #if defined(STARLING_HAVE_NPU)
         if (npu_pending.valid()) {
-            auto r = npu_pending.get();
-            npu = std::move(r.first);
-            npu_note = std::move(r.second);
+            try {
+                auto r = npu_pending.get();
+                npu = std::move(r.first);
+                npu_note = std::move(r.second);
+            } catch (const std::exception& e) {   // the GPU encoder stays in charge
+                npu.reset();
+                npu_note = std::string("open failed: ") + e.what();
+            }
         }
         return npu != nullptr;
 #else
@@ -1111,19 +1117,31 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     const double t_pack = ms_since(t_load0);
     // The static buffers (KV caches: ~0.5 GB on Qwen3-0.6B) are created
     // alongside the weight fill; the driver zeroes both allocations.
+    // Nothing leaves the thread, and it is joined however finalize exits
+    // (an exception there then fails the load instead of terminating).
     std::string serr;
     bool static_ok = false;
     std::thread st([&] {
         try {
             static_ok = alloc_static(serr);
+        } catch (const std::bad_alloc&) {
+            // serr stays empty: reported as out of memory below
         } catch (const std::exception& e) {
-            serr = e.what();
+            try { serr = e.what(); } catch (...) {}
+        } catch (...) {
         }
     });
+    struct Join {
+        std::thread& t;
+        ~Join() { if (t.joinable()) t.join(); }
+    } join_st{st};
     const bool weights_ok = ar.finalize(*ctx, err);
     st.join();
     if (!weights_ok) return false;
-    if (!static_ok) { err = serr; return false; }
+    if (!static_ok) {
+        err = serr.empty() ? "fast " + tag + ": out of memory allocating the KV cache and state buffers" : serr;
+        return false;
+    }
     if (env_on("STARLING_FAST_TIMING"))
         std::fprintf(stderr, "[fast-%s] load: plan %.1f ms, repack+upload %.1f ms\n", sp.tag, t_pack,
                      ms_since(t_load0) - t_pack);
