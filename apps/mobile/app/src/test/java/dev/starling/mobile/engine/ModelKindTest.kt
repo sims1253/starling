@@ -132,6 +132,14 @@ class ModelKindTest {
         }
     }
 
+    @Test
+    fun llmDecoderWindowsStayWithinTheirThirtySecondEncoders() {
+        assertEquals(32.0, ModelKind.PARAKEET.maxWindowSeconds, 0.0)
+        for (kind in ModelKind.entries - ModelKind.PARAKEET) {
+            assertEquals(kind.name, 30.0, kind.maxWindowSeconds, 0.0)
+        }
+    }
+
     companion object {
         private fun u32(value: Long): ByteArray = byteArrayOf(
             (value and 0xff).toByte(),
