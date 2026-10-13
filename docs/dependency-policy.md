@@ -1,8 +1,5 @@
 # Dependency policy
 
-For the October 2026 update batch, compatibility fixes, and feature adoption
-recommendations, see [October dependency updates](dependency-updates-2026-10.md).
-
 Starling builds from five ecosystems (uv, CMake with vendored sources and a
 submodule, Gradle, Swift, Cargo) plus GitHub Actions tooling. This document
 defines what counts as a dependency change, what evidence a change needs, how
