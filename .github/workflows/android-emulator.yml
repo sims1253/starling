@@ -31,6 +31,17 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+      - name: Read the native dependency revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:third_party/ggml)" >> "$GITHUB_OUTPUT"
+      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          # Shared with apps.yml. ccache also hashes the compiler, ABI and
+          # flags for each object, so both Android ABIs remain covered.
+          key: android-ndk28.2.13676358-cmake3.31.1-${{ steps.ggml.outputs.sha }}-${{ hashFiles('third_party/ggml-patches/**', 'apps/mobile/app/build.gradle.kts') }}
+          restore-keys: android-ndk28.2.13676358-cmake3.31.1
+          max-size: 1G
+          save: ${{ github.event_name == 'push' }}
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: temurin
@@ -46,7 +57,7 @@ jobs:
       - name: Build the app and test APKs
         working-directory: apps/mobile
         shell: bash
-        run: ./gradlew --no-daemon assembleDebug assembleDebugAndroidTest
+        run: ./gradlew --no-daemon -PstarlingCompilerLauncher=ccache assembleDebug assembleDebugAndroidTest
       - name: Run instrumented tests
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
@@ -57,7 +68,7 @@ jobs:
           ram-size: 4096M
           disable-animations: true
           working-directory: apps/mobile
-          script: ./gradlew --no-daemon connectedDebugAndroidTest
+          script: ./gradlew --no-daemon -PstarlingCompilerLauncher=ccache connectedDebugAndroidTest
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
