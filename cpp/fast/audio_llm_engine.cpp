@@ -573,6 +573,11 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
     if (j.dirs.empty()) return note("no STARLING_NPU_DIR");
     if (!npu::tpu_present()) return note("no TPU runtime on this device");
     const npu::TensorLookup tensor = [&ml](const std::string& n) -> const ggml_tensor* { return ml.tensor(n.c_str()); };
+    // The metadata the model was loaded with (shapes, window sizes, LayerNorm
+    // epsilon) is part of the model hash, like the encoder tensors.
+    std::vector<npu::EncoderMeta> meta;
+    std::string meta_err;
+    if (!npu::qwen3_encoder_meta(ml.kv(), meta, meta_err)) return note("no model fingerprint: " + meta_err);
     j.frames = sp.n_window_infer;
     j.tokens = 13 * (j.frames / 100);
     j.nm = sp.n_mels;
@@ -583,13 +588,13 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
     std::promise<void> hashed;
     r.hashed = hashed.get_future();
     r.note = "checking the TPU artifact";
-    auto work = [j, tensor, &ml, hashed = std::move(hashed)]() mutable {
+    auto work = [j, tensor, meta = std::move(meta), &ml, hashed = std::move(hashed)]() mutable {
         const auto t0 = std::chrono::steady_clock::now();
         uint64_t h = 0;
         std::string e;
         bool ok = false;
         try {
-            ok = npu::qwen3_model_hash(ml.tensor_names(), tensor, h, e);
+            ok = npu::qwen3_model_hash(ml.tensor_names(), tensor, meta, h, e);
         } catch (const std::exception& x) {
             e = x.what();
         }

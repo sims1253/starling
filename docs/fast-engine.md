@@ -205,15 +205,20 @@ turns the `.tflite`'s rows into the GPU path's transcripts (`short.wav`,
 *The model hash* (`cpp/npu/encoder_contract.hpp`) binds an artifact to one
 GGUF: a digest of every audio-encoder and projector tensor (`enc.*`,
 `proj.*`) exactly as the GGUF stores it — name, type, shape, and an XXH64 of
-the raw bytes, folded with FNV-1a in name order — so a GGUF whose encoder
-differs in any byte, a weights-only fine-tune or another quantization
-included, does not match an artifact compiled for another. The export
-computes it from the file it read (`export_encoder.py --model-hash GGUF`
-prints it; plain Python, faster with the `xxhash` package) and the artifact
-is named by it, so an artifact carries the hash of the weights it was built
-from; the engine computes the same digest from the GGUF it loads (the
-Python and C++ sides are pinned to the same test vectors,
-`tests/test_npu_fingerprint.py`, `cpp/tests/npu_fingerprint_test.cpp`). The
+the raw bytes — and of the encoder metadata the graph is built from (every
+`qwen3.enc.*` and `qwen3.proj.*` key: shapes, window sizes, LayerNorm
+epsilon, as the engine's loader reads them), folded with FNV-1a in name
+order. So a GGUF whose encoder differs in any byte or hyperparameter, a
+weights-only fine-tune or another quantization included, does not match an
+artifact compiled for another. The export computes it from the file it read
+(`export_encoder.py --model-hash GGUF` prints it; plain Python, faster with
+the `xxhash` package) and the artifact is named by it, so an artifact
+carries the hash of the encoder it was built from; the engine computes the
+same digest from the GGUF it loads (the Python and C++ sides are pinned to
+the same test vectors, `tests/test_npu_fingerprint.py`,
+`cpp/tests/npu_fingerprint_test.cpp`). The contract key's
+version (`qwen3-asr-enc/2`) moves whenever what an artifact computes for a
+GGUF can change, so artifacts from an older exporter report `stale`. The
 engine computes it only where a TPU can be used (a Qwen3-ASR model, an
 artifact directory, firmware that lists the TPU library), on that worker,
 and the load waits for it only if the GPU weights are in place first;

@@ -1,8 +1,8 @@
 // Copyright 2026 The Starling Authors. Apache-2.0.
 //
 // The model hash of model_fingerprint.hpp from a GGUF file (npu_tool on the
-// phone, the tests on the host): ggml's GGUF parser for the tensor table, then
-// each tensor's bytes read from the file as stored.
+// phone, the tests on the host): ggml's GGUF parser for the metadata and the
+// tensor table, then each tensor's bytes read from the file as stored.
 #include "gguf_fingerprint.hpp"
 
 #include "gguf.h"
@@ -12,6 +12,40 @@
 #include <vector>
 
 namespace starling::npu {
+
+namespace {
+
+// The encoder metadata, normalized as ModelLoader reads it (model_loader.cpp:
+// integers to int64, floats to double, strings; booleans skipped).
+bool encoder_meta(const gguf_context* g, std::vector<EncoderMeta>& out, std::string& err) {
+    for (int64_t i = 0; i < gguf_get_n_kv(g); ++i) {
+        const std::string key = gguf_get_key(g, i);
+        if (!is_qwen3_encoder_key(key)) continue;
+        EncoderMeta m;
+        m.key = key;
+        switch (gguf_get_kv_type(g, i)) {
+            case GGUF_TYPE_UINT8: m.i = gguf_get_val_u8(g, i); break;
+            case GGUF_TYPE_INT8: m.i = gguf_get_val_i8(g, i); break;
+            case GGUF_TYPE_UINT16: m.i = gguf_get_val_u16(g, i); break;
+            case GGUF_TYPE_INT16: m.i = gguf_get_val_i16(g, i); break;
+            case GGUF_TYPE_UINT32: m.i = gguf_get_val_u32(g, i); break;
+            case GGUF_TYPE_INT32: m.i = gguf_get_val_i32(g, i); break;
+            case GGUF_TYPE_UINT64: m.i = (int64_t)gguf_get_val_u64(g, i); break;
+            case GGUF_TYPE_INT64: m.i = gguf_get_val_i64(g, i); break;
+            case GGUF_TYPE_FLOAT32: m.kind = 'f'; m.f = gguf_get_val_f32(g, i); break;
+            case GGUF_TYPE_FLOAT64: m.kind = 'f'; m.f = gguf_get_val_f64(g, i); break;
+            case GGUF_TYPE_STRING: m.kind = 's'; m.s = gguf_get_val_str(g, i); break;
+            case GGUF_TYPE_ARRAY:
+                err = "encoder metadata " + key + " is an array (not covered by the model hash)";
+                return false;
+            default: continue;   // bool: ModelLoader does not read it
+        }
+        out.push_back(std::move(m));
+    }
+    return true;
+}
+
+}  // namespace
 
 bool gguf_model_hash(const std::string& path, uint64_t& hash, std::string& err) {
     ggml_context* meta = nullptr;
@@ -49,7 +83,8 @@ bool gguf_model_hash(const std::string& path, uint64_t& hash, std::string& err) 
         t->data = buf.data();
         return t;
     };
-    if (!qwen3_model_hash(names, read, hash, err)) {
+    std::vector<EncoderMeta> enc_meta;
+    if (!encoder_meta(g.get(), enc_meta, err) || !qwen3_model_hash(names, read, enc_meta, hash, err)) {
         err += " (" + path + ")";
         return false;
     }

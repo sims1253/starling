@@ -15,7 +15,7 @@
 # How it knows what to build: when the app loads a model, the engine writes
 # status-<piece>-<model hash>.txt next to the artifacts it looks for (files/npu
 # of the app, and its external files dir), with the model hash (a digest of
-# the GGUF's encoder tensors, naming the artifact), the GGUF file it loaded
+# the GGUF's encoder tensors and metadata, naming the artifact), the GGUF file it loaded
 # and state missing / stale (an artifact compiled for older TPU firmware or
 # by an older exporter) / ok / error. So: load each model in the app once,
 # then run this. It

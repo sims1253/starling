@@ -9,7 +9,8 @@
 //    the same read from the file (starling-npu-tool) and from the loaded
 //    model (the engine), covers every encoder/projector tensor whatever its
 //    type — a change confined to one byte of a weight matrix changes it —
-//    and ignores the rest.
+//    and the encoder metadata the graph is built from — another LayerNorm
+//    epsilon changes it — and ignores the rest.
 //
 // Usage: npu_fingerprint_test [MODEL.gguf ...]
 //   With Qwen3-ASR GGUFs: the model hash from the file and from ModelLoader
@@ -55,18 +56,32 @@ void check_hex(uint64_t got, uint64_t want, const std::string& what) {
 // pinned so the digest's layout cannot drift silently (artifacts are named
 // by it); tests/test_npu_fingerprint.py writes the same GGUFs and pins the
 // same values for export_encoder.py.
-constexpr uint64_t kDigestVector = 0xae909cf3a449d7f7ull;
-constexpr uint64_t kDigestTweakedVector = 0x7de98079b43d9342ull;
+constexpr uint64_t kDigestVector = 0x9b4f28654f4e15b6ull;
+constexpr uint64_t kDigestTweakedVector = 0x66351613e1266017ull;
+constexpr uint64_t kDigestEpsVector = 0xf237d4837eb57312ull;
 
 // A tiny Qwen3-ASR-like GGUF: five F32 encoder vectors, k = 0..4 holding
 // 4 + k values (16k + i) / 4 - 1, an encoder weight matrix of each stored
 // kind (Q8_0 blocks, BF16), and two tensors outside the encoder; every other
-// byte b of a tensor is (b * 37 + 11 + strlen(name)) & 255. `tweak` flips one
-// byte: 1 in the Q8_0 encoder matrix, 2 in the non-encoder tensor.
+// byte b of a tensor is (b * 37 + 11 + strlen(name)) & 255. Encoder metadata
+// of each kind (u32, f32, string; a bool, which no side reads) and one key
+// outside the encoder. `tweak` changes one thing: 1 a byte of the Q8_0
+// encoder matrix, 2 a byte of the non-encoder tensor, 3 the LayerNorm
+// epsilon, 4 the non-encoder key; 5 adds an array under an encoder key.
 bool write_model(const char* path, int tweak) {
     ggml_context* ctx = ggml_init({1 << 20, nullptr, false});
     gguf_context* g = gguf_init_empty();
     gguf_set_val_str(g, "general.architecture", "qwen3");
+    gguf_set_val_u32(g, "qwen3.enc.heads", 14);
+    gguf_set_val_f32(g, "qwen3.enc.layer_norm_eps", tweak == 3 ? 1e-6f : 1e-5f);
+    gguf_set_val_u32(g, "qwen3.proj.output_dim", 1024);
+    gguf_set_val_str(g, "qwen3.enc.activation", "gelu");
+    gguf_set_val_bool(g, "qwen3.enc.flag", true);
+    gguf_set_val_u32(g, "qwen3.llm.hidden_size", tweak == 4 ? 2048 : 1024);
+    if (tweak == 5) {
+        const int32_t w[2] = {1, 2};
+        gguf_set_arr_data(g, "qwen3.enc.windows", GGUF_TYPE_INT32, w, 2);
+    }
     auto add = [&](const char* name, ggml_type type, std::vector<int64_t> ne) {
         ggml_tensor* t = ggml_new_tensor(ctx, type, (int)ne.size(), ne.data());
         ggml_set_name(t, name);
@@ -94,7 +109,7 @@ bool write_model(const char* path, int tweak) {
     return ok;
 }
 
-// The engine's path: ModelLoader's mapped tensors.
+// The engine's path: ModelLoader's mapped tensors and its metadata.
 bool loaded_model_hash(const char* path, uint64_t& hash, double& digest_ms, std::string& err) {
     starling::ggml::ModelLoader ml;
     if (!ml.load(path)) {
@@ -102,8 +117,10 @@ bool loaded_model_hash(const char* path, uint64_t& hash, double& digest_ms, std:
         return false;
     }
     const TensorLookup tensor = [&ml](const std::string& n) -> const ggml_tensor* { return ml.tensor(n.c_str()); };
+    std::vector<EncoderMeta> meta;
+    if (!qwen3_encoder_meta(ml.kv(), meta, err)) return false;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = qwen3_model_hash(ml.tensor_names(), tensor, hash, err);
+    const bool ok = qwen3_model_hash(ml.tensor_names(), tensor, meta, hash, err);
     digest_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return ok;
 }
@@ -124,33 +141,44 @@ void test_vectors() {
 }
 
 void test_synthesized() {
-    char base[256], tw1[256], tw2[256];
-    std::snprintf(base, sizeof base, "/tmp/npu_fingerprint_test_%d.gguf", (int)getpid());
-    std::snprintf(tw1, sizeof tw1, "/tmp/npu_fingerprint_test_%d_w.gguf", (int)getpid());
-    std::snprintf(tw2, sizeof tw2, "/tmp/npu_fingerprint_test_%d_l.gguf", (int)getpid());
-    if (!write_model(base, 0) || !write_model(tw1, 1) || !write_model(tw2, 2)) {
-        check(false, "synthesized GGUFs written");
-        return;
+    char path[6][256];
+    for (int t = 0; t < 6; ++t) {
+        std::snprintf(path[t], sizeof path[t], "/tmp/npu_fingerprint_test_%d_%d.gguf", (int)getpid(), t);
+        if (!write_model(path[t], t)) {
+            check(false, "synthesized GGUFs written");
+            return;
+        }
     }
-    uint64_t f0 = 0, f1 = 0, f2 = 0, l0 = 0;
+    uint64_t f[5] = {}, l[5] = {};
     std::string err;
     double ms = 0;
-    const bool ok = gguf_model_hash(base, f0, err) && gguf_model_hash(tw1, f1, err) && gguf_model_hash(tw2, f2, err);
+    bool ok = true, ok_loaded = true;
+    for (int t = 0; t < 5; ++t) {
+        ok = ok && gguf_model_hash(path[t], f[t], err);
+        ok_loaded = ok_loaded && loaded_model_hash(path[t], l[t], ms, err);
+    }
     check(ok, "gguf_model_hash reads the synthesized GGUFs " + err);
-    const bool ok_loaded = loaded_model_hash(base, l0, ms, err);
-    check(ok_loaded, "the loaded model's hash " + err);
-    if (ok) {
-        check_hex(f0, kDigestVector, "encoder digest (pinned, = export_encoder.py's)");
-        check_hex(l0, f0, "digest from the loaded model = from the file");
-        check_hex(f1, kDigestTweakedVector, "one changed byte of an encoder weight matrix: another digest (pinned)");
-        check(f1 != f0, "... which differs from the original's");
-        check_hex(f2, f0, "a changed non-encoder tensor leaves the digest alone");
+    check(ok_loaded, "the loaded models' hashes " + err);
+    if (ok && ok_loaded) {
+        check_hex(f[0], kDigestVector, "encoder digest (pinned, = export_encoder.py's)");
+        for (int t = 0; t < 5; ++t) check_hex(l[t], f[t], "digest from the loaded model = from the file");
+        check_hex(f[1], kDigestTweakedVector, "one changed byte of an encoder weight matrix: another digest (pinned)");
+        check(f[1] != f[0], "... which differs from the original's");
+        check_hex(f[2], f[0], "a changed non-encoder tensor leaves the digest alone");
+        check_hex(f[3], kDigestEpsVector, "another LayerNorm epsilon: another digest (pinned)");
+        check(f[3] != f[0], "... which differs from the original's");
+        check_hex(f[4], f[0], "a changed non-encoder metadata key leaves the digest alone");
     }
     uint64_t none = 0;
+    std::string arr_err;
+    bool refused = !gguf_model_hash(path[5], none, arr_err) && arr_err.find("array") != std::string::npos;
+    check(refused, "an array under an encoder key is an error (file): " + arr_err);
+    double unused = 0;
+    arr_err.clear();
+    refused = !loaded_model_hash(path[5], none, unused, arr_err) && arr_err.find("array") != std::string::npos;
+    check(refused, "an array under an encoder key is an error (loaded): " + arr_err);
     check(!gguf_model_hash("/nonexistent/model.gguf", none, err), "a missing file is an error");
-    std::remove(base);
-    std::remove(tw1);
-    std::remove(tw2);
+    for (auto& p : path) std::remove(p);
 }
 
 }  // namespace

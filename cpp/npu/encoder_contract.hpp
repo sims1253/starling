@@ -7,13 +7,19 @@
 //    (n_window_infer mel frames -> tokens rows of the projector output), with
 //    inputs [1, n_mels, frames] f32 mel and [1, 1, 1, tokens] f32 additive key
 //    mask (0 valid, -1e4 padding) and output [1, tokens, out_dim] f32;
+//    The key's version (qwen3-asr-enc/N) changes whenever what an artifact
+//    computes for a given GGUF can change (version 2: the weights come from
+//    the GGUF, and the model hash covers its encoder metadata), so artifacts
+//    an older exporter built report stale and are rebuilt;
 //  * model_hash: the GGUF it was built for — a digest of every audio-encoder
 //    and projector tensor exactly as the GGUF stores it (name, type, shape
-//    and raw bytes, any quant; qwen3_encoder_digest). The graph's weights are
-//    that GGUF's own encoder tensors (scripts/npu/export_encoder.py exports
-//    from the file and computes the same digest), so an artifact never runs
-//    beside encoder weights other than the ones it was built from, a
-//    weights-only fine-tune included;
+//    and raw bytes, any quant) and of the encoder metadata the graph is built
+//    from (every qwen3.enc.* / qwen3.proj.* key: shapes, window sizes,
+//    LayerNorm epsilon; qwen3_encoder_digest). The graph's weights are that
+//    GGUF's own encoder tensors (scripts/npu/export_encoder.py exports from
+//    the file and computes the same digest), so an artifact never runs beside
+//    encoder weights or hyperparameters other than the ones it was built
+//    from, a weights-only fine-tune included;
 //  * vendor: the firmware's thrGetVendorApiVersion() it was compiled with.
 #pragma once
 
@@ -83,6 +89,11 @@ inline uint64_t xxh64(const void* data, size_t len, uint64_t seed = 0) {
 inline bool is_qwen3_encoder_tensor(const std::string& name) {
     return name.rfind("enc.", 0) == 0 || name.rfind("proj.", 0) == 0;
 }
+// The metadata it covers: every key of the encoder and the projector, all of
+// which the exported graph may depend on.
+inline bool is_qwen3_encoder_key(const std::string& key) {
+    return key.rfind("qwen3.enc.", 0) == 0 || key.rfind("qwen3.proj.", 0) == 0;
+}
 
 // One tensor as the GGUF stores it: ggml type, ne[0..3] (unused dims 1),
 // byte size and xxh64 of those bytes.
@@ -94,12 +105,31 @@ struct EncoderTensor {
     uint64_t data_hash = 0;
 };
 
-// FNV-1a 64 over, per tensor in name order: the name with its NUL, the
-// type (u32), ne[4] (u64), the byte size (u64) and the xxh64 of the bytes
-// (u64), all little-endian.
-inline uint64_t qwen3_encoder_digest(std::vector<EncoderTensor> ts) {
+// One encoder metadata value as ModelLoader reads it (runtime/model_loader.cpp):
+// every integer type widened to int64 ('i'), f32/f64 to double ('f'), a
+// string ('s'). Booleans are not read (ModelLoader skips them, so every side
+// skips them); an array under an encoder key is an error.
+struct EncoderMeta {
+    std::string key;
+    char kind = 'i';
+    int64_t i = 0;
+    double f = 0.0;
+    std::string s;
+};
+
+// FNV-1a 64 over, all little-endian:
+//  * the tensor count (u64), then per tensor in name order: the name with its
+//    NUL, the type (u32), ne[4] (u64), the byte size (u64) and the xxh64 of
+//    the bytes (u64);
+//  * the metadata count (u64), then per encoder key in key order: the key
+//    with its NUL, the kind (one byte 'i', 'f' or 's') and the value: int64,
+//    the double's bits, or the string's length (u64) and bytes.
+inline uint64_t qwen3_encoder_digest(std::vector<EncoderTensor> ts, std::vector<EncoderMeta> ms) {
     std::sort(ts.begin(), ts.end(), [](const EncoderTensor& a, const EncoderTensor& b) { return a.name < b.name; });
+    std::sort(ms.begin(), ms.end(), [](const EncoderMeta& a, const EncoderMeta& b) { return a.key < b.key; });
     uint64_t h = kFnvBasis;
+    const uint64_t n_ts = ts.size(), n_ms = ms.size();
+    h = fnv1a_update(h, &n_ts, sizeof n_ts);
     for (const EncoderTensor& t : ts) {
         h = fnv1a_update(h, t.name.c_str(), t.name.size() + 1);
         h = fnv1a_update(h, &t.type, sizeof t.type);
@@ -107,16 +137,36 @@ inline uint64_t qwen3_encoder_digest(std::vector<EncoderTensor> ts) {
         h = fnv1a_update(h, &t.nbytes, sizeof t.nbytes);
         h = fnv1a_update(h, &t.data_hash, sizeof t.data_hash);
     }
+    h = fnv1a_update(h, &n_ms, sizeof n_ms);
+    for (const EncoderMeta& m : ms) {
+        h = fnv1a_update(h, m.key.c_str(), m.key.size() + 1);
+        h = fnv1a_update(h, &m.kind, 1);
+        if (m.kind == 'i') {
+            h = fnv1a_update(h, &m.i, sizeof m.i);
+        } else if (m.kind == 'f') {
+            uint64_t bits;
+            std::memcpy(&bits, &m.f, sizeof bits);
+            h = fnv1a_update(h, &bits, sizeof bits);
+        } else {
+            const uint64_t n = m.s.size();
+            h = fnv1a_update(h, &n, sizeof n);
+            h = fnv1a_update(h, m.s.data(), m.s.size());
+        }
+    }
     return h;
 }
+
+// The contract key's version: see the header comment.
+inline constexpr const char* kQwen3EncContract = "qwen3-asr-enc/2";
 
 inline std::string qwen3_enc_key(uint32_t n_mels, uint32_t frames, uint32_t tokens, uint32_t d, uint32_t layers,
                                  uint32_t heads, uint32_t ff, uint32_t ds, uint32_t out) {
     char b[200];
-    std::snprintf(b, sizeof b, "qwen3-asr-enc/1 mels=%u frames=%u tokens=%u d=%u L=%u H=%u ff=%u ds=%u out=%u", n_mels,
-                  frames, tokens, d, layers, heads, ff, ds, out);
+    std::snprintf(b, sizeof b, "%s mels=%u frames=%u tokens=%u d=%u L=%u H=%u ff=%u ds=%u out=%u", kQwen3EncContract,
+                  n_mels, frames, tokens, d, layers, heads, ff, ds, out);
     return b;
 }
+
 
 inline std::string qwen3_enc_artifact_name(uint64_t model_hash) {
     char b[64];

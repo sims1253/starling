@@ -11,8 +11,9 @@ weights, so the TPU computes with the GPU engine's encoder weights. Weights
 are stored as fp16 (the TPU computes in fp16 either way); the converter's
 `keep_stablehlo_constant` metadata key, which the phone's on-device compiler
 rejects, is renamed in place. The export also computes the GGUF's model hash
-(the digest cpp/npu computes, below): the artifact is named by the hash of
-the file its weights came from.
+(the digest cpp/npu computes, below, of the encoder tensors and the encoder
+metadata the graph is built from): the artifact is named by the hash of the
+file its weights and shapes came from.
 
 python -I export_encoder.py MODEL.gguf OUT.tflite [--expect-hash 0xHASH]
     Prints one JSON line: {"key", "in", "out", "model_hash", "gguf", "tflite",
@@ -114,14 +115,32 @@ def is_encoder_tensor(name):
     return name.startswith(("enc.", "proj."))
 
 
-def encoder_digest(tensors):
-    """tensors: (name, ggml type, ne (up to 4 dims), byte size, xxh64 of the bytes).
-    FNV-1a 64 over, per tensor in name order: the name and a NUL, the type
-    (u32), ne[4] (u64, unused dims 1), the byte size and the xxh64 (u64)."""
-    h = FNV_BASIS
+def is_encoder_key(key):
+    return key.startswith(("qwen3.enc.", "qwen3.proj."))
+
+
+def encoder_digest(tensors, meta=()):
+    """tensors: (name, ggml type, ne (up to 4 dims), byte size, xxh64 of the bytes);
+    meta: (key, kind, value) of the encoder metadata (encoder_meta).
+    FNV-1a 64 over the tensor count (u64), then per tensor in name order: the
+    name and a NUL, the type (u32), ne[4] (u64, unused dims 1), the byte size
+    and the xxh64 (u64); then the metadata count (u64) and per key in key
+    order: the key and a NUL, the kind (b"i", b"f" or b"s") and the value
+    (int64; the double's bits; or the length (u64) and the UTF-8 bytes)."""
+    h = fnv1a64(struct.pack("<Q", len(tensors)))
     for name, typ, ne, nbytes, data_hash in sorted(tensors, key=lambda t: t[0].encode()):
         ne4 = [int(d) for d in ne] + [1] * (4 - len(ne))
         h = fnv1a64(name.encode() + b"\0" + struct.pack("<I6Q", typ, *ne4, nbytes, data_hash), h)
+    h = fnv1a64(struct.pack("<Q", len(meta)), h)
+    for key, kind, value in sorted(meta, key=lambda m: m[0].encode()):
+        if kind == "i":
+            v = struct.pack("<Q", value & M64)
+        elif kind == "f":
+            v = struct.pack("<d", value)
+        else:
+            b = value.encode()
+            v = struct.pack("<Q", len(b)) + b
+        h = fnv1a64(key.encode() + b"\0" + kind.encode() + v, h)
     return h
 
 
@@ -131,6 +150,7 @@ class Gguf:
     tensor table, over a read-only mapping of the file."""
 
     _SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+    INTS, FLOATS, BOOL, STRING, ARRAY = (0, 1, 2, 3, 4, 5, 10, 11), (6, 12), 7, 8, 9
 
     def __init__(self, path):
         import mmap
@@ -148,9 +168,11 @@ class Gguf:
             raise ValueError(f"{path}: not a GGUF v2/v3 file")
         n_tensors, n_kv = self._get("<Q"), self._get("<Q")
         self.kv = {}
+        self.kv_type = {}
         for _ in range(n_kv):
             key = self._str()
-            self.kv[key] = self._value(self._get("<I"))
+            self.kv_type[key] = self._get("<I")
+            self.kv[key] = self._value(self.kv_type[key])
         self.tensors = []   # (name, ggml type, ne, offset in the file, byte size)
         infos = []
         for _ in range(n_tensors):
@@ -214,18 +236,38 @@ def _field(r, key, default=None):
     return default if v is None else v
 
 
-def _hash_of(path, tensors):
-    """tensors: (name, ggml type, ne, bytes) of every encoder tensor."""
+def encoder_meta(r):
+    """(key, kind, value) of every encoder metadata key, as the engine's
+    ModelLoader reads it: integers ("i"), floats ("f", f32 widened exactly to
+    a double), strings ("s"); booleans are skipped (ModelLoader does not read
+    them); an array is an error (the digest has no form for it)."""
+    meta = []
+    for key, t in r.kv_type.items():
+        if not is_encoder_key(key) or t == Gguf.BOOL:
+            continue
+        if t in Gguf.INTS:
+            meta.append((key, "i", int(r.kv[key])))
+        elif t in Gguf.FLOATS:
+            meta.append((key, "f", float(r.kv[key])))
+        elif t == Gguf.STRING:
+            meta.append((key, "s", r.kv[key]))
+        else:
+            raise ValueError(f"{r.path}: encoder metadata {key} is an array (not covered by the model hash)")
+    return meta
+
+
+def _hash_of(r, tensors):
+    """tensors: (name, ggml type, ne, bytes) of every encoder tensor of r."""
     if not tensors:
-        raise ValueError(f"{path}: no audio-encoder tensors (enc.*, proj.*)")
-    return f"0x{encoder_digest([(n, t, ne, len(b), xxh64(b)) for n, t, ne, b in tensors]):016x}"
+        raise ValueError(f"{r.path}: no audio-encoder tensors (enc.*, proj.*)")
+    return f"0x{encoder_digest([(n, t, ne, len(b), xxh64(b)) for n, t, ne, b in tensors], encoder_meta(r)):016x}"
 
 
 def model_hash(path, reader=None):
     """The model hash of a Qwen3-ASR GGUF (0x + 16 hex digits)."""
     r = reader or _open(path)
-    return _hash_of(path, [(name, typ, ne, r.raw(off, nbytes))
-                           for name, typ, ne, off, nbytes in r.tensors if is_encoder_tensor(name)])
+    return _hash_of(r, [(name, typ, ne, r.raw(off, nbytes))
+                        for name, typ, ne, off, nbytes in r.tensors if is_encoder_tensor(name)])
 
 
 def _is_qwen3_asr(r):
@@ -234,6 +276,9 @@ def _is_qwen3_asr(r):
 
 # ---- finding the GGUF with a given hash, with a cache ----
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "starling-npu", "model-hashes.json")
+# Bumped with every change to the digest, so a cache entry of an older one is
+# recomputed (2: the encoder metadata is part of it).
+DIGEST_VERSION = 2
 
 
 def _load_cache():
@@ -265,7 +310,7 @@ def _describe(path, cache):
     key = os.path.realpath(path)
     stamp = [st.st_size, st.st_mtime_ns]
     hit = cache.get(key)
-    if isinstance(hit, dict) and hit.get("stamp") == stamp:
+    if isinstance(hit, dict) and hit.get("stamp") == stamp and hit.get("v") == DIGEST_VERSION:
         return hit.get("hash"), hit.get("hd")
     h = hd = None
     try:
@@ -275,7 +320,7 @@ def _describe(path, cache):
             h = model_hash(path, r)
     except ValueError:
         pass
-    cache[key] = {"stamp": stamp, "hash": h, "hd": hd}
+    cache[key] = {"stamp": stamp, "v": DIGEST_VERSION, "hash": h, "hd": hd}
     return h, hd
 
 
@@ -304,6 +349,10 @@ def find(want, roots, hd=None):
     return None
 
 
+# ---- the contract key (cpp/npu/encoder_contract.hpp) ----
+CONTRACT = "qwen3-asr-enc/2"   # cpp/npu/encoder_contract.hpp kQwen3EncContract
+
+
 # ---- the graph ----
 def load_gguf(path, expect=None):
     """(config, {GGUF tensor name: f32 numpy array in torch layout}, model hash).
@@ -323,7 +372,7 @@ def load_gguf(path, expect=None):
     cfg["enc.layer_norm_eps"] = float(_field(r, "qwen3.enc.layer_norm_eps", 1e-5))
     ts = [(name, typ, ne, bytes(r.raw(off, nbytes)))
           for name, typ, ne, off, nbytes in r.tensors if is_encoder_tensor(name)]
-    mh = _hash_of(path, ts)
+    mh = _hash_of(r, ts)
     if expect is not None and int(mh, 16) != int(expect, 16):
         raise SystemExit(f"{path}: model hash {mh}, not {expect}: not the GGUF the app loads")
     w = {}
@@ -481,14 +530,14 @@ def export(path, out_path, expect=None):
                                       algorithm_key=AlgorithmName.FLOAT_CASTING)
             src = os.path.join(td, "fp16.tflite")
             quantizer.Quantizer(f32, rm.get_quantization_recipe()).quantize(None, serialize_to_path=src)
+        ckey = (f"{CONTRACT} mels={s['NM']} frames={s['FR']} tokens={s['TOK']} d={s['D']} L={s['L']} "
+                f"H={s['H']} ff={s['FF']} ds={s['DS']} out={s['OUT']}")
         b = bytearray(open(src, "rb").read())
         key = b"keep_stablehlo_constant"
         assert b.count(key) <= 1, b.count(key)
         b = b.replace(key, b"x" * len(key))
         open(out_path, "wb").write(b)
 
-    ckey = (f"qwen3-asr-enc/1 mels={s['NM']} frames={s['FR']} tokens={s['TOK']} d={s['D']} L={s['L']} "
-            f"H={s['H']} ff={s['FF']} ds={s['DS']} out={s['OUT']}")
     print(json.dumps({"key": ckey, "in": [s["NM"] * s["FR"] * 4, s["TOK"] * 4], "out": [s["TOK"] * s["OUT"] * 4],
                       "model_hash": mh, "gguf": os.path.abspath(path), "tflite": out_path,
                       "bytes": os.path.getsize(out_path)}))

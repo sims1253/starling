@@ -11,8 +11,9 @@
 #    tensor counts, operators per builtin) export_encoder.py produces for it;
 #    the artifact's I/O sizes follow from KEY;
 #  * HASH (0x...) is the model hash export_encoder.py printed for the GGUF
-#    TFLITE's weights came from (the digest of its encoder tensors, which the
-#    engine computes from the GGUF it loads); it names the artifact;
+#    TFLITE's weights came from (the digest of its encoder tensors and
+#    metadata, which the engine computes from the GGUF it loads); it names
+#    the artifact;
 #  * the phone has at least NPU_MIN_MEM_MB (default 4096) available and TFLITE
 #    is no larger than its window's graph has been (0.6B: 640 MB; 1.7B, which
 #    exports with f32 weights: 1300 MB; both compiled cleanly).
@@ -21,7 +22,7 @@
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 7 ] || { sed -n 2,22p "$0" >&2; exit 2; }
+[ $# -eq 7 ] || { sed -n 2,23p "$0" >&2; exit 2; }
 NPU_TOOL=$1; TFL=$2; HASH=$3; KEY=$4; DIR=$5; APPS=$6; T=$7
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
@@ -56,10 +57,10 @@ canon() {
 # updated (and the graph compiled once with care: see docs/fast-engine.md,
 # Pixel TPU encoder).
 case $KEY in
-  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024")
+  "qwen3-asr-enc/2 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024")
     OUTD=1024 MAXMB=640
     GRAPH="1294 1046 0:129 3:2 4:1 6:114 9:111 18:74 22:277 25:18 34:3 39:74 40:74 41:37 76:37 99:37 126:36 150:22" ;;
-  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=1024 L=24 H=16 ff=4096 ds=480 out=2048")
+  "qwen3-asr-enc/2 mels=128 frames=800 tokens=104 d=1024 L=24 H=16 ff=4096 ds=480 out=2048")
     OUTD=2048 MAXMB=1300
     GRAPH="1871 1452 0:171 3:2 4:1 9:244 18:219 22:367 25:24 34:3 39:100 40:98 41:49 76:49 99:49 126:48 150:28" ;;
   *) echo "refusing '$KEY': only the Qwen3-ASR 0.6B/1.7B encoder windows compile safely on the phone" >&2; exit 2 ;;

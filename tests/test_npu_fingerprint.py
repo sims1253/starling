@@ -20,9 +20,10 @@ gguf = pytest.importorskip("gguf")
 
 EXPORTER = Path(__file__).resolve().parents[1] / "scripts" / "npu" / "export_encoder.py"
 
-# kDigestVector / kDigestTweakedVector in cpp/tests/npu_fingerprint_test.cpp.
-DIGEST_VECTOR = "0xae909cf3a449d7f7"
-DIGEST_TWEAKED_VECTOR = "0x7de98079b43d9342"
+# kDigestVector / kDigestTweakedVector / kDigestEpsVector in cpp/tests/npu_fingerprint_test.cpp.
+DIGEST_VECTOR = "0x9b4f28654f4e15b6"
+DIGEST_TWEAKED_VECTOR = "0x66351613e1266017"
+DIGEST_EPS_VECTOR = "0xf237d4837eb57312"
 
 
 def _exporter():
@@ -38,8 +39,18 @@ def _fill(name: str, n: int) -> np.ndarray:
 
 
 def _write_model(path: Path, tweak: int) -> None:
-    """The GGUF of write_model() in cpp/tests/npu_fingerprint_test.cpp."""
+    """The GGUF of write_model() in cpp/tests/npu_fingerprint_test.cpp (tweak:
+    1 an encoder weight byte, 2 a non-encoder tensor byte, 3 the LayerNorm
+    epsilon, 4 a non-encoder key, 5 an array under an encoder key)."""
     w = gguf.GGUFWriter(str(path), "qwen3")
+    w.add_uint32("qwen3.enc.heads", 14)
+    w.add_float32("qwen3.enc.layer_norm_eps", 1e-6 if tweak == 3 else 1e-5)
+    w.add_uint32("qwen3.proj.output_dim", 1024)
+    w.add_string("qwen3.enc.activation", "gelu")
+    w.add_bool("qwen3.enc.flag", True)
+    w.add_uint32("qwen3.llm.hidden_size", 2048 if tweak == 4 else 1024)
+    if tweak == 5:
+        w.add_array("qwen3.enc.windows", [1, 2])
     vectors = ["enc.conv1.bias", "enc.ln_post.weight", "enc.ln_post.bias", "proj.linear_2.bias",
                "enc.blk.0.attn_norm.weight"]
     for k, name in enumerate(vectors):
@@ -87,7 +98,7 @@ def test_xxh64_matches_the_reference_vectors():
 def test_model_hash_matches_the_cpp_vectors(tmp_path, monkeypatch):
     ee = _exporter()
     paths = {}
-    for tweak in (0, 1, 2):
+    for tweak in range(6):
         paths[tweak] = tmp_path / f"m{tweak}.gguf"
         _write_model(paths[tweak], tweak)
     for impl in (ee.xxh64, ee.xxh64_pure):
@@ -95,6 +106,23 @@ def test_model_hash_matches_the_cpp_vectors(tmp_path, monkeypatch):
         assert ee.model_hash(str(paths[0])) == DIGEST_VECTOR
         assert ee.model_hash(str(paths[1])) == DIGEST_TWEAKED_VECTOR   # one weight byte: another hash
         assert ee.model_hash(str(paths[2])) == DIGEST_VECTOR           # outside the encoder: the same
+        assert ee.model_hash(str(paths[4])) == DIGEST_VECTOR           # a non-encoder key: the same
+    with pytest.raises(ValueError, match="qwen3.enc.windows is an array"):
+        ee.model_hash(str(paths[5]))
+
+
+def test_another_layer_norm_eps_is_another_model(tmp_path):
+    """Two GGUFs with identical encoder tensors but another epsilon build
+    different graphs, so they must not share an artifact."""
+    ee = _exporter()
+    base, eps = tmp_path / "base.gguf", tmp_path / "eps.gguf"
+    _write_model(base, 0)
+    _write_model(eps, 3)
+    assert ee.model_hash(str(eps)) == DIGEST_EPS_VECTOR
+    assert ee.model_hash(str(eps)) != ee.model_hash(str(base))
+    meta = dict((k, (kind, v)) for k, kind, v in ee.encoder_meta(ee.Gguf(str(eps))))
+    assert meta == {"qwen3.enc.heads": ("i", 14), "qwen3.enc.layer_norm_eps": ("f", float(np.float32(1e-6))),
+                    "qwen3.proj.output_dim": ("i", 1024), "qwen3.enc.activation": ("s", "gelu")}
 
 
 def test_model_hash_needs_encoder_tensors(tmp_path):
@@ -170,6 +198,12 @@ def test_every_encoder_tensor_maps_to_one_parameter():
 
 def test_encoder_digest_layout():
     ee = _exporter()
-    # One tensor: FNV-1a over name + NUL, type u32, ne[4] u64, size u64, xxh64 u64.
-    body = b"enc.x\0" + struct.pack("<I6Q", 8, 32, 2, 1, 1, 68, 0x1234)
-    assert ee.encoder_digest([("enc.x", 8, [32, 2], 68, 0x1234)]) == ee.fnv1a64(body)
+    # FNV-1a over the tensor count, per tensor name + NUL, type u32, ne[4] u64,
+    # size u64, xxh64 u64; then the metadata count, per key key + NUL, kind and value.
+    body = struct.pack("<Q", 1) + b"enc.x\0" + struct.pack("<I6Q", 8, 32, 2, 1, 1, 68, 0x1234)
+    assert ee.encoder_digest([("enc.x", 8, [32, 2], 68, 0x1234)]) == ee.fnv1a64(body + struct.pack("<Q", 0))
+    meta = [("qwen3.enc.s", "s", "ab"), ("qwen3.enc.f", "f", 0.5), ("qwen3.enc.i", "i", -1)]
+    tail = (struct.pack("<Q", 3) + b"qwen3.enc.f\0f" + struct.pack("<d", 0.5) + b"qwen3.enc.i\0i"
+            + struct.pack("<q", -1) + b"qwen3.enc.s\0s" + struct.pack("<Q", 2) + b"ab")
+    assert ee.encoder_digest([("enc.x", 8, [32, 2], 68, 0x1234)], meta) == ee.fnv1a64(body + tail)
+

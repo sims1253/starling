@@ -27,7 +27,7 @@ ArtifactHeader valid_header(uint64_t bytecode_size) {
     h.out_bytes[0] = 104 * 1024 * 4;
     std::snprintf(h.function, sizeof h.function, "serving_default");
     std::snprintf(h.vendor, sizeof h.vendor, "vendor-1");
-    std::snprintf(h.key, sizeof h.key, "qwen3-asr-enc/1 test");
+    std::snprintf(h.key, sizeof h.key, "qwen3-asr-enc/2 test");
     h.model_hash = 0x1234;
     h.tflite_hash = 0x5678;
     h.bytecode_offset = kArtifactHeaderBytes;
@@ -62,7 +62,7 @@ int main() {
         ArtifactInfo info;
         std::string err;
         if (!parse_artifact_header(&h, sizeof h, full, info, err) || info.function != "serving_default" ||
-            info.vendor != "vendor-1" || info.key != "qwen3-asr-enc/1 test" || info.in_bytes.size() != 2 ||
+            info.vendor != "vendor-1" || info.key != "qwen3-asr-enc/2 test" || info.in_bytes.size() != 2 ||
             info.in_bytes[1] != 104 * 4 || info.out_bytes.size() != 1 || info.model_hash != 0x1234 ||
             info.tflite_hash != 0x5678 || info.bytecode_offset != kArtifactHeaderBytes || info.bytecode_size != bc) {
             std::printf("FAIL valid header did not round-trip (%s)\n", err.c_str());
