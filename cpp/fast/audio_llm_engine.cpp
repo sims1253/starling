@@ -526,7 +526,7 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
         const auto t0 = std::chrono::steady_clock::now();
         auto m = std::make_unique<npu::TpuModel>();
         std::string e;
-        if (!m->open(path, npu::LoadMode::Mmap, e)) {
+        if (!m->open(path, e)) {
             report(npu::PieceState::Error, "open " + path + ": " + e);
             return finish("open " + path + ": " + e);
         }

@@ -1,18 +1,17 @@
 // Copyright 2026 The Starling Authors. Apache-2.0.
 //
-// adb-shell tool for the Pixel TPU path (compiling needs the shell user: the
-// firmware compile service refuses apps not on Google's EdgeTPU allowlist;
-// loading and running an artifact works from any app).
-//   npu_tool fingerprint MODEL.gguf
-//   npu_tool compile MODEL.tflite ART --in B,B --out B [--fn F] [--key K]
-//                    [--gguf MODEL.gguf | --hash 0x...] [--pad N]
-//   npu_tool run ART [--mode mmap|fdoff|fd] [--runs N] [--out PREFIX] [IN0 IN1 ...]
-//   npu_tool repack ART OUT [--pad N]
-//   npu_tool info ART
+// starling-npu-tool: the adb-shell half of scripts/npu/npu_compile.sh.
+// Compiling must run as the shell user: the firmware compile service refuses
+// apps not on Google's EdgeTPU allowlist (loading and running an artifact
+// works from any app, see tpu_runtime.hpp).
+//   starling-npu-tool fingerprint MODEL.gguf
+//   starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. [--fn F] [--key K]
+//                             [--gguf MODEL.gguf | --hash 0x..]
+//   starling-npu-tool info ART
 #include "gguf_fingerprint.hpp"
-#include "npu_probe.hpp"
 #include "tpu_runtime.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,7 +19,9 @@
 
 using namespace starling::npu;
 
-static std::vector<uint64_t> sizes(const char* s) {
+namespace {
+
+std::vector<uint64_t> sizes(const char* s) {
     std::vector<uint64_t> v;
     std::stringstream ss(s);
     std::string t;
@@ -28,91 +29,97 @@ static std::vector<uint64_t> sizes(const char* s) {
     return v;
 }
 
+double now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    out.resize(n > 0 ? (size_t)n : 0);
+    bool ok = n >= 0 && std::fread(out.data(), 1, out.size(), f) == out.size();
+    std::fclose(f);
+    return ok;
+}
+
+// Compiles a .tflite on the device and writes the artifact around its bytecode.
+bool compile(const std::string& tflite, const std::string& artifact, ArtifactInfo info, std::string& err) {
+    if (!load_southbound(err)) return false;
+    std::vector<uint8_t> model;
+    if (!read_file(tflite, model)) {
+        err = "cannot read " + tflite;
+        return false;
+    }
+    std::vector<uint8_t> bc;
+    const double t0 = now_ms();
+    if (!compile_tflite(model.data(), model.size(), bc, err)) return false;
+    std::printf("on-device compile %.1f ms, %zu-byte model -> %zu-byte bytecode\n", now_ms() - t0, model.size(),
+                bc.size());
+    info.vendor = vendor_version();
+    info.tflite_hash = fnv1a(model.data(), model.size());
+    if (!write_artifact(artifact, info, bc, err)) return false;
+    std::printf("wrote %s (TPU firmware %s)\n", artifact.c_str(), info.vendor.c_str());
+    return true;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: npu_tool fingerprint MODEL.gguf\n"
-                     "       npu_tool compile MODEL.tflite ART --in B,.. --out B,.. [--fn F] [--key K]\n"
-                     "                        [--gguf MODEL.gguf | --hash 0x..] [--pad N]\n"
-                     "       npu_tool run ART [--mode mmap|fdoff|fd] [--runs N] [--out PREFIX] [IN...]\n"
-                     "       npu_tool repack ART OUT [--pad N]\n"
-                     "       npu_tool info ART\n");
+                     "usage: starling-npu-tool fingerprint MODEL.gguf\n"
+                     "       starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. [--fn F] [--key K]\n"
+                     "                                 [--gguf MODEL.gguf | --hash 0x..]\n"
+                     "       starling-npu-tool info ART\n");
         return 2;
     }
     const std::string cmd = argv[1];
-    bool ok = false;
-    std::string rep, err;
+    std::string err;
     if (cmd == "fingerprint") {
         uint64_t h = 0;
-        ok = gguf_fingerprint(argv[2], h, err);
-        char b[64];
-        std::snprintf(b, sizeof b, "0x%016llx\n", (unsigned long long)h);
-        rep = ok ? std::string(b) : err + "\n";
-    } else if (cmd == "compile" && argc >= 4) {
-        std::string fn = "serving_default", key;
-        std::vector<uint64_t> in, out;
-        uint64_t pad = 0, hash = 0;
+        if (!gguf_fingerprint(argv[2], h, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        std::printf("0x%016llx\n", (unsigned long long)h);
+        return 0;
+    }
+    if (cmd == "compile" && argc >= 4) {
+        ArtifactInfo info;
+        info.function = "serving_default";
         for (int i = 4; i + 1 < argc; i += 2) {
-            if (!std::strcmp(argv[i], "--fn")) fn = argv[i + 1];
-            else if (!std::strcmp(argv[i], "--in")) in = sizes(argv[i + 1]);
-            else if (!std::strcmp(argv[i], "--out")) out = sizes(argv[i + 1]);
-            else if (!std::strcmp(argv[i], "--pad")) pad = std::strtoull(argv[i + 1], nullptr, 10);
-            else if (!std::strcmp(argv[i], "--key")) key = argv[i + 1];
-            else if (!std::strcmp(argv[i], "--hash")) hash = std::strtoull(argv[i + 1], nullptr, 0);
-            else if (!std::strcmp(argv[i], "--gguf") && !gguf_fingerprint(argv[i + 1], hash, err)) {
+            if (!std::strcmp(argv[i], "--fn")) info.function = argv[i + 1];
+            else if (!std::strcmp(argv[i], "--in")) info.in_bytes = sizes(argv[i + 1]);
+            else if (!std::strcmp(argv[i], "--out")) info.out_bytes = sizes(argv[i + 1]);
+            else if (!std::strcmp(argv[i], "--key")) info.key = argv[i + 1];
+            else if (!std::strcmp(argv[i], "--hash")) info.model_hash = std::strtoull(argv[i + 1], nullptr, 0);
+            else if (!std::strcmp(argv[i], "--gguf") && !gguf_fingerprint(argv[i + 1], info.model_hash, err)) {
                 std::fprintf(stderr, "%s\n", err.c_str());
                 return 1;
             }
         }
-        rep = probe_compile(argv[2], argv[3], fn, in, out, pad, ok, key, hash);
-    } else if (cmd == "repack" && argc >= 4) {
-        // Rewrite an artifact with its bytecode at offset 4096 + pad (pad != 0
-        // reproduces the unaligned bytecode offset of a LiteRT-serialized model).
-        ArtifactInfo info;
-        uint64_t pad = argc >= 6 && !std::strcmp(argv[4], "--pad") ? std::strtoull(argv[5], nullptr, 10) : 0;
-        FILE* f = read_artifact_info(argv[2], info, err) ? std::fopen(argv[2], "rb") : nullptr;
-        std::vector<uint8_t> bc(info.bytecode_size);
-        ok = f && std::fseek(f, (long)info.bytecode_offset, SEEK_SET) == 0 &&
-             std::fread(bc.data(), 1, bc.size(), f) == bc.size();
-        if (f) std::fclose(f);
-        ok = ok && write_artifact(argv[3], info, bc, pad, err);
-        rep = ok ? "repacked with bytecode at offset " + std::to_string(4096 + pad) + "\n" : "repack failed: " + err + "\n";
-    } else if (cmd == "info") {
-        ArtifactInfo info;
-        ok = read_artifact_info(argv[2], info, err);
-        if (ok) {
-            char b[512];
-            std::snprintf(b, sizeof b, "fn '%s'\nkey '%s'\nvendor %s\nmodel_hash 0x%016llx\ntflite_hash 0x%016llx\n"
-                                       "bytecode %llu bytes at %llu\n",
-                          info.function.c_str(), info.key.c_str(), info.vendor.c_str(),
-                          (unsigned long long)info.model_hash, (unsigned long long)info.tflite_hash,
-                          (unsigned long long)info.bytecode_size, (unsigned long long)info.bytecode_offset);
-            rep = b;
-        } else {
-            rep = err + "\n";
+        if (!compile(argv[2], argv[3], info, err)) {
+            std::fprintf(stderr, "compile: %s\n", err.c_str());
+            return 1;
         }
-    } else if (cmd == "run") {
-        LoadMode mode = LoadMode::Mmap;
-        int runs = 20;
-        std::string out;
-        std::vector<std::string> ins;
-        for (int i = 3; i < argc; ++i) {
-            if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) {
-                const std::string m = argv[++i];
-                mode = m == "fdoff" ? LoadMode::FdOffset : m == "fd" ? LoadMode::Fd : LoadMode::Mmap;
-            } else if (!std::strcmp(argv[i], "--runs") && i + 1 < argc) {
-                runs = std::atoi(argv[++i]);
-            } else if (!std::strcmp(argv[i], "--out") && i + 1 < argc) {
-                out = argv[++i];
-            } else {
-                ins.push_back(argv[i]);
-            }
-        }
-        rep = probe_run(argv[2], mode, ins, out, runs, ok);
-    } else {
-        std::fprintf(stderr, "unknown command\n");
-        return 2;
+        return 0;
     }
-    std::fputs(rep.c_str(), stdout);
-    return ok ? 0 : 1;
+    if (cmd == "info") {
+        ArtifactInfo info;
+        if (!read_artifact_info(argv[2], info, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        std::printf("fn '%s'\nkey '%s'\nvendor %s\nmodel_hash 0x%016llx\ntflite_hash 0x%016llx\n"
+                    "bytecode %llu bytes at %llu\n",
+                    info.function.c_str(), info.key.c_str(), info.vendor.c_str(),
+                    (unsigned long long)info.model_hash, (unsigned long long)info.tflite_hash,
+                    (unsigned long long)info.bytecode_size, (unsigned long long)info.bytecode_offset);
+        return 0;
+    }
+    std::fprintf(stderr, "unknown command\n");
+    return 2;
 }

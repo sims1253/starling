@@ -193,10 +193,10 @@ if(ANDROID)
   target_include_directories(starling_ggml_core PUBLIC ${STARLING_NPU_SRC})
   target_link_libraries(starling_ggml_core PUBLIC nativewindow log)
   # adb-shell tool that compiles encoder artifacts on the phone
-  # (benchmarks/npu/npu_compile.sh) and benchmarks them.
+  # (scripts/npu/npu_compile.sh).
   add_executable(starling-npu-tool EXCLUDE_FROM_ALL
-    ${STARLING_NPU_SRC}/npu_tool.cpp ${STARLING_NPU_SRC}/npu_probe.cpp
-    ${STARLING_NPU_SRC}/gguf_fingerprint.cpp ${STARLING_NPU_SRC}/tpu_runtime.cpp)
+    ${STARLING_NPU_SRC}/npu_tool.cpp ${STARLING_NPU_SRC}/gguf_fingerprint.cpp
+    ${STARLING_NPU_SRC}/tpu_runtime.cpp)
   target_link_libraries(starling-npu-tool PRIVATE nativewindow ${CMAKE_DL_LIBS})
   set_target_properties(starling-npu-tool PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endif()

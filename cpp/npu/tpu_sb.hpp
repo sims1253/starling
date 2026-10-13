@@ -66,9 +66,6 @@ struct SouthBound {
     ThrStatus (*graph_set_output_edge)(ThrGraph*, ThrEdgeId);
     ThrStatus (*graph_assign_sq)(ThrGraph*, ThrNodeId, ThrSqContainerHandle, const char*);
     ThrStatus (*load_sq_container)(ThrContext*, ThrSqContainerType, const void*, size_t, ThrSqContainerHandle*);
-    ThrStatus (*load_sq_container_fd)(ThrContext*, ThrSqContainerType, int, size_t, bool, ThrSqContainerHandle*);
-    ThrStatus (*load_sq_container_fd_with_offset)(ThrContext*, ThrSqContainerType, int, size_t, size_t, bool,
-                                                  ThrSqContainerHandle*);
     ThrStatus (*unload_sq_container)(ThrContext*, ThrSqContainerHandle);
     ThrStatus (*register_buffer_with_offset)(ThrContext*, ThrBufferType, void*, size_t, size_t, ThrBufferHandle*);
     ThrStatus (*unregister_buffer)(ThrContext*, ThrBufferHandle);

@@ -23,11 +23,9 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -73,8 +71,6 @@ void do_load() {
     sym(h, "thrGraphSetOutputEdge", s.graph_set_output_edge, true, miss);
     sym(h, "thrGraphAssignSq", s.graph_assign_sq, true, miss);
     sym(h, "thrLoadSqContainer", s.load_sq_container, true, miss);
-    sym(h, "thrLoadSqContainerFd", s.load_sq_container_fd, false, miss);
-    sym(h, "thrLoadSqContainerFdWithOffset", s.load_sq_container_fd_with_offset, false, miss);
     sym(h, "thrUnloadSqContainer", s.unload_sq_container, true, miss);
     sym(h, "thrRegisterBufferWithOffset", s.register_buffer_with_offset, true, miss);
     sym(h, "thrUnregisterBuffer", s.unregister_buffer, true, miss);
@@ -181,7 +177,7 @@ bool compile_tflite(const void* tflite, size_t size, std::vector<uint8_t>& bytec
 }
 
 bool write_artifact(const std::string& path, const ArtifactInfo& info, const std::vector<uint8_t>& bytecode,
-                    uint64_t pad, std::string& err) {
+                    std::string& err) {
     if (info.in_bytes.size() > 64 || info.out_bytes.size() > 64 || info.function.size() >= 64 ||
         info.key.size() >= 256) {
         err = "artifact: too many I/Os or function name too long";
@@ -198,7 +194,7 @@ bool write_artifact(const std::string& path, const ArtifactInfo& info, const std
     std::snprintf(h.key, sizeof h.key, "%s", info.key.c_str());
     h.model_hash = info.model_hash;
     h.tflite_hash = info.tflite_hash;
-    h.bytecode_offset = kHeader + pad;   // pad != 0 reproduces an unaligned bytecode offset
+    h.bytecode_offset = kHeader;
     h.bytecode_size = bytecode.size();
     const std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -206,7 +202,7 @@ bool write_artifact(const std::string& path, const ArtifactInfo& info, const std
         err = "cannot write " + tmp;
         return false;
     }
-    std::vector<uint8_t> head(kHeader + pad, 0);
+    std::vector<uint8_t> head(kHeader, 0);
     std::memcpy(head.data(), &h, sizeof h);
     bool ok = std::fwrite(head.data(), 1, head.size(), f) == head.size() &&
               std::fwrite(bytecode.data(), 1, bytecode.size(), f) == bytecode.size();
@@ -300,7 +296,7 @@ bool TpuModel::alloc(Buf& b, size_t bytes, std::string& err) {
     return true;
 }
 
-bool TpuModel::open(const std::string& path, LoadMode mode, std::string& err) {
+bool TpuModel::open(const std::string& path, std::string& err) {
     close();
     sb_ = load_southbound(err);
     if (!sb_) return false;
@@ -316,10 +312,7 @@ bool TpuModel::open(const std::string& path, LoadMode mode, std::string& err) {
     // Same context attributes as LiteRT's dispatch device context.
     if (s->set_attr_str) {
         s->set_attr_str(ctx, "edgetpu_use_tpu_tachyon", "1");
-        // STARLING_NPU_SQ_LOAD=default leaves the firmware's own SQ loading method
-        // (diagnosis of the fd-based load paths); LiteRT always asks for dmabuf.
-        const char* m = std::getenv("STARLING_NPU_SQ_LOAD");
-        if (!m || std::strcmp(m, "default") != 0) s->set_attr_str(ctx, "sq_container_load_method", m ? m : "dmabuf");
+        s->set_attr_str(ctx, "sq_container_load_method", "dmabuf");
     }
 
     ThrSqContainerHandle sq = 0;
@@ -330,59 +323,16 @@ bool TpuModel::open(const std::string& path, LoadMode mode, std::string& err) {
         return false;
     }
     fd_ = fd;
-    switch (mode) {
-    case LoadMode::Mmap: {
-        map_len_ = info_.bytecode_offset + info_.bytecode_size;
-        map_ = mmap(nullptr, map_len_, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (map_ == MAP_FAILED) {
-            map_ = nullptr;
-            err = "mmap failed";
-            return false;
-        }
-        st = s->load_sq_container(ctx, kThrSqContainerTypeMlModel,
-                                  static_cast<const uint8_t*>(map_) + info_.bytecode_offset, info_.bytecode_size, &sq);
-        break;
+    // The bytecode stays in the mapped file (no copy).
+    map_len_ = info_.bytecode_offset + info_.bytecode_size;
+    map_ = mmap(nullptr, map_len_, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_ == MAP_FAILED) {
+        map_ = nullptr;
+        err = "mmap failed";
+        return false;
     }
-    case LoadMode::FdOffset:
-        if (!s->load_sq_container_fd_with_offset) {
-            err = "thrLoadSqContainerFdWithOffset not in this firmware";
-            return false;
-        }
-        st = s->load_sq_container_fd_with_offset(ctx, kThrSqContainerTypeMlModel, fd, info_.bytecode_size,
-                                                 info_.bytecode_offset, false, &sq);
-        break;
-    case LoadMode::Fd: {
-        if (!s->load_sq_container_fd) {
-            err = "thrLoadSqContainerFd not in this firmware";
-            return false;
-        }
-        // A second file holding only the bytecode (offset 0).
-        const std::string bc = path + ".bc";
-        struct stat sb {};
-        if (::stat(bc.c_str(), &sb) != 0 || (uint64_t)sb.st_size != info_.bytecode_size) {
-            std::vector<uint8_t> tmp(info_.bytecode_size);
-            if (pread(fd, tmp.data(), tmp.size(), (off_t)info_.bytecode_offset) != (ssize_t)tmp.size()) {
-                err = "short read of bytecode";
-                return false;
-            }
-            FILE* f = std::fopen(bc.c_str(), "wb");
-            if (!f || std::fwrite(tmp.data(), 1, tmp.size(), f) != tmp.size()) {
-                if (f) std::fclose(f);
-                err = "cannot write " + bc;
-                return false;
-            }
-            std::fclose(f);
-        }
-        const int bfd = ::open(bc.c_str(), O_RDONLY | O_CLOEXEC);
-        if (bfd < 0) {
-            err = "cannot open " + bc;
-            return false;
-        }
-        st = s->load_sq_container_fd(ctx, kThrSqContainerTypeMlModel, bfd, info_.bytecode_size, false, &sq);
-        ::close(bfd);
-        break;
-    }
-    }
+    st = s->load_sq_container(ctx, kThrSqContainerTypeMlModel,
+                              static_cast<const uint8_t*>(map_) + info_.bytecode_offset, info_.bytecode_size, &sq);
     if (st != kThrStatusSuccess) {
         err = "loading the SQ container failed";
         return false;

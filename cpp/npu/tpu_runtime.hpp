@@ -38,15 +38,9 @@ struct ArtifactInfo {
     uint64_t bytecode_offset = 0, bytecode_size = 0;
 };
 bool write_artifact(const std::string& path, const ArtifactInfo& info, const std::vector<uint8_t>& bytecode,
-                    uint64_t pad, std::string& err);
+                    std::string& err);
 bool read_artifact_info(const std::string& path, ArtifactInfo& info, std::string& err);
 uint64_t fnv1a(const void* data, size_t size);
-
-enum class LoadMode {
-    Mmap,      // mmap the file, thrLoadSqContainer(pointer)  (what an in-memory model does)
-    FdOffset,  // thrLoadSqContainerFdWithOffset(fd, offset)   (what LiteRT does for a file-backed model)
-    Fd,        // bytecode copied to its own file, thrLoadSqContainerFd(fd)
-};
 
 class TpuModel {
 public:
@@ -55,7 +49,7 @@ public:
     TpuModel(const TpuModel&) = delete;
     TpuModel& operator=(const TpuModel&) = delete;
 
-    bool open(const std::string& artifact_path, LoadMode mode, std::string& err);
+    bool open(const std::string& artifact_path, std::string& err);   // mmaps the artifact
     // Host access to the I/O buffers (AHardwareBuffer BLOBs, also importable
     // into Vulkan as external memory).
     bool write_input(size_t i, const void* data, size_t bytes, std::string& err);
