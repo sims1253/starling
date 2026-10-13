@@ -59,8 +59,9 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_SKIP=label[,prefix*]` | diagnostic: drop every dispatch recorded under those labels (`enc_qkv`, `llm_ff_up`, `conv_pw2`, `enc_*`, …; results are garbage) to price encoder/prefill work by difference |
 | `STARLING_FAST_FULL_BARRIER=1` | every recorded barrier in the wide compute+transfer form (default: scoped to the commands it orders) |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
-| `STARLING_NPU_DIR=dir[:dir…]` | where Qwen3-ASR's TPU encoder artifacts are looked up (default: `STARLING_FAST_CACHE_DIR`); see *Pixel TPU encoder* below |
-| `STARLING_NPU=0` | never use a TPU encoder artifact (GPU encoder) |
+| `STARLING_NPU_DIR=dir[:dir…]` | where TPU artifacts are looked up and `status-*.txt` written (default: `STARLING_FAST_CACHE_DIR`); see *Pixel TPU encoder* below |
+| `STARLING_NPU=0` | never use a TPU artifact (GPU encoder and prefill) |
+| `STARLING_NPU_PREFILL=0` | TPU encoder, but the GPU prefill (Qwen3-ASR) |
 
 ## Design
 
@@ -163,28 +164,92 @@ directory set the engine times candidate GEMM tiles and GEMV row counts on
 synthetic weights at the real shapes the first time it meets a device, and
 stores the choice.
 
-**Pixel TPU encoder (Qwen3-ASR, `cpp/npu`).** On Tensor phones the audio
-encoder can run on the TPU instead of the GPU. Nothing from Google's Tensor
-SDK is involved: the phone's own firmware library `libedgetpu_litert.so` (a
-public vendor library, opened with `dlopen` at run time; the app declares it
-with `<uses-native-library android:required="false">`) both compiles a
-`.tflite` on the device and runs the result. Compiling only works from the
-adb shell (the firmware's compile service serves just the apps on Google's
-EdgeTPU allowlist), so it is a one-time developer step,
-`benchmarks/npu/npu_compile.sh HF_MODEL PHONE_GGUF [--app PKG]`, which
-exports one encoder attention window (800 mel frames → 104 projector rows,
-fp16 weights, an additive key mask for the partial last window) from the HF
-checkpoint and writes `qwen3-asr-enc-<fingerprint>.stnpu`. The engine loads
-an artifact only if its header matches the GGUF (a hash of a few F32
-tensors), the encoder shape and the firmware's API version; it opens and
-warms it up on a worker thread during the GPU weight load, runs the encoder
-window by window on the TPU, uploads the projector rows into the LLM's audio
-rows and records a prefill without the GPU encoder pass. Without a matching
-artifact, with `STARLING_NPU=0`, or after any TPU error it runs the GPU
-encoder as before. The app looks in `files/npu` (debug builds:
-`npu_compile.sh --app dev.starling.mobile.debug`) and in its external files
-dir `Android/data/<pkg>/files/npu` (any build: `adb push`). Measured in
-`benchmarks/npu/` (`phone_npu_ab.sh`, `phone_npu_fleurs.sh`).
+**Pixel TPU encoder (Qwen3-ASR, `cpp/npu`).** On Tensor phones Qwen3-ASR's
+audio encoder can run on the TPU instead of the GPU. Nothing from Google's
+Tensor SDK is involved: the phone's own firmware library
+`libedgetpu_litert.so` (a public vendor library, opened with `dlopen` at run
+time; the app declares it with `<uses-native-library android:required="false">`)
+both compiles a `.tflite` on the device and runs the result. Compiling only
+works from the adb shell (the firmware's compile service serves just the apps
+on Google's EdgeTPU allowlist), so the user compiles on their own phone over
+adb and nothing precompiled ships: load the Qwen3-ASR model in the app once,
+then run `benchmarks/npu/npu_compile_all.sh`. It finds the phone
+(`ANDROID_SERIAL`, the one `adb devices` entry, or wireless debugging via
+mDNS; `--wait S`), the installed Starling packages (release, `.debug`,
+`.experimental`), reads what each loaded model reported (below), and compiles
+every missing or stale Qwen3-ASR encoder with `npu_compile.sh HF_MODEL
+(--gguf PHONE_GGUF | --hash 0x…) [--app PKG,…]`: export from the HF checkpoint
+(downloaded on first use), compile with the phone's compiler, install into
+`files/npu` of a debuggable package (run-as) or the external files dir
+`Android/data/<pkg>/files/npu` of any other. The artifact is one encoder
+attention window (800 mel frames → 104 projector rows, fp16 weights, an
+additive key mask for the partial last window),
+`qwen3-asr-enc-<fingerprint>.stnpu`. The engine loads an artifact only if its
+header matches the GGUF (a hash of a few F32 tensors, the same for every
+quantization of a model), the graph shape and the firmware's API version; it
+opens and warms it up on a worker thread during the GPU weight load, runs the
+encoder window by window on the TPU, uploads the projector rows into the
+LLM's audio rows and records a prefill without the GPU encoder pass. Short
+clip (7.4 s, Qwen3-ASR-0.6B, after the subgroup-broadcast GEMM): encoder +
+prefill 558 → 396 ms, wall 1576 → 1422 ms (TPU encoder 54 ms); transcripts
+match the GPU's up to a punctuation near-tie.
+
+*Opt-in LLM prefill* (Qwen3-ASR-0.6B only): `npu_compile.sh … --prefill 128`
+adds the LLM trunk for prompts of up to 128 tokens (≈ 8.6 s of audio) as two
+14-layer segments (`qwen3-llm-prefill-<fingerprint>-sb128-l<a>-<b>.stnpu`,
+2 × 457 MB); the K/V rows go straight into the GPU cache and the last row into
+the first decode step. Short clip: encoder + prefill 396 → 259 ms, wall
+1422 → 1284 ms; most of what remains is the K/V hand-off (~108 ms). Off unless
+its files exist; `STARLING_NPU_PREFILL=0` skips it.
+
+*Fallback, said out loud.* Without a matching artifact, with `STARLING_NPU=0`,
+or after any TPU error the engine runs the GPU encoder as before. Each piece's
+state (`ok`, `missing`, `stale` — compiled for older firmware or by an older
+exporter — or `error`) goes to `status-<piece>-<fingerprint>.txt` in every
+existing `STARLING_NPU_DIR` directory (what `npu_compile_all.sh` reads;
+`missing` only where the firmware lists the TPU library, and without loading
+it), stale and error states are logged once per process (logcat tag
+`StarlingNpu`: "TPU … not used (stale), the GPU runs it: … — recompile via
+adb"), and `describe()` carries the stale note. Measured with
+`benchmarks/npu/phone_npu_ab.sh` and `phone_npu_fleurs.sh`.
+
+*Compiler limits, and why only Qwen3-ASR* (firmware 0.21.0, Pixel 10 Pro).
+The on-device compiler accepts graphs whose tensors stay window-sized; the
+other audio encoders were tried and parked (`benchmarks/npu/parked/`, exact
+against HF on the host, not wired in):
+* a batched matmul with more than 256 keys fails ("Reshape input/output slice
+  mismatch"), so 30 s of global (ARK-ASR) or long sliding-window attention
+  does not compile as is;
+* slicing an activation fails — the last dimension of a 64-wide head (RoPE's
+  rotate-half; a constant `[hd, hd]` matmul works instead), K/V or GLU halves
+  ("Cannot remove elements due to shape mismatch"), blocks along the sequence;
+* whole-sequence tensors (1500–1600 rows × 1024–1280) overflow on-chip memory
+  ("TENSOR_MOVEMENT layer … overflows memory", "Model is too large to fit in
+  on-chip memory") or exceed the compiler's 60 s overflow budget, which
+  rules out blocking a 30 s encoder into ≤ 256-row pieces (ARK, Granite);
+* graphs of ~0.7 GB of weights exhaust the compile service's memory
+  (`DEAD_OBJECT`, Android killing background apps). `FAILED_TRANSACTION` /
+  "Binder buffer full" is only the compiler's oversized error text: the real
+  error is in logcat (`edgetpu_vendor_service`).
+
+MOSS-Transcribe's encoder (the Qwen3-Omni audio tower, at 32 × 1280, in
+8-layer segments per window) compiles and runs (~110 ms per 8 s window; the GPU
+encoder took ~1.1 s on that clip before the subgroup GEMM), but its last
+segment returns wrong rows (rel-L2 0.98: ln_post and the projection are
+exact, the gated-MLP adapter is not — its SwiGLU products are ~1e-4, half
+below fp16's normal range, and scaling them by 1024 did not help), so it is
+parked too.
+
+**Compiling can reboot the phone.** Twice the compiler took the whole phone
+down — `kernel_panic,system_is_deadloomld_on_oomory`, with 11.7 GB available
+before the compile: once on a 4 MB probe graph (four 256-row slices of a
+`[1, 1024, 1024]` input, each through a linear layer, concatenated:
+"pslice-1024"), once on MOSS's adapter alone (`[1, 104, 2048]` → 8192 →
+2048, 100 MB). Neither size nor free memory predicts it. The compile scripts
+therefore build only the graphs with a clean record (the Qwen3-ASR encoder;
+the 0.6B prefill segments on request), with fixed shapes, refuse graphs above
+640 MB, and refuse to compile with less than 4 GB available
+(`NPU_MIN_MEM_MB`); save your work on the phone before running them.
 
 ## Kernels
 

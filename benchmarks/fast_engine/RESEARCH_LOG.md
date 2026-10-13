@@ -1283,3 +1283,31 @@ columns of one k, vec4 FMAs into independent accumulators) measured
 another ~15 % in the probe (P6-1 vs P6-3) but needs a second resident
 weight layout next to the decode GEMVs' one; P·V (F16ᵀ) is still a
 shared-tile kernel.
+
+## P7: the Pixel TPU beyond Qwen3-ASR's encoder (2026-10-13)
+
+Goal: take the Tensor G5 TPU path (our own `cpp/npu` client on the
+firmware's on-device compiler, no Tensor SDK) from Qwen3-ASR's encoder to
+every model where it pays: Qwen3's LLM prefill and the audio encoders of
+ARK-ASR, Granite Speech, Voxtral (removed from Starling meanwhile) and
+MOSS-Transcribe. Outcome: Qwen3-ASR only; the rest is parked
+(`benchmarks/npu/parked/`).
+
+| # | Piece | Result | Verdict |
+|---|---|---|---|
+| P7-1 | Qwen3-ASR-0.6B LLM prefill on the TPU (sb128, two 14-layer segments, 2 × 457 MB) | short clip after the subgroup GEMM: enc+prefill 558 (GPU) → 396 (TPU encoder) → **259 ms** (+ TPU prefill), wall 1576 → 1422 → **1284 ms**; TPU trunk 78.6 ms, K/V hand-off into the GPU cache 108 ms, first token 13 ms; transcript = GPU's up to a punctuation near-tie. A whole 28-layer trunk (1.76 GB) and sb416 fail to compile (FAILED_TRANSACTION). | **keep, opt-in** (`npu_compile.sh --prefill 128`, 0.6B only) |
+| P7-2 | ARK-ASR / Voxtral encoders, 1500 positions | interleaved RoPE: "Reshape input/output slice mismatch"; probes: any batched matmul with > 256 keys fails the same way (256 compiles), as does the rotate-half's last-dim slice of a 64-wide head (a constant `[hd, hd]` matmul compiles) | compiler limit |
+| P7-3 | ARK with blocked attention (≤ 250-row blocks sliced from `[1, P, d]`, online softmax; exact vs HF on 29 s) | "Cannot remove elements due to shape mismatch" (layers 0–2); "TENSOR_MOVEMENT layer … overflows memory" (layers 8–16) | **parked** |
+| P7-4 | Granite (conformer, Shaw block attention 200, Q-Former; P = 1600, exact vs HF) | 1 layer @ 600: "Cannot remove elements …" (fp16 and int8 weights alike; K/V and GLU halves are activation slices); 0–8 @ 1600: TENSOR_MOVEMENT overflow; 8–16 (680 MB .tflite): compile service `DEAD_OBJECT`, lmkd killed background apps | **parked** |
+| P7-5 | op probes at 1500 rows (block slices, `torch.chunk`, last-dim split, batch-dim slice) | "Model is too large to fit in on-chip memory" / "Unable to resolve all overflows … within 60000 ms"; **pslice-1024** (`[1, 1024, 1024]` in four 256-row slices → linear → concat, 4 MB) **panicked the kernel**: `kernel_panic,system_is_deadloomld_on_oomory` (uptime 47 s after) | stop probing |
+| P7-6 | MOSS-Transcribe encoder (Qwen3-Omni tower 32 × 1280 + gated-MLP adapter), 4 × 8-layer segments per 800-frame window (1.41 GB) | compiles (9–12 s per segment, MemAvailable ~11.8 GB before each); ~110 ms per window (segments 26.7 / 20.3 / 19.5 / 26.1 ms) vs GPU encoder ~1.1 s (pre-GEMM); **wrong rows**: segments 1–3 match the host (rel-L2 0.08–0.14 %), the last 0.98 — ln_post + projection alone exact (6e-4), the adapter not; its SwiGLU products ~1e-4 (50 % below fp16 normal), up projection ×1024 did not help; transcripts loop to the 200-token cap | **parked** |
+| P7-7 | MOSS adapter alone (`[1, 104, 2048]` → 8192 → 2048, 100 MB) | **second kernel panic** during compile (uptime 14 s after), 11.7 GB available before | stop; Qwen3 only |
+| P7-8 | `FAILED_TRANSACTION` / "Binder buffer full" | only the compiler's error text exceeding the binder reply; the real error is in logcat (`edgetpu_vendor_service`) | diagnosis |
+
+Kept: the compile scripts build only graphs with a clean record (Qwen3-ASR
+encoder; the 0.6B prefill on request), with fixed shapes, a 640 MB graph cap
+and a 4 GB MemAvailable floor; `npu_compile_all.sh` compiles the Qwen3-ASR
+encoders the installed app reported (status files), into the release
+(external files dir) or debuggable (run-as) package; the engine reports
+missing / stale / error per piece (status files, one logcat line per
+problem). The phone was on AC throughout: no energy numbers.
