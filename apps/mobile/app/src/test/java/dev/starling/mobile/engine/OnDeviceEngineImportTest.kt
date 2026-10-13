@@ -826,7 +826,6 @@ class OnDeviceEngineImportTest {
                 "ark" to "ARK-ASR",
                 "granite" to "Granite Speech",
                 "qwen3" to "Qwen3-ASR",
-                "voxtral" to "Voxtral Realtime",
             )) {
                 val source = sparseModelFile(directory, "source.part", ggufBytes("general.architecture" to architecture))
                 val result = engine.importModel(source.inputStream(), "$architecture.gguf")
@@ -843,7 +842,7 @@ class OnDeviceEngineImportTest {
                 ),
                 result,
             )
-            assertEquals("voxtral.gguf", engine.activeModelName())
+            assertEquals("qwen3.gguf", engine.activeModelName())
             assertFalse(File(directory, "s1.gguf").exists())
         } finally {
             directory.deleteRecursively()

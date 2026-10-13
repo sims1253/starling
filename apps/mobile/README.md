@@ -60,20 +60,20 @@ or app restart, and is checked against its SHA-256 before it replaces the
 active model (`engine/ModelCatalog.kt`). Any other Parakeet-TDT GGUF can
 be imported through **Import model (.gguf)** instead, and so can the
 repository's other speech-model GGUFs: Qwen3-ASR (1.7B, 0.6B), ARK-ASR
-(3B, 0.6B), Granite Speech, MOSS-Transcribe and Voxtral Realtime. The
-engine is picked from the file's own metadata (`engine/ModelKind.kt`);
-anything else, including the S1-mini text model, is refused at import.
-These LLM-decoder models are several times larger and slower than Parakeet
-on a phone, and their load is memory-gated with a larger working-set
-estimate (a KV cache on top of the weights); they transcribe long
-recordings in 30 s windows, and live previews of a slow model are spaced
-so they keep the engine busy at most half of the time. Every model
-(Parakeet, Qwen3-ASR, MOSS, ARK, Granite and Voxtral) runs on the GPU
-(Vulkan fast engines) where the phone has one, and on the CPU otherwise.
-GPU inference is both faster and several times more energy-efficient per
-transcription than the CPU engine. The model is loaded on first use. When
-a transcription fails — missing model, load failure — the failure is
-surfaced and the local recording remains available for retry.
+(3B, 0.6B), Granite Speech and MOSS-Transcribe. The engine is picked from
+the file's own metadata (`engine/ModelKind.kt`); anything else, including
+the S1-mini text model, is refused at import. These LLM-decoder models are
+several times larger and slower than Parakeet on a phone, and their load
+is memory-gated with a larger working-set estimate (a KV cache on top of
+the weights); they transcribe long recordings in 30 s windows, and live
+previews of a slow model are spaced so they keep the engine busy at most
+half of the time. Every model (Parakeet, Qwen3-ASR, MOSS, ARK and Granite)
+runs on the GPU (Vulkan fast engines) where the phone has one, and on the
+CPU otherwise. GPU inference is both faster and several times more
+energy-efficient per transcription than the CPU engine. The model is
+loaded on first use. When a transcription fails — missing model, load
+failure — the failure is surfaced and the local recording remains
+available for retry.
 Building the app additionally requires the Android NDK and CMake SDK packages.
 
 Models live in app-private storage until you tap **Keep models across

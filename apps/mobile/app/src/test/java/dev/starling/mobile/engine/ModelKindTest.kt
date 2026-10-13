@@ -33,7 +33,6 @@ class ModelKindTest {
             "ark" to ModelKind.ARK,
             "granite" to ModelKind.GRANITE,
             "qwen3" to ModelKind.QWEN3,
-            "voxtral" to ModelKind.VOXTRAL,
         )
         for ((architecture, kind) in expected) {
             assertEquals(architecture, kind, supported(parsed(architecture)).kind)
@@ -50,7 +49,6 @@ class ModelKindTest {
                 ModelKind.ARK to 3,
                 ModelKind.GRANITE to 6,
                 ModelKind.QWEN3 to 7,
-                ModelKind.VOXTRAL to 11,
             ),
             ModelKind.entries.associateWith { it.nativeKind },
         )
@@ -86,6 +84,8 @@ class ModelKindTest {
     fun unknownArchitecturesAreRejectedByName() {
         assertEquals("This GGUF (llama) is not a supported speech model.", reason(parsed("llama")))
         assertEquals("This GGUF (whisper) is not a supported speech model.", reason(parsed("whisper")))
+        // Voxtral's engine was removed (kind 11 is reserved in the C API).
+        assertEquals("This GGUF (voxtral) is not a supported speech model.", reason(parsed("voxtral")))
         assertEquals(
             "This GGUF (no architecture tag) is not a supported speech model.",
             reason(parsed(keys = listOf("general.name"))),
@@ -119,7 +119,6 @@ class ModelKindTest {
         assertEquals(ModelKind.QWEN3, supported(parsed("qwen3", uints = mapOf(ModelKind.QWEN3_HIDDEN_SIZE_KEY to 1024L))).kind)
         assertEquals("Granite Speech", name("granite"))
         assertEquals("MOSS-Transcribe", name("moss_transcribe"))
-        assertEquals("Voxtral Realtime", name("voxtral"))
     }
 
     @Test

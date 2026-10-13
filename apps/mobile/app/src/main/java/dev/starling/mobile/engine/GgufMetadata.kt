@@ -43,7 +43,7 @@ object GgufMetadata {
      * Metadata + tensor infos are a few hundred KB for Parakeet, but the
      * LLM-decoder models carry a full BPE tokenizer (150k+ pieces plus
      * merges): ~7 MB for ARK-0.6B and ARK-3B, similar or more for Qwen3,
-     * MOSS, Granite and Voxtral. 32 MiB leaves room for those and still
+     * MOSS and Granite. 32 MiB leaves room for those and still
      * bounds crafted files.
      */
     const val MAX_METADATA_BYTES = 32L * 1024 * 1024

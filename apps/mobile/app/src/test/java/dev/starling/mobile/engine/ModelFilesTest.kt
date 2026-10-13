@@ -104,7 +104,6 @@ class ModelFilesTest {
             "ark" to ModelKind.ARK,
             "granite" to ModelKind.GRANITE,
             "qwen3" to ModelKind.QWEN3,
-            "voxtral" to ModelKind.VOXTRAL,
         )) {
             val staged = stagedOf(ModelKindTest.gguf("general.architecture" to architecture))
             assertNull(architecture, ModelFiles.validateStaged(staged))

@@ -40,7 +40,6 @@ enum class ModelKind(
 
     // Likewise for Qwen3-ASR-0.6B and the QWEN3_06 alias.
     QWEN3(7, "Qwen3-ASR", LLM_DECODER_WORKING_SET_BYTES),
-    VOXTRAL(11, "Voxtral Realtime", LLM_DECODER_WORKING_SET_BYTES),
     ;
 
     /** Free memory a load of a [modelBytes] file of this kind asks for (see [workingSetBytes]). */
@@ -71,7 +70,6 @@ enum class ModelKind(
             "ark" to ARK,
             "granite" to GRANITE,
             "qwen3" to QWEN3,
-            "voxtral" to VOXTRAL,
         )
 
         /**
