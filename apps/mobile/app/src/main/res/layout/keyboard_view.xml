@@ -55,7 +55,7 @@
         android:visibility="gone" />
 
     <!-- Where the on-device model stands (loading, failed); hidden when
-         it is ready or the server engine is selected. -->
+         it is ready. -->
     <TextView
         android:id="@+id/keyboard_model_status"
         android:layout_width="match_parent"

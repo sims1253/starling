@@ -4,31 +4,22 @@
     <string name="keyboard_name">Starling Voice Input</string>
     <string name="recognition_service_name">Starling Voice Recognition</string>
     <string name="screen_title">Starling Mobile</string>
-    <string name="screen_subtitle">Private voice input for your own Starling server</string>
-    <string name="backend_heading">Backend connection</string>
-    <string name="backend_endpoint_hint">Backend URL</string>
-    <string name="backend_endpoint_help">Use the server root, for example https://host:8181, or its /v1/audio/transcriptions route.</string>
-    <string name="allow_http">Allow HTTP for a trusted private LAN</string>
-    <string name="allow_http_help">Only localhost, private IPv4 or IPv6, link-local, or .local hosts are accepted. HTTPS remains the default.</string>
-    <string name="save_endpoint">Save connection</string>
-    <string name="endpoint_saved">Connection saved. No credentials are stored.</string>
-    <string name="endpoint_save_error">Could not save this connection setting.</string>
-    <string name="model_hint">Model slug (from /v1/models)</string>
-    <string name="model_required">Enter the model slug served by this backend.</string>
-    <string name="protocol_help">Use the model slug reported by /v1/models. Starling defaults to parakeet.</string>
-    <string name="engine_heading">Transcribe on</string>
-    <string name="engine_server">Starling server</string>
-    <string name="engine_on_device">This device (experimental)</string>
+    <string name="screen_subtitle">Private voice input, transcribed on this phone</string>
+    <string name="model_heading">Speech model</string>
     <string name="on_device_status_no_model">No on-device model yet. Download the recommended Parakeet model (Wi-Fi recommended) or another catalog model, or import a speech model GGUF you already have (Parakeet, Qwen3-ASR, ARK-ASR, Granite Speech, MOSS-Transcribe or Voxtral Realtime).</string>
-    <string name="on_device_model_in_use">Using %1$s, %2$d MB. Recordings transcribe offline on this device, live while you speak.</string>
-    <string name="on_device_model_not_selected">Installed: %1$s, %2$d MB, not in use. Choose \"%3$s\" above to transcribe with it.</string>
+    <string name="on_device_model_in_use">Using %1$s, %2$d MB. Recordings transcribe offline on this phone, live while you speak.</string>
     <string name="recommended_model_name">%1$s (recommended)</string>
     <string name="installed_models_heading">Installed models</string>
-    <string name="installed_models_help">Kept in Starling\'s private storage (not in Downloads or Files). Tap one to use it.</string>
+    <string name="installed_models_help">Tap one to use it.</string>
+    <string name="models_shared">Models are kept in %1$s, so they stay when Starling is uninstalled and every Starling build on this phone uses them.</string>
+    <string name="models_private">Models are kept inside this app and are deleted when it is uninstalled. Allow file access to keep them in Starling/models instead, where a reinstall and every other Starling build find them.</string>
+    <string name="models_private_unsupported">Models are kept inside this app and are deleted when it is uninstalled.</string>
+    <string name="models_moving">Moving installed models to %1$s…</string>
+    <string name="share_models">Keep models across reinstalls</string>
     <string name="installed_model_row">%1$s, %2$d MB</string>
     <string name="delete_model">Delete</string>
     <string name="delete_model_title">Delete this model?</string>
-    <string name="delete_model_message">%1$s is removed from this device. Download or import it again to use it later.</string>
+    <string name="delete_model_message">%1$s is removed from this phone, for every Starling build that uses the same model folder. Download or import it again to use it later.</string>
     <string name="delete_model_error">The model could not be deleted.</string>
     <string name="select_model_error">The model could not be selected.</string>
     <string name="on_device_importing">Importing model…</string>
@@ -43,7 +34,7 @@
     <string name="download_other_row">%1$s · %2$d MB</string>
     <string name="download_other_row_installed">%1$s · %2$d MB · installed</string>
     <string name="cancel_download">Pause download</string>
-    <string name="on_device_downloading">Downloading %4$s: %1$d%% (%2$d of %3$d MB). It resumes where it stopped if the connection drops or the app closes.</string>
+    <string name="on_device_downloading">Downloading %4$s: %1$d%% (%2$d of %3$d MB). It keeps going when you leave the app and resumes where it stopped if the connection drops.</string>
     <string name="on_device_verifying">Verifying the download…</string>
     <string name="on_device_download_paused">Download paused. Tap Resume to continue where it stopped.</string>
     <string name="on_device_download_failed">Download failed: %1$s</string>
@@ -56,7 +47,7 @@
     <string name="streaming_connecting">Recording… starting live transcription.</string>
     <string name="streaming_live">Transcribing live; the partial transcript appears below.</string>
     <string name="streaming_interrupted">Live transcription stopped: %1$s. The recording continues and will be transcribed when you stop.</string>
-    <string name="sending_recording">Saved privately. Contacting Starling…</string>
+    <string name="sending_recording">Saved privately. Transcribing…</string>
     <string name="transcription_saved">Transcript saved verbatim.</string>
     <string name="transcription_failed_retry">Transcription failed. The recording is retained; try Retry.</string>
     <string name="recording_storage_error">Could not create a private recording file.</string>
@@ -97,6 +88,14 @@
         <item>5 GB</item>
         <item>20 GB</item>
     </string-array>
+    <plurals name="models_not_moved">
+        <item quantity="one">%1$d model could not be moved to %2$s (is there enough free space?). It still works, but is deleted if Starling is uninstalled; the move is tried again each time Starling starts.</item>
+        <item quantity="other">%1$d models could not be moved to %2$s (is there enough free space?). They still work, but are deleted if Starling is uninstalled; the move is tried again each time Starling starts.</item>
+    </plurals>
+    <plurals name="models_moved">
+        <item quantity="one">Moved %1$d model to %2$s.</item>
+        <item quantity="other">Moved %1$d models to %2$s.</item>
+    </plurals>
     <plurals name="cleanup_compressed">
         <item quantity="one">compressed %1$d recording losslessly (saved %2$d MB)</item>
         <item quantity="other">compressed %1$d recordings losslessly (saved %2$d MB)</item>
@@ -138,8 +137,7 @@
     <string name="retry_recording">Retry</string>
     <string name="retranscribe_recording">Transcribe again</string>
     <string name="retry_with_title">Transcribe with</string>
-    <string name="retry_with_on_device">This device: %1$s</string>
-    <string name="retry_with_server">Server: %1$s</string>
+    <string name="retry_with_on_device">%1$s</string>
     <string name="play_recording">Play</string>
     <string name="stop_playback">Stop</string>
     <string name="playback_error">Could not play this recording.</string>
@@ -186,6 +184,11 @@
     <string name="keyboard_copied">Transcript copied.</string>
     <string name="keyboard_switch_label">⌨</string>
     <string name="keyboard_switch_description">Switch to the previous keyboard</string>
+    <string name="download_notification_channel">Model downloads</string>
+    <string name="download_notification_title">Downloading %1$s</string>
+    <string name="download_notification_progress">%1$d of %2$d MB. Continues in the background.</string>
+    <string name="download_notification_done">%1$s is downloaded and ready to use.</string>
+    <string name="download_notification_model">speech model</string>
     <string name="take_notification_channel">Dictation in progress</string>
     <string name="take_notification_title">Starling is recording</string>
     <string name="take_notification_text">The take keeps recording while the keyboard is hidden.</string>
@@ -207,7 +210,7 @@
     <string name="model_status_loading">Loading the on-device model… you can already record.</string>
     <!-- The reason comes last, after a separator, so the message reads
          correctly whether or not the engine's reason ends with punctuation. -->
-    <string name="model_status_failed">Recordings are still saved; you can pick another model or a server in Starling Mobile — %1$s</string>
+    <string name="model_status_failed">Recordings are still saved; you can pick another model in Starling Mobile — %1$s</string>
     <string name="model_status_driver_failed">The phone\'s GPU driver reported a failure (%1$s). Recordings are still saved; restarting the phone clears it.</string>
     <string name="keyboard_stream_interrupted">Live transcription stopped: %1$s. Transcribing after stop.</string>
     <!-- Staged dictation (#302) -->

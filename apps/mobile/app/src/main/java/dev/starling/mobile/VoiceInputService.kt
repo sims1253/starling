@@ -39,15 +39,14 @@ import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.ModelLifetime
-import dev.starling.mobile.network.StreamEvent
-import dev.starling.mobile.network.StreamSession
-import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.processing.InsertionBoundary
-import dev.starling.mobile.processing.ModeCatalog
 import dev.starling.mobile.processing.Mode
+import dev.starling.mobile.processing.ModeCatalog
 import dev.starling.mobile.processing.RegionKind
 import dev.starling.mobile.processing.StagedTake
 import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.transcription.StreamEvent
+import dev.starling.mobile.transcription.StreamSession
 import dev.starling.mobile.ui.BoundaryDelivery
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
@@ -56,14 +55,14 @@ import dev.starling.mobile.ui.InputTargetGuard
  * Lightweight voice keyboard. Two text paths exist, both guarded by the
  * editor target the take is bound to:
  *
- * - **Live streaming** (on-device engine or Starling server): while
+ * - **Live transcription** (the on-device engine): while
  *   recording, growing partial transcripts are shown through
  *   `setComposingText`, the Android dictation idiom — composing text is
  *   ephemeral, replaces itself with each partial, and is removed when the
- *   stream fails. The single `commitText` happens only when the final
+ *   live session fails. The single `commitText` happens only when the final
  *   transcript arrives after Stop.
- * - **Batch transcription** (fallback after any streaming failure, or an
- *   OpenAI-shaped endpoint): no asynchronous insertion at all; the
+ * - **Batch transcription** (fallback after any live failure, or no
+ *   model installed): no asynchronous insertion at all; the
  *   transcript is shown first and `commitText` is a separate, explicit user
  *   action on the Insert button.
  *
@@ -365,12 +364,11 @@ class VoiceInputService : InputMethodService() {
             statusView?.setText(R.string.recording_storage_error)
             return
         }
-        // The live stream is an observer of the capture; null means this
-        // configuration records in the plain batch mode.
-        val config = application.backendSettings.load()
+        // The live stream is an observer of the capture; null means no
+        // model is installed and the take records in the plain batch mode.
         var session: StreamSession? = null
         val savedAudio = application.recordings.partialFile(recording)
-        session = application.transcription.beginStreaming(config, savedAudio) { event ->
+        session = application.transcription.beginStreaming(savedAudio) { event ->
             // Events from a superseded or stopped take must not touch the
             // state of the take that replaced it.
             val current = take
@@ -425,7 +423,7 @@ class VoiceInputService : InputMethodService() {
                 take?.staged != null -> R.string.staging_drafting
                 session == null -> R.string.keyboard_recording
                 // Audio is already being saved; live text follows the load.
-                application.isOnDeviceModelLoading(config) -> R.string.keyboard_recording_loading
+                application.isOnDeviceModelLoading() -> R.string.keyboard_recording_loading
                 else -> R.string.keyboard_streaming
             },
         )
@@ -466,15 +464,11 @@ class VoiceInputService : InputMethodService() {
     /** Shows where the on-device model stands; hidden when it is ready or unused. */
     private fun renderModelState(state: ModelLifetime.State) {
         val view = modelStatusView ?: return
-        val text = if (application.backendSettings.load().engine != TranscriptionEngine.ON_DEVICE) {
-            null
-        } else {
-            when (state) {
-                is ModelLifetime.State.Loading -> getString(R.string.model_status_loading)
-                is ModelLifetime.State.Failed -> getString(R.string.model_status_failed, state.reason)
-                is ModelLifetime.State.DriverFailed -> getString(R.string.model_status_driver_failed, state.reason)
-                is ModelLifetime.State.Ready, ModelLifetime.State.Unloaded -> null
-            }
+        val text = when (state) {
+            is ModelLifetime.State.Loading -> getString(R.string.model_status_loading)
+            is ModelLifetime.State.Failed -> getString(R.string.model_status_failed, state.reason)
+            is ModelLifetime.State.DriverFailed -> getString(R.string.model_status_driver_failed, state.reason)
+            is ModelLifetime.State.Ready, ModelLifetime.State.Unloaded -> null
         }
         view.text = text
         view.visibility = if (text == null) View.GONE else View.VISIBLE
@@ -615,7 +609,7 @@ class VoiceInputService : InputMethodService() {
         val recording = current.recording
         when (result) {
             is CaptureResult.Completed -> {
-                // The WAV is finalized and durable before any network use.
+                // The WAV is finalized and durable before it is transcribed.
                 val finalized = runCatching {
                     application.recordings.commitAudio(recording, result.durationSeconds)
                 }.getOrElse {
@@ -633,18 +627,17 @@ class VoiceInputService : InputMethodService() {
                         },
                     )
                 }
-                val config = application.backendSettings.load()
                 val settled: (Recording) -> Unit = { completed -> onTranscriptionSettled(current, completed) }
                 if (session != null) {
-                    // Commit the live stream; the coordinator falls back to
-                    // the batch upload of the same saved WAV on any failure.
-                    application.transcription.finishStreaming(session, finalized.id, config, settled)
+                    // Finish the live stream; the coordinator falls back to
+                    // transcribing the same saved WAV on any failure.
+                    application.transcription.finishStreaming(session, finalized.id, settled)
                 } else {
-                    application.transcription.transcribe(finalized.id, config, settled)
+                    application.transcription.transcribe(finalized.id, callback = settled)
                 }
             }
             is CaptureResult.Failed -> {
-                // Nothing will be transcribed; drop the server session and
+                // Nothing will be transcribed; drop the live session and
                 // any composing region the live stream left in the editor.
                 session?.close()
                 discardOrFail(recording, current.sensitive, result.message)

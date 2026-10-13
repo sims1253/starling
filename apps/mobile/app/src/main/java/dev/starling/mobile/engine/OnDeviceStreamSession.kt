@@ -1,8 +1,8 @@
 package dev.starling.mobile.engine
 
-import dev.starling.mobile.network.CommitOutcome
-import dev.starling.mobile.network.StreamEvent
-import dev.starling.mobile.network.StreamSession
+import dev.starling.mobile.transcription.CommitOutcome
+import dev.starling.mobile.transcription.StreamEvent
+import dev.starling.mobile.transcription.StreamSession
 import java.io.Closeable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -29,7 +29,7 @@ import kotlin.concurrent.withLock
  * recording's saved WAV, which [backlog] opens for the worker to read back.
  * Without a [backlog] the bound interrupts the stream as before.
  *
- * As with the server stream, the saved WAV stays the source of truth: any
+ * The saved WAV stays the source of truth: any
  * engine failure interrupts the stream, and [finish] answers
  * [CommitOutcome.Fallback] so the batch path transcribes the WAV.
  *

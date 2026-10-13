@@ -196,8 +196,15 @@ class OnDeviceEngineImportTest {
         val directory = tempDir()
         try {
             val engine = OnDeviceEngine(directory)
-            val staleUnique = File(directory, "parakeet.gguf.6f1c9af2.importing").apply { writeBytes(byteArrayOf(1)) }
-            val staleLegacy = File(directory, "parakeet.gguf.importing").apply { writeBytes(byteArrayOf(2)) }
+            val hourAgo = System.currentTimeMillis() - 61 * 60 * 1000
+            val staleUnique = File(directory, "parakeet.gguf.6f1c9af2.importing").apply {
+                writeBytes(byteArrayOf(1))
+                setLastModified(hourAgo)
+            }
+            val staleLegacy = File(directory, "parakeet.gguf.importing").apply {
+                writeBytes(byteArrayOf(2))
+                setLastModified(hourAgo)
+            }
 
             val result = engine.importModel("XXXX-not-a-gguf".toByteArray().inputStream())
 
@@ -209,6 +216,247 @@ class OnDeviceEngineImportTest {
                 emptyList<File>(),
                 directory.listFiles { f -> f.name.endsWith(".importing") }!!.toList(),
             )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun aRecentStagingFileOfAnotherBuildSharingTheFolderIsKept() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val inFlight = File(directory, "parakeet.gguf.0a1b2c3d.importing").apply { writeBytes(byteArrayOf(1)) }
+
+            engine.importModel("XXXX-not-a-gguf".toByteArray().inputStream())
+
+            assertTrue("another build's import in progress must survive the sweep", inFlight.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    // ---- shared model folder (ModelStorage) ------------------------------
+
+    @Test
+    fun theModelFolderIsLookedUpPerCallAndTheActiveMarkerStaysWithTheInstall() {
+        val privateDir = tempDir()
+        val sharedDir = tempDir()
+        try {
+            var current = privateDir
+            val engine = OnDeviceEngine({ current }, privateDir)
+            sparseModelFile(privateDir, "a.gguf", parakeetPayload())
+            sparseModelFile(sharedDir, "b.gguf", parakeetPayload())
+            sparseModelFile(sharedDir, "c.gguf", parakeetPayload())
+            assertEquals(listOf("a.gguf"), engine.installedModels().map { it.name })
+
+            current = sharedDir
+            assertTrue(engine.selectModel("c.gguf"))
+
+            // a.gguf is not moved yet, so it stays installed beside the shared ones.
+            assertEquals(listOf("a.gguf", "b.gguf", "c.gguf"), engine.installedModels().map { it.name })
+            assertEquals("c.gguf", engine.activeModelName())
+            assertTrue("the marker is the install's own", File(privateDir, "active-model").isFile)
+            assertFalse("another build sharing the folder keeps its choice", File(sharedDir, "active-model").exists())
+        } finally {
+            privateDir.deleteRecursively()
+            sharedDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun adoptModelsMovesPrivateModelsIntoTheSharedFolder() {
+        val privateDir = tempDir()
+        val sharedDir = tempDir()
+        try {
+            val engine = OnDeviceEngine({ sharedDir }, privateDir)
+            val payload = parakeetPayload()
+            sparseModelFile(privateDir, "mine.gguf", payload)
+            // The same download already there (another build fetched it): not copied again.
+            sparseModelFile(privateDir, "same.gguf", payload)
+            sparseModelFile(sharedDir, "same.gguf", payload)
+            // A different file under a taken name gets a numbered one.
+            sparseModelFile(privateDir, "clash.gguf", payload, ModelFiles.MIN_MODEL_BYTES + 1)
+            sparseModelFile(sharedDir, "clash.gguf", payload)
+            File(privateDir, "active-model").writeText("mine.gguf")
+
+            assertEquals(OnDeviceEngine.Adoption(moved = 3, remaining = 0), engine.adoptModels(privateDir))
+
+            assertEquals(
+                listOf("clash-2.gguf", "clash.gguf", "mine.gguf", "same.gguf"),
+                engine.installedModels().map { it.name },
+            )
+            assertEquals(ModelFiles.MIN_MODEL_BYTES + 1, File(sharedDir, "clash-2.gguf").length())
+            assertTrue(payload.contentEquals(prefix(File(sharedDir, "mine.gguf"), payload.size)))
+            assertTrue(privateDir.listFiles()!!.none { it.name.endsWith(".gguf") })
+            assertTrue(sharedDir.listFiles()!!.none { it.name.endsWith(".importing") })
+            assertEquals("the active model stays active", "mine.gguf", engine.activeModelName())
+            assertEquals(OnDeviceEngine.Adoption(0, 0), engine.adoptModels(sharedDir))
+        } finally {
+            privateDir.deleteRecursively()
+            sharedDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun adoptModelsKeepsASameSizedModelWithOtherContentsAndTheActiveChoiceFollowsIt() {
+        val privateDir = tempDir()
+        val sharedDir = tempDir()
+        try {
+            val engine = OnDeviceEngine({ sharedDir }, privateDir)
+            // Same name and size, different weights (two builds imported different files).
+            sparseModelFile(privateDir, "model.gguf", parakeetPayload())
+            sparseModelFile(sharedDir, "model.gguf", parakeetPayload() + byteArrayOf(1))
+            File(privateDir, "active-model").writeText("model.gguf")
+
+            assertEquals(OnDeviceEngine.Adoption(moved = 1, remaining = 0), engine.adoptModels(privateDir))
+
+            assertEquals(listOf("model-2.gguf", "model.gguf"), engine.installedModels().map { it.name })
+            assertTrue(parakeetPayload().contentEquals(prefix(File(sharedDir, "model-2.gguf"), parakeetPayload().size)))
+            assertEquals("the moved model stays the active one", "model-2.gguf", engine.activeModelName())
+        } finally {
+            privateDir.deleteRecursively()
+            sharedDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun modelsNotMovedYetStayInstalled() {
+        val privateDir = tempDir()
+        val sharedDir = tempDir()
+        try {
+            val engine = OnDeviceEngine({ sharedDir }, privateDir)
+            sparseModelFile(privateDir, "left.gguf", parakeetPayload())
+            sparseModelFile(privateDir, "both.gguf", parakeetPayload())
+            sparseModelFile(sharedDir, "both.gguf", parakeetPayload())
+            File(privateDir, "active-model").writeText("left.gguf")
+
+            assertEquals(listOf("both.gguf", "left.gguf"), engine.installedModels().map { it.name })
+            assertEquals("left.gguf", engine.activeModelName())
+            assertTrue(engine.deleteModel("left.gguf"))
+            assertFalse(File(privateDir, "left.gguf").exists())
+        } finally {
+            privateDir.deleteRecursively()
+            sharedDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun deletingASharedModelDoesNotHandItsChoiceToAnUnmovedNamesake() {
+        val privateDir = tempDir()
+        val sharedDir = tempDir()
+        try {
+            val engine = OnDeviceEngine({ sharedDir }, privateDir)
+            sparseModelFile(privateDir, "model.gguf", parakeetPayload())
+            sparseModelFile(sharedDir, "model.gguf", parakeetPayload() + byteArrayOf(1))
+            sparseModelFile(sharedDir, "other.gguf", parakeetPayload())
+            assertTrue(engine.selectModel("model.gguf"))
+
+            assertTrue(engine.deleteModel("model.gguf"))
+
+            assertFalse(File(sharedDir, "model.gguf").exists())
+            assertTrue("the unmoved namesake is a model of its own", File(privateDir, "model.gguf").exists())
+            assertFalse("the deleted model's choice is dropped", File(privateDir, "active-model").exists())
+        } finally {
+            privateDir.deleteRecursively()
+            sharedDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun aCompleteDownloadOlderThanThePartialSweepIsStillAdopted() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val downloaded = sparseModelFile(directory, "download-0123456789abcdef.local.part", parakeetPayload()).apply {
+                setLastModified(System.currentTimeMillis() - 8L * 24 * 60 * 60 * 1000)
+            }
+
+            val result = engine.adoptDownloaded(downloaded, "model.gguf")
+
+            assertTrue("$result", result is OnDeviceEngine.ImportResult.Imported)
+            assertTrue(File(directory, "model.gguf").isFile)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun twoBuildsImportingTheSameNameIntoASharedFolderKeepBothModels() {
+        val sharedDir = tempDir()
+        val ownA = tempDir()
+        val ownB = tempDir()
+        try {
+            val buildA = OnDeviceEngine({ sharedDir }, ownA)
+            val buildB = OnDeviceEngine({ sharedDir }, ownB)
+            // A slow promotion widens the window between choosing a free name and taking it.
+            val slow: (File, File) -> Boolean = { staged, target ->
+                Thread.sleep(200)
+                buildA.promoteByMove(staged, target)
+            }
+            val payload = { pad: Int ->
+                val file = sparseModelFile(tempDir(), "src.gguf", parakeetPayload(), ModelFiles.MIN_MODEL_BYTES + pad)
+                file.inputStream()
+            }
+            val results = arrayOfNulls<OnDeviceEngine.ImportResult>(2)
+            val threads = listOf(
+                Thread { results[0] = buildA.importModel(payload(1), "same.gguf", slow) },
+                Thread { results[1] = buildB.importModel(payload(2), "same.gguf", slow) },
+            )
+            threads.forEach(Thread::start)
+            threads.forEach(Thread::join)
+
+            assertTrue(results.all { it is OnDeviceEngine.ImportResult.Imported })
+            assertEquals(
+                listOf("same-2.gguf", "same.gguf"),
+                sharedDir.listFiles { f -> f.name.endsWith(".gguf") }!!.map { it.name }.sorted(),
+            )
+            assertEquals(
+                setOf(ModelFiles.MIN_MODEL_BYTES + 1, ModelFiles.MIN_MODEL_BYTES + 2),
+                sharedDir.listFiles { f -> f.name.endsWith(".gguf") }!!.map { it.length() }.toSet(),
+            )
+        } finally {
+            sharedDir.deleteRecursively()
+            ownA.deleteRecursively()
+            ownB.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun downloadPartialsBelongToTheirInstallAndAPausedPrivateOneResumesWhereItIs() {
+        val privateDir = tempDir()
+        val sharedDir = tempDir()
+        try {
+            val spec = ModelCatalog.RECOMMENDED_PARAKEET
+            val debug = OnDeviceEngine({ sharedDir }, privateDir, partialTag = "dev.starling.mobile.debug")
+            val release = OnDeviceEngine({ sharedDir }, tempDir(), partialTag = "dev.starling.mobile")
+
+            assertEquals(sharedDir, debug.downloadFile(spec).parentFile)
+            assertTrue(debug.downloadFile(spec) != release.downloadFile(spec))
+
+            val paused = File(privateDir, debug.downloadFile(spec).name).apply { writeBytes(byteArrayOf(1)) }
+            assertEquals(paused, debug.downloadFile(spec))
+        } finally {
+            privateDir.deleteRecursively()
+            sharedDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun onlyLongAbandonedDownloadPartialsAreSwept() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val abandoned = File(directory, "download-0123456789abcdef.gone.build.part").apply {
+                writeBytes(byteArrayOf(1))
+                setLastModified(System.currentTimeMillis() - 8L * 24 * 60 * 60 * 1000)
+            }
+            val paused = File(directory, "download-fedcba9876543210.other.build.part").apply { writeBytes(byteArrayOf(1)) }
+
+            engine.importModel("XXXX-not-a-gguf".toByteArray().inputStream())
+
+            assertFalse(abandoned.exists())
+            assertTrue(paused.exists())
         } finally {
             directory.deleteRecursively()
         }

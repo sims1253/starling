@@ -19,8 +19,7 @@ import dev.starling.mobile.data.Recording
 import dev.starling.mobile.engine.StreamDebug
 import dev.starling.mobile.engine.StreamTrace
 import dev.starling.mobile.engine.WavPcm
-import dev.starling.mobile.network.InferenceResult
-import dev.starling.mobile.network.TranscriptionEngine
+import dev.starling.mobile.transcription.InferenceResult
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -76,7 +75,6 @@ class StreamBaselineDeviceTest {
         arguments.getString("model")?.let { assertTrue("$it is not installed", engine.selectModel(it)) }
         val model = engine.activeModelName()
         assertNotNull("install an on-device model first", model)
-        val config = app.backendSettings.load().copy(engine = TranscriptionEngine.ON_DEVICE)
 
         val traced = AtomicReference<StreamTrace?>()
         val traceDone = AtomicReference(CountDownLatch(1))
@@ -116,7 +114,7 @@ class StreamBaselineDeviceTest {
                 val thermalBefore = thermal()
                 val cpuBefore = cpuSeconds()
                 val wallBefore = System.nanoTime() / 1e9
-                val run = runTake(pcm, config)
+                val run = runTake(pcm)
                 val cpu = cpuSeconds() - cpuBefore
                 val wall = System.nanoTime() / 1e9 - wallBefore
                 assertTrue("no trace for $take", traceDone.get().await(30, TimeUnit.SECONDS))
@@ -159,10 +157,10 @@ class StreamBaselineDeviceTest {
     private class TakeRun(val recording: Recording, val stopPressed: Double, val delivered: Double)
 
     /** Records [pcm] once at real-time pace through the production capture and streaming path. */
-    private fun runTake(pcm: ByteArray, config: dev.starling.mobile.network.BackendConfig): TakeRun {
+    private fun runTake(pcm: ByteArray): TakeRun {
         val recording = app.recordings.create()
         val partial = app.recordings.partialFile(recording)
-        val session = app.transcription.beginStreaming(config, partial)
+        val session = app.transcription.beginStreaming(partial)
         assertNotNull("no on-device live session", session)
         session!!
         val source = PacedOnceSource(pcm)
@@ -185,7 +183,7 @@ class StreamBaselineDeviceTest {
         val result = AtomicReference<Recording>()
         var delivered = 0.0
         assertTrue(
-            app.transcription.finishStreaming(session, committed.id, config) {
+            app.transcription.finishStreaming(session, committed.id) {
                 delivered = System.nanoTime() / 1e9
                 result.set(it)
                 settled.countDown()

@@ -10,7 +10,6 @@ import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.engine.WavPcm
-import dev.starling.mobile.network.TranscriptionEngine
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -165,9 +164,8 @@ class DurableAudioDeviceTest {
     private fun transcribe(id: String, model: String?): Recording {
         val latch = CountDownLatch(1)
         var settled: Recording? = null
-        val config = app.backendSettings.load().copy(engine = TranscriptionEngine.ON_DEVICE, onDeviceModel = model)
         val started = System.nanoTime()
-        assertTrue(app.transcription.transcribe(id, config) { settled = it; latch.countDown() })
+        assertTrue(app.transcription.transcribe(id, model) { settled = it; latch.countDown() })
         assertTrue(latch.await(30, TimeUnit.MINUTES))
         Log.i(TAG, "transcription took ${(System.nanoTime() - started) / 1_000_000} ms")
         return settled!!

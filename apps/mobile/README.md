@@ -1,26 +1,22 @@
 # Starling Mobile (Android)
 
-Starling Mobile is a small native Android client for a Starling server that
-you run yourself. It records 16 kHz mono PCM16 microphone audio, writes a WAV
-file in app-private storage, and only then sends a multipart transcription
-request. The exact `text` returned by the server is stored as the raw
-transcript. Nothing in the client fixes numbering, removes filler words, or
-silently rewrites words such as `not`, `like`, or `auth`.
+Starling Mobile is a small native Android app that transcribes speech on
+the phone. It records 16 kHz mono PCM16 microphone audio, writes a WAV file
+in app-private storage, and only then transcribes it with the on-device
+engine. The exact text the model returns is stored as the raw transcript.
+Nothing in the app fixes numbering, removes filler words, or silently
+rewrites words such as `not`, `like`, or `auth`. Audio never leaves the
+phone; the network is used only to download models.
 
 While recording, the same 16 kHz chunks are also transcribed live: growing
 partial transcripts appear in the recorder, become composing text in the voice
 keyboard, and are delivered as partial results through the system recognizer,
-and Stop finalizes the stream for the final transcript. Live transcription
-runs either on this device (the on-device engine with an imported model) or
-over the native server's `WS /stream` protocol (the Starling protocol on a
-remote server, under the same trusted-host rules as the batch client). The
-OpenAI-compatible route has no streaming; it records exactly as before and
-transcribes after Stop.
+and Stop finalizes the live session for the final transcript.
 
 The same capture flow is available from the standalone app and the optional
 Starling Voice Input keyboard. The keyboard shows a transcript first; it only
 calls `InputConnection.commitText` after the user taps **Insert transcript** —
-except while a live stream is running, where growing partials are shown as
+except while a live session is running, where growing partials are shown as
 composing text (the Android dictation idiom) and the final text is committed
 once, on Stop, into the field the recording started in. The field's declared
 attributes (package, id, input type, hint) are compared in memory only, to
@@ -43,21 +39,18 @@ instead). The text read is used for this
 decision only; it is not stored or sent anywhere. An adjusted insertion is
 kept on the recording as a derived revision ("Inserted with boundary fixes"
 in Saved recordings); the transcript itself stays as recognized. An editor
-target generation and connection identity check prevents a late network
-response from being inserted into a field that has changed.
+target generation and connection identity check prevents a late
+transcription from being inserted into a field that has changed.
 
 ## Prerequisites
 
 - Android Studio Ladybug or newer, or JDK 17 with the Android SDK.
 - Android SDK platform 35 and build-tools 36.0.0 installed.
-- A running Starling native server (`starling-serve`). Native serving is the
-  supported portable path and requires a 16 kHz WAV.
 - A device or emulator with a microphone. Android 8.0 / API 26 is the minimum.
 
-No Python or GPU runtime is bundled. An optional **on-device engine**
-(experimental) embeds the repository's native engine (`libstarling_ggml`)
-for offline transcription. Tap **Download recommended
-model** to fetch `parakeet-tdt-0.6b-v3-q4pw-fullimx.gguf` (364 MB) from
+The app embeds the repository's native engine (`libstarling_ggml`). Tap
+**Download recommended model** to fetch
+`parakeet-tdt-0.6b-v3-q4pw-fullimx.gguf` (364 MB) from
 [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf),
 or **Download another model…** for the phone quants of Qwen3-ASR (0.6B,
 1.7B), ARK-ASR 0.6B, Granite Speech and MOSS-Transcribe (see the
@@ -73,19 +66,26 @@ own metadata (`engine/ModelKind.kt`); anything else, including the S1-mini
 text model, is refused at import. These LLM-decoder models are several
 times larger and slower than Parakeet on a phone, and their load is
 memory-gated with a larger working-set estimate (a KV cache on top of the
-weights). Then select **This device** under *Transcribe on*. The model stays in app-private storage and is loaded on first
-use; no server or network is needed. Server transcription remains the
-default. When a transcription fails — unreachable server or missing model —
-the failure is surfaced and the local recording remains available for retry.
+weights). The model is loaded on first use. When a transcription fails —
+missing model, load failure — the failure is surfaced and the local
+recording remains available for retry.
 Building the app additionally requires the Android NDK and CMake SDK packages.
 
+Models live in app-private storage until you tap **Keep models across
+reinstalls** and allow Android's *All files access* for Starling (Android
+11+). From then on they are kept in `Starling/models` on the phone's shared
+storage (`ModelStorage.kt`); the models already installed move there. That
+folder survives an uninstall, and every Starling build on the phone —
+release, experimental, debug — uses the same copy, so a reinstall finds its
+models without downloading them again. Which model is active stays per
+install. Deleting a model there removes it for every build.
+
 The arm64 engine is built for ARMv8.2 with the dot-product and FP16
-extensions (every mainstream phone core since 2018). On older CPUs the
-on-device option reports that it cannot run instead of loading the library;
-server transcription still works there. The engine uses the performance
-cores only, and the loaded model is released when Android reports memory
-pressure (it reloads on the next use); a load that clearly cannot fit in free
-memory is refused with an explanation.
+extensions (every mainstream phone core since 2018). On older CPUs the app
+reports that it cannot transcribe instead of loading the library. The
+engine uses the performance cores only, and the loaded model is released
+when Android reports memory pressure (it reloads on the next use); a load
+that clearly cannot fit in free memory is refused with an explanation.
 
 ## Install a release build
 
@@ -133,7 +133,8 @@ gh secret set STARLING_ANDROID_KEY_PASSWORD   # same as the store password for P
 
 Without these secrets, `v*` releases fail to build, and `android-v*` test
 builds are signed with a throwaway key per release, so installing a later one
-needs an uninstall first (which deletes the app's recordings and model).
+needs an uninstall first (which deletes the app's recordings, and its models
+unless they are kept in shared storage).
 
 Local release builds read the same four values from `STARLING_ANDROID_*`
 environment variables (`STARLING_ANDROID_KEYSTORE` is the keystore path);
@@ -149,36 +150,16 @@ From this directory:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Open **Starling Mobile**, grant microphone access, enter the server URL and
-its model slug, then tap **Save connection**. `starling-serve` binds to
-`127.0.0.1` by default; start it with `--host 0.0.0.0` (or the machine's LAN
-or Tailscale address) so the phone can reach it. The model slug is shown by
-the server's `/v1/models` response. The default transport
-is HTTPS. For a local development server using the documented default HTTP
-port, explicitly check **Allow HTTP for a trusted private LAN** and use an
-address such as:
+Debug builds install as **Starling Debug** (application id
+`dev.starling.mobile.debug`) beside a release or experimental build, so
+device tests never touch the app you use.
 
-```text
-http://127.0.0.1:8181       # emulator: http://10.0.2.2:8181
-http://192.168.1.20:8181   # physical device on the same LAN
-http://100.101.42.1:8181   # Tailscale/CGNAT VPN overlay
-```
-
-The HTTP setting accepts only loopback, RFC1918 private, link-local, CGNAT
-(`100.64.0.0/10`, as assigned by Tailscale-style VPN overlays), or `.local`
-hosts. Remote HTTP URLs and credentials embedded in URLs are rejected.
-The Android network policy is configured for this explicit private-LAN opt-in;
-HTTPS remains the default and is recommended whenever available. Existing
-Starling deployments have no authentication layer, so expose a server through
-an authenticated reverse proxy when a network boundary matters. This client
-does not persist credentials or bearer tokens.
-
-Recordings are retained in the app's private files directory. Each item keeps
-its WAV, state, retry count, exact raw transcript, its provenance (streamed
-live or batch-uploaded), and any transport error. Automatic bounded retries
-cover transient HTTP/server failures; **Retry** is also available from the
-recording list. Deleting an item requires an explicit confirmation and removes
-its WAV and transcript from this app.
+Open **Starling Mobile**, grant microphone access, and download or import a
+model. Recordings are retained in the app's private files directory. Each
+item keeps its WAV, state, exact raw transcript, its provenance (streamed
+live or transcribed after Stop), and any error. **Retry** is available from
+the recording list, with any installed model. Deleting an item requires an
+explicit confirmation and removes its WAV and transcript from this app.
 
 To enable the keyboard, tap **Enable Starling keyboard**, enable Starling Voice
 Input in Android settings, then select it from the keyboard switcher. The
@@ -251,19 +232,18 @@ desktop's Rust ports; so does the insertion-boundary port
 (`processing/InsertionBoundary.kt`). The draft lives in memory: the raw recording is in
 Saved recordings as always, but edits are lost if Android kills the keyboard.
 
-### Live streaming and its fallback
+### Live transcription and its fallback
 
-The WAV written during capture stays the source of truth: the stream is an
-observer of the same chunks, never a gate on them. The save still completes
-before any network use — on Stop the WAV is finalized and committed first,
-and only then is the stream committed for its final transcript. If the socket
-fails at any point (connect, mid-stream, at commit, or the server's 60 s live
-buffer cap fires), the stream is dropped, the interruption is shown, and the
-already-saved WAV is transcribed through the ordinary batch upload path with
-its normal retries. A streaming failure therefore loses nothing: the
-recording, retry, and failure story is indistinguishable from the
-non-streaming flow. In the voice keyboard a failed stream removes its
-composing text and falls back to the explicit **Insert transcript** flow.
+The WAV written during capture stays the source of truth: the live session
+is an observer of the same chunks, never a gate on them. On Stop the WAV is
+finalized and committed first, and only then is the session finished for its
+final transcript. If it fails at any point (the model cannot load, a window
+fails, or the engine falls too far behind the recording), the session is
+dropped, the interruption is shown, and the already-saved WAV is transcribed
+after Stop instead. A live failure therefore loses nothing: the recording,
+retry, and failure story is indistinguishable from the non-live flow. In the
+voice keyboard a failed session removes its composing text and falls back to
+the explicit **Insert transcript** flow.
 
 ### Voice input and Android settings
 
@@ -276,10 +256,10 @@ some contexts, but the Pixel **Default digital assistant app** screen is a
 different setting and does not list Starling. Enable **Starling Voice Input**
 as a keyboard for dictation in text fields. Closed keyboards such as Gboard
 or SwiftKey keep their bundled engines and cannot delegate to a custom
-recognizer. When the configuration supports streaming, growing partials are
-delivered through the platform's `partialResults` callback while you speak;
-the final result is still delivered once, after the stream commits or the
-batch transcription of the saved WAV completes. Every dictation stays visible
+recognizer. Growing partials are delivered through the platform's
+`partialResults` callback while you speak; the final result is still
+delivered once, after the live session finishes or the transcription of the
+saved WAV completes. Every dictation stays visible
 in Saved recordings, including failed transcriptions, so it can be retried or
 deleted there.
 
@@ -290,27 +270,13 @@ once, shows live partials, and returns the verbatim transcript when you tap
 **Done**. **Cancel** keeps the audio in Saved recordings without transcribing
 it.
 
-## API compatibility
-
-Batch transcription sends the multipart fields `file`, `model`, and
-`response_format=json` to `/v1/audio/transcriptions`. The model field is
-required. Successful JSON responses must contain a `text` string. Live
-dictation uses Starling's `WS /stream` and falls back to batch transcription
-if the stream fails. No normalization endpoint is called, so the returned
-transcript remains the source of truth.
-
-Set the endpoint to a server root, or enter the exact route. A server root
-gets `/v1/audio/transcriptions` appended; a root ending in `/v1` gets
-`/audio/transcriptions` appended.
-
 ## Scope and limitations
 
 This directory contains the Android app. The sibling standalone iOS recorder is
 at `../ios`, and the desktop client is at `../desktop`. The
 Android app does not provide an iOS keyboard extension; its system-wide voice
 keyboard is Android-specific. Push-to-talk hardware integration remains a
-future extension. Server live streaming follows the
-`WS /stream` contract in `../../docs/native-serving.md` and requires a native
-Starling server; on-device live transcription uses the same window geometry
-(12 s windows, 3 s overlap, word stitching) with partials about every second. The app does not ship model weights or
+future extension. Live transcription uses the same window geometry as the
+native server's `WS /stream` (12 s windows, 3 s overlap, word stitching)
+with partials about every second. The app does not ship model weights or
 third-party/copyrighted application code.

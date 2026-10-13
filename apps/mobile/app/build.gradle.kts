@@ -218,9 +218,8 @@ android {
 
 dependencies {
     implementation("androidx.core:core:1.19.1")
-    // WebSocket client for the /stream live-dictation protocol; the batch
-    // upload path stays on HttpURLConnection. Keep OkHttp and MockWebServer
-    // on the same version so tests exercise one implementation.
+    // HTTP client for model downloads. Keep OkHttp and MockWebServer on the
+    // same version so tests exercise one implementation.
     implementation("com.squareup.okhttp3:okhttp:5.5.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20260814")

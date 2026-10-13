@@ -2,11 +2,9 @@ package dev.starling.mobile.engine
 
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.RecordingStatus
-import dev.starling.mobile.network.BackendConfig
-import dev.starling.mobile.network.InferenceResult
-import dev.starling.mobile.network.TranscriptionEngine
-import dev.starling.mobile.network.transcribeStoredAudio
 import dev.starling.mobile.storage.RecordingStore
+import dev.starling.mobile.transcription.InferenceResult
+import dev.starling.mobile.transcription.transcribeStoredAudio
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -325,7 +323,7 @@ class BoundedTranscriptionTest {
             ),
         )
 
-        val result = backend.transcribe(audio, BackendConfig("", false, engine = TranscriptionEngine.ON_DEVICE))
+        val result = backend.transcribe(audio)
 
         result as InferenceResult.Failure
         assertTrue(result.retryable)

@@ -34,6 +34,9 @@ class ModelDownloader(private val client: OkHttpClient = defaultClient()) {
     }
 
     @Volatile private var cancelled = false
+
+    /** Whether [cancel] was called since the current download started. */
+    val isCancelled: Boolean get() = cancelled
     @Volatile private var call: Call? = null
 
     fun cancel() {
@@ -67,9 +70,10 @@ class ModelDownloader(private val client: OkHttpClient = defaultClient()) {
             return Result.Failed("The server sent a file of the wrong size.")
         }
         progress(spec.sizeBytes, spec.sizeBytes, true)
-        val digest = runCatching { sha256(partial) }.getOrElse {
+        // A pause during the checksum keeps the complete file for the next try.
+        val digest = runCatching { sha256(partial) { cancelled } }.getOrElse {
             return Result.Failed("The download could not be read back: ${it.message}")
-        }
+        } ?: return Result.Cancelled
         if (!digest.equals(spec.sha256, ignoreCase = true)) {
             partial.delete()
             return Result.Failed("The download was corrupted (checksum mismatch); it was discarded.")
@@ -165,11 +169,13 @@ class ModelDownloader(private val client: OkHttpClient = defaultClient()) {
         internal fun rangeStart(header: String?): Long =
             header?.removePrefix("bytes ")?.substringBefore('-')?.trim()?.toLongOrNull() ?: -1L
 
-        internal fun sha256(file: File): String {
+        /** The file's SHA-256, or null once [cancelled] says so. */
+        internal fun sha256(file: File, cancelled: () -> Boolean = { false }): String? {
             val md = MessageDigest.getInstance("SHA-256")
             FileInputStream(file).use { input ->
                 val buffer = ByteArray(BUFFER_BYTES)
                 while (true) {
+                    if (cancelled()) return null
                     val n = input.read(buffer)
                     if (n < 0) break
                     md.update(buffer, 0, n)

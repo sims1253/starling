@@ -16,16 +16,15 @@ import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
-import dev.starling.mobile.network.BackendConfig
-import dev.starling.mobile.network.StreamEvent
-import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.transcription.StreamEvent
+import dev.starling.mobile.transcription.StreamSession
 
 /**
  * The `ACTION_RECOGNIZE_SPEECH` popup (E22): apps that ask the system for
  * speech input with `startActivityForResult` get a small Starling dialog
- * that starts listening at once, shows live partials when the configuration
- * streams (on-device or a Starling server), and returns the verbatim final
+ * that starts listening at once, shows live partials from the on-device
+ * model, and returns the verbatim final
  * transcript as the single `EXTRA_RESULTS` entry when the user taps Done.
  *
  * The capture follows the same durable-first rules as the rest of the app:
@@ -38,7 +37,7 @@ import dev.starling.mobile.storage.DiskLevel
  * (bounded, since any app can start this exported activity); EXTRA_LANGUAGE,
  * EXTRA_LANGUAGE_MODEL, EXTRA_MAX_RESULTS and EXTRA_PARTIAL_RESULTS are not
  * honored. The result is always the single verbatim final transcript, and
- * the language is whatever the configured model detects.
+ * the language is whatever the active model detects.
  *
  * Threading: every method here runs on the main thread (capture stop
  * callbacks and TranscriptionCoordinator callbacks are delivered there), so
@@ -69,9 +68,6 @@ class RecognizeSpeechActivity : Activity() {
 
     /** Set once a result has been delivered; later outcomes are store-only. */
     private var resultDelivered = false
-
-    /** The configuration this capture started with; its outcome is classified by it. */
-    private var captureConfig: BackendConfig? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -162,11 +158,9 @@ class RecognizeSpeechActivity : Activity() {
             deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_storage_error)
             return
         }
-        val config = application.backendSettings.load()
-        captureConfig = config
         var session: StreamSession? = null
         val savedAudio = application.recordings.partialFile(recording)
-        session = application.transcription.beginStreaming(config, savedAudio) { event ->
+        session = application.transcription.beginStreaming(savedAudio) { event ->
             if (streamSession === session) onStreamEvent(event)
         }
         val error = capture.start(
@@ -191,7 +185,7 @@ class RecognizeSpeechActivity : Activity() {
         }
         activeRecording = recording
         streamSession = session
-        val loading = session != null && application.isOnDeviceModelLoading(config)
+        val loading = session != null && application.isOnDeviceModelLoading()
         diskNotice = application.diskWarning(disk)
         showListeningStatus(getString(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening))
     }
@@ -255,9 +249,8 @@ class RecognizeSpeechActivity : Activity() {
             deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_finalize_error)
             return
         }
-        val config = captureConfig ?: application.backendSettings.load()
         val settled: (Recording) -> Unit = { done ->
-            val outcome = RecognizeSpeechOutcome.settled(done, config.engine)
+            val outcome = RecognizeSpeechOutcome.settled(done)
             val message = when (outcome.resultCode) {
                 RESULT_OK -> null
                 RecognizerIntent.RESULT_NO_MATCH -> R.string.recognize_no_match
@@ -266,9 +259,9 @@ class RecognizeSpeechActivity : Activity() {
             deliver(outcome, message)
         }
         if (session != null) {
-            application.transcription.finishStreaming(session, finalized.id, config, settled)
+            application.transcription.finishStreaming(session, finalized.id, settled)
         } else {
-            application.transcription.transcribe(finalized.id, config, settled)
+            application.transcription.transcribe(finalized.id, callback = settled)
         }
     }
 

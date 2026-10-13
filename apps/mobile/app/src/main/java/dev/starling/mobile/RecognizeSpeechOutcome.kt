@@ -5,7 +5,6 @@ import android.speech.RecognizerIntent
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
-import dev.starling.mobile.network.TranscriptionEngine
 
 /**
  * Maps [RecognizeSpeechActivity] outcomes onto the `ACTION_RECOGNIZE_SPEECH`
@@ -18,18 +17,14 @@ object RecognizeSpeechOutcome {
     data class Outcome(val resultCode: Int, val transcript: String? = null)
 
     /** A settled transcription. Failures report the class the caller can act on. */
-    fun settled(completed: Recording, engine: TranscriptionEngine): Outcome {
+    fun settled(completed: Recording): Outcome {
         val text = completed.rawTranscript
         return when {
             completed.status == RecordingStatus.TRANSCRIBED && text != null ->
                 if (text.isBlank()) Outcome(RecognizerIntent.RESULT_NO_MATCH) else Outcome(Activity.RESULT_OK, text)
             // A local engine problem (missing model, load failure) is the
-            // client's. Every failure on the server path is reported as
-            // RESULT_NETWORK_ERROR: the app has no finer server error model
-            // (the batch client retries transient failures itself), and the
-            // recording stays retryable in Starling Mobile either way.
-            engine == TranscriptionEngine.ON_DEVICE -> Outcome(RecognizerIntent.RESULT_CLIENT_ERROR)
-            else -> Outcome(RecognizerIntent.RESULT_NETWORK_ERROR)
+            // client's; the recording stays retryable in Starling Mobile.
+            else -> Outcome(RecognizerIntent.RESULT_CLIENT_ERROR)
         }
     }
 
