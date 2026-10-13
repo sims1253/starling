@@ -92,9 +92,9 @@ if command -v systemd-run >/dev/null; then
 fi
 META=$(flock "$LOCK" "${CMD[@]}" 2>"$WORK/export.log" | tail -1) || { tail -20 "$WORK/export.log" >&2; exit 1; }
 echo "$META"
-KEY=$(field key); IN=$(field in); OUT=$(field out)
+KEY=$(field key)
 [ "$(field model_hash)" = "$CKHASH" ] || { echo "export fingerprint changed under us" >&2; exit 1; }
 echo "== compile on the phone"
 PHONE_LOCK=(flock /tmp/starling-phone.lock)
 [ -n "${STARLING_PHONE_LOCK_HELD:-}" ] && PHONE_LOCK=()   # the caller holds it
-PY=$PY "${PHONE_LOCK[@]}" "$ROOT/scripts/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$CKHASH" "$KEY" "$IN" "$OUT" "$DIR" "$APP" "$T"
+PY=$PY "${PHONE_LOCK[@]}" "$ROOT/scripts/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$CKHASH" "$KEY" "$DIR" "$APP" "$T"

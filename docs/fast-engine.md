@@ -168,7 +168,10 @@ mDNS; `--wait S`), the installed Starling packages (release, `.debug`,
 `.experimental`), reads what each loaded model reported (below), and compiles
 every missing or stale Qwen3-ASR encoder with `npu_compile.sh HF_MODEL
 (--gguf PHONE_GGUF | --hash 0x…) [--app PKG,…]`: export from the HF checkpoint
-(downloaded on first use), compile with the phone's compiler, install into
+(downloaded on first use; refused unless its fingerprint is the app model's,
+so a fine-tune never gets the base model's encoder), compile with the phone's
+compiler (only the Qwen3-ASR 0.6B/1.7B encoder window; the phone-side helper
+checks the graph's key and its inputs and output itself), install into
 `files/npu` of a debuggable package (run-as) or the external files dir
 `Android/data/<pkg>/files/npu` of any other. The artifact is one encoder
 attention window (800 mel frames → 104 projector rows, fp16 weights, an
