@@ -3,7 +3,7 @@
 # Qwen3-ASR model the installed Starling app has loaded, on a Pixel (Tensor G5),
 # and install it into the app.
 #
-#   benchmarks/npu/npu_compile_all.sh [--all] [--app PKG] [--wait SECONDS] [--dry-run]
+#   scripts/npu/npu_compile_all.sh [--all] [--app PKG] [--wait SECONDS] [--dry-run]
 #
 # WARNING: the phone's on-device compiler can exhaust the phone's memory and
 # panic its kernel (the phone reboots). Only the Qwen3-ASR encoder, a graph
@@ -148,7 +148,7 @@ while read -r piece hash arch hd states pkgs; do
   if [ -z "$ck" ]; then echo "!! no checkpoint known for $piece ($arch, hd=$hd); skipped" >&2; fail=1; continue; fi
   echo "== $piece $hash ($ck, $states) -> $pkgs"
   "$PY" -I -c "import sys; from huggingface_hub import snapshot_download as d; d(sys.argv[1], allow_patterns=['*.json', '*.safetensors'])" "$ck" >/dev/null
-  PY=$PY "$ROOT/benchmarks/npu/npu_compile.sh" "$ck" --hash "$hash" --app "$pkgs" </dev/null || { echo "!! $piece $hash failed" >&2; fail=1; }
+  PY=$PY "$ROOT/scripts/npu/npu_compile.sh" "$ck" --hash "$hash" --app "$pkgs" </dev/null || { echo "!! $piece $hash failed" >&2; fail=1; }
 done <<<"$PLAN"
 echo "done. Restart the app (or reload the model) to pick the TPU files up."
 exit $fail

@@ -56,7 +56,7 @@ void report_piece(const std::string& piece, uint64_t model_hash, const std::stri
         std::lock_guard<std::mutex> lock(mu);
         if (logged.insert(piece + hash + st).second) {
             const std::string line = "TPU " + piece + " not used (" + st + "), the GPU runs it: " + message +
-                                     (state == PieceState::Stale ? " -- recompile via adb (benchmarks/npu/npu_compile_all.sh)"
+                                     (state == PieceState::Stale ? " -- recompile via adb (scripts/npu/npu_compile_all.sh)"
                                                                  : "");
             std::fprintf(stderr, "[npu] %s\n", line.c_str());
 #if defined(__ANDROID__)

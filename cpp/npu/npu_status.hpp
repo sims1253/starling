@@ -5,7 +5,7 @@
 // for older TPU firmware or by an older exporter) are logged once per process
 // (logcat tag "StarlingNpu" on Android, and stderr), and every state is
 // written to status-<piece>-<hash16>.txt in each existing STARLING_NPU_DIR
-// directory: benchmarks/npu/npu_compile_all.sh reads those files to compile
+// directory: scripts/npu/npu_compile_all.sh reads those files to compile
 // exactly what the loaded models need ("missing" / "stale").
 #pragma once
 

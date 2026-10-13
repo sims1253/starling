@@ -117,7 +117,7 @@ object NativeSupport {
 
     /**
      * Where the engine looks for Pixel TPU encoder artifacts (compiled over
-     * adb by benchmarks/npu/npu_compile.sh; the app only loads them):
+     * adb by scripts/npu/npu_compile.sh; the app only loads them):
      * colon-separated, first match wins. Null when there is nothing to set.
      */
     internal fun npuDirValue(npuDirs: List<File>): String? =

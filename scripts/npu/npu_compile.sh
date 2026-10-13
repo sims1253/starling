@@ -3,7 +3,7 @@
 # them where starling-bench and the app look for them. To do this for every
 # model the installed app has loaded, run npu_compile_all.sh instead.
 #
-#   benchmarks/npu/npu_compile.sh HF_MODEL (--gguf PHONE_GGUF | --hash 0xHASH)
+#   scripts/npu/npu_compile.sh HF_MODEL (--gguf PHONE_GGUF | --hash 0xHASH)
 #                                 [--app PKG[,PKG...]] [--dir DIR]
 # HF_MODEL: a Qwen3-ASR checkpoint. Only its audio encoder is built: it is the
 # one graph known to compile safely.
@@ -12,7 +12,7 @@
 # kernel (it rebooted twice on other graphs, see docs/fast-engine.md, Pixel
 # TPU). Save your work on the phone first; npu_compile_phone.sh refuses to
 # compile with less than 4 GB available or graphs above 640 MB.
-#   e.g. benchmarks/npu/npu_compile.sh Qwen/Qwen3-ASR-0.6B-hf \
+#   e.g. scripts/npu/npu_compile.sh Qwen/Qwen3-ASR-0.6B-hf \
 #            --gguf /data/local/tmp/starling/qwen3-asr-0.6b-q4e8.gguf --app dev.starling.mobile
 #
 # 1. Host: export the encoder graph from the HF checkpoint (export_encoder.py;
@@ -73,7 +73,7 @@ TYPE=$(cfg "c['model_type']")
   { echo "$MODEL ($TYPE): no TPU graphs for this model (supported: Qwen3-ASR)" >&2; exit 2; }
 TFL=$WORK/enc.tflite
 echo "== export $MODEL (encoder)"
-CMD=("$PY" -I "$ROOT/benchmarks/npu/export_encoder.py" "$MODEL" "$TFL")
+CMD=("$PY" -I "$ROOT/scripts/npu/export_encoder.py" "$MODEL" "$TFL")
 if command -v systemd-run >/dev/null; then
   CMD=(systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 "${CMD[@]}")
 fi
@@ -83,4 +83,4 @@ KEY=$(field key); IN=$(field in); OUT=$(field out)
 echo "== compile on the phone"
 PHONE_LOCK=(flock /tmp/starling-phone.lock)
 [ -n "${STARLING_PHONE_LOCK_HELD:-}" ] && PHONE_LOCK=()   # the caller holds it
-"${PHONE_LOCK[@]}" "$ROOT/benchmarks/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$KEY" "$IN" "$OUT" "$DIR" "$APP" "$T"
+"${PHONE_LOCK[@]}" "$ROOT/scripts/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$KEY" "$IN" "$OUT" "$DIR" "$APP" "$T"

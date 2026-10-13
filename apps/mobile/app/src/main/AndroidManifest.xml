@@ -34,7 +34,7 @@
         <!-- Pixel TPU runtime (a public vendor library on Tensor phones): the
              fast engine runs the Qwen3-ASR audio encoder on the TPU when an
              encoder artifact compiled for this phone is installed
-             (benchmarks/npu/npu_compile.sh); absent elsewhere. -->
+             (scripts/npu/npu_compile.sh); absent elsewhere. -->
         <uses-native-library
             android:name="libedgetpu_litert.so"
             android:required="false" />

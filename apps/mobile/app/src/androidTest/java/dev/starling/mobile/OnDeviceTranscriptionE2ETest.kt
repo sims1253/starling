@@ -71,7 +71,7 @@ class OnDeviceTranscriptionE2ETest {
         val model = InstrumentationRegistry.getArguments().getString("model")
         assumeTrue("set the model instrumentation argument to run", model != null)
         val context = instrumentation.targetContext
-        // Same TPU artifact directory as the app (benchmarks/npu/npu_compile.sh --app).
+        // Same TPU artifact directory as the app (scripts/npu/npu_compile.sh --app).
         val engine = OnDeviceEngine(File(context.filesDir, "e2e-models"), npuDirs = listOf(File(context.filesDir, "npu")))
         assumeTrue("$model is not in files/e2e-models", engine.installedModels().any { it.name == model })
         val wav = File(context.cacheDir, "e2e.wav")
