@@ -3,7 +3,8 @@
 # Qwen3-ASR model the installed Starling app has loaded, on a Pixel (Tensor G5),
 # and install it into the app.
 #
-#   scripts/npu/npu_compile_all.sh [--all] [--app PKG] [--wait SECONDS] [--dry-run]
+#   scripts/npu/npu_compile_all.sh [--gguf HOST_GGUF ...] [--models DIR ...]
+#                                  [--all] [--app PKG] [--wait SECONDS] [--dry-run]
 #
 # WARNING: the phone's on-device compiler can exhaust the phone's memory and
 # panic its kernel (the phone reboots). Only the Qwen3-ASR encoder, a graph
@@ -13,55 +14,68 @@
 #
 # How it knows what to build: when the app loads a model, the engine writes
 # status-<piece>-<model hash>.txt next to the artifacts it looks for (files/npu
-# of the app, and its external files dir), with the model's two fingerprints
-# (model hash: a digest of the GGUF's encoder tensors, naming the artifact;
-# identity: the checkpoint it was converted from) and state missing / stale
-# (an artifact compiled for older TPU firmware or by an older exporter) / ok /
-# error. So: load each model in the app once, then run this. It
+# of the app, and its external files dir), with the model hash (a digest of
+# the GGUF's encoder tensors, naming the artifact), the GGUF file it loaded
+# and state missing / stale (an artifact compiled for older TPU firmware or
+# by an older exporter) / ok / error. So: load each model in the app once,
+# then run this. It
 #   1. finds the phone: $ANDROID_SERIAL, else the single `adb devices` entry,
 #      else wireless debugging via mDNS (`adb mdns services`, avahi-browse)
 #      and `adb connect`; with --wait it keeps looking that long;
 #   2. finds the installed Starling packages (dev.starling.mobile and its
 #      .debug / .experimental variants; --app picks one);
 #   3. reads their status files (run-as for a debuggable package, the
-#      external files dir otherwise) and compiles every missing or stale
-#      Qwen3-ASR encoder (--all: also the ok ones) with npu_compile.sh, each
-#      into every package that asked for it.
-# The HF checkpoint is downloaded on first use (Qwen/Qwen3-ASR-0.6B-hf,
-# Qwen/Qwen3-ASR-1.7B-hf; weights and config only) and must be the app's
-# model: npu_compile.sh refuses a model whose identity is not the
-# checkpoint's (a fine-tune with the same shapes). Nothing is precompiled or
-# shipped: the phone's own compiler builds every artifact for its firmware,
-# and after a firmware update the app reports the files as stale until this
-# is rerun.
+#      external files dir otherwise) and, for every missing or stale
+#      Qwen3-ASR encoder (--all: also the ok ones), finds the GGUF with that
+#      model hash on this host and compiles it with npu_compile.sh into every
+#      package that asked for it.
+# The graph is exported from the very GGUF the app loads (its own encoder
+# weights), so the host needs that file, found by its model hash:
+#   * --gguf HOST_GGUF (repeatable): that file, if its hash is one the app
+#     asked for;
+#   * else the first GGUF with the hash under --models DIR (repeatable;
+#     default $STARLING_MODELS_DIR, else the repository's models/ directory,
+#     else that of the main checkout when this is a git worktree). Hashes are
+#     cached by path, size and mtime in ~/.cache/starling-npu;
+#   * else the file the status names, pulled from the phone (run-as for a
+#     debuggable package; otherwise only if the adb shell can read it);
+#   * else that model is refused: pass --gguf with the file the app loads.
+# Nothing is precompiled or shipped: the phone's own compiler builds every
+# artifact for its firmware, and after a firmware update the app reports the
+# files as stale until this is rerun.
 #
-# Env: PY (python with litert-torch, ai-edge-quantizer, transformers, torch,
-# huggingface_hub), NPU_TOOL (see npu_compile.sh).
+# Env: PY (python with gguf, litert-torch, ai-edge-quantizer, torch; xxhash
+# speeds up hashing), NPU_TOOL and STARLING_PHONE_LOCK_HELD (see
+# npu_compile.sh).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 PY=${PY:-python3}
-ALL=0; ONLY=""; WAIT=0; DRY=0
+ALL=0; ONLY=""; WAIT=0; DRY=0; GGUFS=(); MODELS=()
 while [ $# -gt 0 ]; do
   case $1 in
+    --gguf) GGUFS+=("$2"); shift ;;
+    --models) MODELS+=("$2"); shift ;;
     --all) ALL=1 ;;
     --app) ONLY=$2; shift ;;
     --wait) WAIT=$2; shift ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n 2,39p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,49p "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
   shift
 done
-
-# (piece, arch, LLM hidden size) -> the candidate HF checkpoint; npu_compile.sh
-# then checks its identity against the app's. Nothing else is compiled.
-checkpoint() {
-  case "$1:$2:$3" in
-    qwen3-asr-enc:qwen3:1024) echo Qwen/Qwen3-ASR-0.6B-hf ;;
-    qwen3-asr-enc:qwen3:2048) echo Qwen/Qwen3-ASR-1.7B-hf ;;
-    *) echo "" ;;
-  esac
-}
+for g in "${GGUFS[@]}"; do [ -f "$g" ] || { echo "--gguf $g: no such file" >&2; exit 2; }; done
+if [ ${#MODELS[@]} = 0 ]; then
+  if [ -n "${STARLING_MODELS_DIR:-}" ]; then MODELS=("$STARLING_MODELS_DIR")
+  elif [ -d "$ROOT/models" ]; then MODELS=("$ROOT/models")
+  elif common=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+       [ -d "$(dirname "$common")/models" ]; then MODELS=("$(dirname "$common")/models")
+  fi
+fi
+EXPORTER=$ROOT/scripts/npu/export_encoder.py
+# One argument quoted for the phone's shell.
+q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+same_hash() { "$PY" -I -c 'import sys; print(int(sys.argv[1], 16) == int(sys.argv[2], 16))' "$1" "$2" 2>/dev/null | grep -qx True; }
 
 # ---- 1. the phone ----
 online() { [ "$(adb -s "$1" get-state 2>/dev/null)" = device ]; }
@@ -100,8 +114,9 @@ PKGS=$(adb shell pm list packages dev.starling.mobile </dev/null | tr -d '\r' | 
 [ -n "$PKGS" ] || { echo "no Starling app installed${ONLY:+ ($ONLY)}" >&2; exit 1; }
 
 # ---- 3. what the app asked for ----
-STATUS=$(mktemp /tmp/npu-status.XXXXXX)
-trap 'rm -f "$STATUS"' EXIT
+WORK=$(mktemp -d /tmp/npu-compile-all.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+STATUS=$WORK/status
 for p in $PKGS; do
   if adb shell "run-as $p true" </dev/null >/dev/null 2>&1; then
     how="debuggable: files/npu via run-as"
@@ -112,7 +127,9 @@ for p in $PKGS; do
   adb shell "cat /sdcard/Android/data/$p/files/npu/status-*.txt 2>/dev/null" </dev/null | tr -d '\r' | sed "s/^piece=/pkg=$p\npiece=/" >>"$STATUS" || true
   echo "app: $p ($how)"
 done
-# One line per encoder and model hash: piece hash identity arch hd state packages
+touch "$STATUS"
+# One tab-separated line per encoder model hash:
+#   piece hash hd states packages [package gguf-on-the-phone]...
 PLAN=$("$PY" -I - "$STATUS" "$ALL" <<'EOF'
 import sys
 recs, cur = [], None
@@ -125,18 +142,21 @@ for line in open(sys.argv[1]):
         cur[k] = v
 want = {}
 for r in recs:
-    if r.get("piece") != "qwen3-asr-enc":
+    if r.get("piece") != "qwen3-asr-enc" or not r.get("hash"):
         continue                                  # the only piece built here
     m = dict(kv.split("=", 1) for kv in r.get("model", "").split() if "=" in kv)
     state = r.get("state", "")
     if state not in ("missing", "stale", "error") and not (sys.argv[2] == "1" and state == "ok"):
         continue
-    key = (r["piece"], r["hash"], r.get("identity", "?"), m.get("arch", "?"), m.get("hd", "?"))
-    want.setdefault(key, [set(), set()])
-    want[key][0].add(r["pkg"])
-    want[key][1].add(state)
-for (piece, h, ident, arch, hd), (pkgs, states) in sorted(want.items()):
-    print(piece, h, ident, arch, hd, "/".join(sorted(states)), ",".join(sorted(pkgs)))
+    w = want.setdefault((r["piece"], r["hash"].lower()), {"hd": m.get("hd", ""), "pkgs": set(), "states": set(),
+                                                          "src": {}})
+    w["pkgs"].add(r["pkg"])
+    w["states"].add(state)
+    if r.get("gguf") and "\t" not in r["gguf"]:
+        w["src"].setdefault(r["pkg"], r["gguf"])
+for (piece, h), w in sorted(want.items()):
+    src = [x for p, g in sorted(w["src"].items()) for x in (p, g)]
+    print("\t".join([piece, h, w["hd"] or "-", "/".join(sorted(w["states"])), ",".join(sorted(w["pkgs"]))] + src))
 EOF
 )
 if [ -z "$PLAN" ]; then
@@ -144,21 +164,76 @@ if [ -z "$PLAN" ]; then
   echo "(Load a Qwen3-ASR model in the app once so it reports what it needs, then rerun.)"
   exit 0
 fi
-echo "to compile:"; echo "$PLAN" | sed 's/^/  /'
+echo "to compile:"; echo "$PLAN" | cut -f1-5 | tr '\t' ' ' | sed 's/^/  /'
 [ $DRY = 1 ] && exit 0
 
+# ---- 4. the GGUF of each, on this host ----
+GIVEN=()   # "hash<TAB>path" of each --gguf
+for g in "${GGUFS[@]}"; do
+  h=$("$PY" -I "$EXPORTER" --model-hash "$g" | awk 'NR == 1 {print $1}') || { echo "!! --gguf $g: not a Qwen3-ASR GGUF" >&2; exit 2; }
+  GIVEN+=("$h"$'\t'"$g")
+done
+USED=()   # the GGUFs compiled
+PHONE_LOCK=(flock /tmp/starling-phone.lock)
+[ -n "${STARLING_PHONE_LOCK_HELD:-}" ] && PHONE_LOCK=()   # the caller holds it
+# pull HASH PKG PATH: the GGUF the app loaded, copied from the phone; prints
+# the local copy if its model hash is HASH.
+pull() {
+  local dest=$WORK/pulled-$1.gguf
+  if adb shell "run-as $2 true" </dev/null >/dev/null 2>&1; then
+    "${PHONE_LOCK[@]}" adb exec-out "run-as $2 cat $(q "$3")" </dev/null >"$dest" 2>/dev/null || true
+  else
+    "${PHONE_LOCK[@]}" adb exec-out "cat $(q "$3")" </dev/null >"$dest" 2>/dev/null || true
+  fi
+  if [ -s "$dest" ] && same_hash "$1" "$("$PY" -I "$EXPORTER" --model-hash "$dest" 2>/dev/null | awk '{print $1}')"; then
+    echo "$dest"
+  else
+    rm -f "$dest"
+    return 1
+  fi
+}
+# gguf_for HASH HD [PKG PATH]...: a host GGUF whose model hash is HASH.
+gguf_for() {
+  local want=$1 hd=$2 e f
+  shift 2
+  for e in "${GIVEN[@]}"; do
+    if same_hash "$want" "${e%%$'\t'*}"; then echo "${e#*$'\t'}"; return 0; fi
+  done
+  if [ ${#MODELS[@]} -gt 0 ]; then
+    local hdarg=()
+    [ "$hd" != - ] && hdarg=(--hd "$hd")
+    if f=$("$PY" -I "$EXPORTER" --find "$want" "${hdarg[@]}" "${MODELS[@]}"); then echo "$f"; return 0; fi
+  fi
+  while [ $# -ge 2 ]; do
+    echo "   not on this host; pulling $2 from $1" >&2
+    if f=$(pull "$want" "$1" "$2"); then echo "$f"; return 0; fi
+    echo "   could not pull it (or it has another model hash)" >&2
+    shift 2
+  done
+  return 1
+}
+
 fail=0
-while read -r piece hash ident arch hd states pkgs; do
-  ck=$(checkpoint "$piece" "$arch" "$hd")
-  if [ -z "$ck" ]; then echo "!! no checkpoint known for $piece ($arch, hd=$hd); skipped" >&2; fail=1; continue; fi
-  if [ "$ident" = "?" ]; then
-    echo "!! $piece $hash: no identity in its status file (written by an older app); reload the model and rerun" >&2
+while IFS=$'\t' read -r -a F; do
+  piece=${F[0]} hash=${F[1]} hd=${F[2]} states=${F[3]} pkgs=${F[4]}
+  echo "== $piece $hash ($states) -> $pkgs"
+  if ! gguf=$(gguf_for "$hash" "$hd" "${F[@]:5}"); then
+    echo "!! $piece $hash: no GGUF with this model hash on this host${MODELS[*]:+ (searched ${MODELS[*]})}" >&2
+    for ((i = 5; i + 1 < ${#F[@]}; i += 2)); do echo "   ${F[i]} loads ${F[i+1]}" >&2; done
+    echo "   pass --gguf HOST_GGUF with a copy of the file the app loads" >&2
     fail=1; continue
   fi
-  echo "== $piece $hash ($ck, $states) -> $pkgs"
-  "$PY" -I -c "import sys; from huggingface_hub import snapshot_download as d; d(sys.argv[1], allow_patterns=['*.json', '*.safetensors'])" "$ck" >/dev/null
-  PY=$PY "$ROOT/scripts/npu/npu_compile.sh" "$ck" --hash "$hash" --identity "$ident" --app "$pkgs" </dev/null ||
+  echo "   GGUF: $gguf"
+  USED+=("$gguf")
+  PY=$PY "$ROOT/scripts/npu/npu_compile.sh" "$gguf" --hash "$hash" --app "$pkgs" </dev/null ||
     { echo "!! $piece $hash failed" >&2; fail=1; }
 done <<<"$PLAN"
-echo "done. Restart the app (or reload the model) to pick the TPU files up."
+for e in "${GIVEN[@]}"; do
+  g=${e#*$'\t'}
+  printf '%s\n' "${USED[@]}" | grep -qxF "$g" ||
+    { echo "!! --gguf $g (model hash ${e%%$'\t'*}) is not a model the app asked for" >&2; fail=1; }
+done
+if [ $fail = 0 ]; then echo "done. Restart the app (or reload the model) to pick the TPU files up."
+else echo "done, with failures (!! above). Restart the app (or reload the model) to pick up what was built."
+fi
 exit $fail

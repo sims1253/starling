@@ -204,7 +204,7 @@ if(STARLING_GGML_TESTS)
           ${STARLING_REPO_ROOT}/cpp/serve)
     endif()
 
-    # The npu_fingerprint_test checks the Pixel TPU encoder fingerprints that
+    # The npu_fingerprint_test checks the Pixel TPU encoder model hash that
     # starling-npu-tool computes from a GGUF file (cpp/npu, Android-only in
     # the library, plain C++ + ggml here).
     if(test_name STREQUAL "npu_fingerprint_test")

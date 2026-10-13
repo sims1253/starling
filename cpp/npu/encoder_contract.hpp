@@ -9,18 +9,12 @@
 //    mask (0 valid, -1e4 padding) and output [1, tokens, out_dim] f32;
 //  * model_hash: the GGUF it was built for — a digest of every audio-encoder
 //    and projector tensor exactly as the GGUF stores it (name, type, shape
-//    and raw bytes, any quant; qwen3_encoder_digest), so an artifact never
-//    runs beside encoder weights that differ from the ones it was checked
-//    against, a weights-only fine-tune included;
+//    and raw bytes, any quant; qwen3_encoder_digest). The graph's weights are
+//    that GGUF's own encoder tensors (scripts/npu/export_encoder.py exports
+//    from the file and computes the same digest), so an artifact never runs
+//    beside encoder weights other than the ones it was built from, a
+//    weights-only fine-tune included;
 //  * vendor: the firmware's thrGetVendorApiVersion() it was compiled with.
-//
-// The checkpoint identity (qwen3_identity) is a second, cheap fingerprint:
-// FNV-1a 64 over the raw bytes of a few F32 tensors (biases and norms are F32
-// in every Starling Qwen3-ASR GGUF, widened exactly from the checkpoint, so
-// the HF checkpoint a GGUF was converted from has the same identity). The
-// compile scripts compare it with export_encoder.py's value of the checkpoint
-// they export; it cannot tell apart checkpoints that differ only in their
-// weight matrices (docs/fast-engine.md, Pixel TPU encoder).
 #pragma once
 
 #include <algorithm>
@@ -41,9 +35,10 @@ inline uint64_t fnv1a_update(uint64_t h, const void* data, size_t size) {
     return h;
 }
 
-// XXH64 (seed 0), the per-tensor hash of the encoder digest: hashes 8-byte
-// words, a few GB/s per core, where byte-wise FNV would make hashing a few
-// hundred MB of weights a visible part of the model load.
+// XXH64 (seed 0), the per-tensor hash of the encoder digest (export_encoder.py
+// has the same): hashes 8-byte words, a few GB/s per core, where byte-wise
+// FNV would make hashing a few hundred MB of weights a visible part of the
+// model load.
 inline uint64_t xxh64(const void* data, size_t len, uint64_t seed = 0) {
     constexpr uint64_t P1 = 0x9e3779b185ebca87ull, P2 = 0xc2b2ae3d27d4eb4full, P3 = 0x165667b19e3779f9ull,
                        P4 = 0x85ebca77c2b2ae63ull, P5 = 0x27d4eb2f165667c5ull;
@@ -82,11 +77,6 @@ inline uint64_t xxh64(const void* data, size_t len, uint64_t seed = 0) {
     h ^= h >> 32;
     return h;
 }
-
-// ---- checkpoint identity ----
-inline constexpr const char* kQwen3EncFingerprintTensors[] = {
-    "enc.conv1.bias", "enc.ln_post.weight", "enc.ln_post.bias", "proj.linear_2.bias", "enc.blk.0.attn_norm.weight",
-};
 
 // ---- encoder digest (the artifact's model_hash) ----
 // The tensors it covers: the audio encoder ("enc.") and the projector ("proj.").

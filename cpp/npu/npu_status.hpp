@@ -18,11 +18,11 @@ enum class PieceState { Ok, Missing, Stale, Error };
 
 // piece: "qwen3-asr-enc".
 // model_hash: the artifact's model hash (names the artifact and the status
-// file); identity: the checkpoint identity the compile script checks the HF
-// checkpoint against (encoder_contract.hpp).
-// model: what the compile script needs to pick the checkpoint, as
-// space-separated key=value pairs (e.g. "arch=qwen3 hd=1024").
-void report_piece(const std::string& piece, uint64_t model_hash, uint64_t identity, const std::string& model,
+// file); gguf: the GGUF file the engine loaded (where the compile script can
+// fetch it from, if the host has no copy).
+// model: what the compile script needs to narrow its search for that GGUF,
+// as space-separated key=value pairs (e.g. "arch=qwen3 hd=1024").
+void report_piece(const std::string& piece, uint64_t model_hash, const std::string& gguf, const std::string& model,
                   PieceState state, const std::string& message);
 
 // Whether this device has the TPU runtime, without loading it: the firmware

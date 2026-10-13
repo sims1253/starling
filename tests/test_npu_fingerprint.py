@@ -1,26 +1,64 @@
-"""The checkpoint identity of scripts/npu/export_encoder.py against the C++
-side (cpp/npu/encoder_contract.hpp): the compile scripts compare the two, so
-both must hash the same bytes the same way. cpp/tests/npu_fingerprint_test.cpp
-pins the same constant for a GGUF holding the same tensor values.
+"""The model hash of scripts/npu/export_encoder.py against the C++ side
+(cpp/npu/encoder_contract.hpp): the artifact is named by the hash the export
+computes from the GGUF it read, and the engine only uses an artifact whose
+hash it computes from the GGUF it loaded, so both must hash the same bytes
+the same way. cpp/tests/npu_fingerprint_test.cpp writes the same synthesized
+GGUFs with ggml and pins the same constants.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import struct
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+gguf = pytest.importorskip("gguf")
+
 EXPORTER = Path(__file__).resolve().parents[1] / "scripts" / "npu" / "export_encoder.py"
 
-# kIdentityVector in cpp/tests/npu_fingerprint_test.cpp.
-IDENTITY_VECTOR = "0xad085128de48605d"
+# kDigestVector / kDigestTweakedVector in cpp/tests/npu_fingerprint_test.cpp.
+DIGEST_VECTOR = "0xae909cf3a449d7f7"
+DIGEST_TWEAKED_VECTOR = "0x7de98079b43d9342"
 
 
 def _exporter():
     spec = importlib.util.spec_from_file_location("export_encoder", EXPORTER)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # stdlib-only at import; torch is imported by export()
+    spec.loader.exec_module(mod)  # numpy/gguf/xxhash at most at import; torch is imported by export()
     return mod
+
+
+def _fill(name: str, n: int) -> np.ndarray:
+    # write_model's byte pattern: byte i of a tensor is (i * 37 + 11 + strlen(name)) & 255.
+    return ((np.arange(n, dtype=np.int64) * 37 + 11 + len(name)) & 255).astype(np.uint8)
+
+
+def _write_model(path: Path, tweak: int) -> None:
+    """The GGUF of write_model() in cpp/tests/npu_fingerprint_test.cpp."""
+    w = gguf.GGUFWriter(str(path), "qwen3")
+    vectors = ["enc.conv1.bias", "enc.ln_post.weight", "enc.ln_post.bias", "proj.linear_2.bias",
+               "enc.blk.0.attn_norm.weight"]
+    for k, name in enumerate(vectors):
+        w.add_tensor(name, np.array([(16 * k + i) * 0.25 - 1.0 for i in range(4 + k)], np.float32))
+    q = _fill("enc.blk.0.attn_q.weight", 68)            # Q8_0, ne [32, 2]: 2 blocks of 34 bytes
+    if tweak == 1:
+        q[40] ^= 1
+    w.add_tensor("enc.blk.0.attn_q.weight", q.reshape(2, 34), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+    conv = _fill("enc.conv1.weight", 72)                 # BF16, ne [3, 3, 1, 4]
+    w.add_tensor("enc.conv1.weight", conv.reshape(4, 1, 3, 6), raw_dtype=gguf.GGMLQuantizationType.BF16)
+    llm = _fill("llm.blk.0.attn_q.weight", 32)          # F32, ne [4, 2]
+    if tweak == 2:
+        llm[3] ^= 1
+    w.add_tensor("llm.blk.0.attn_q.weight", llm.view(np.float32).reshape(2, 4))
+    w.add_tensor("audio.mel_filters", _fill("audio.mel_filters", 16).view(np.float32).reshape(2, 2))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
 
 
 def test_fnv1a64_is_the_standard_hash():
@@ -31,18 +69,107 @@ def test_fnv1a64_is_the_standard_hash():
     assert ee.fnv1a64(b"foobar") == 0x85944171F73967E8
 
 
-def test_identity_matches_the_cpp_vector():
-    ee = _exporter()
-    # Identity tensor k (FINGERPRINT_TENSORS order) holds 4 + k f32 values (16k + i) / 4 - 1.
-    values = {ck: [(16 * k + i) * 0.25 - 1.0 for i in range(4 + k)]
-              for k, (_, ck) in enumerate(ee.FINGERPRINT_TENSORS)}
-    got = ee.checkpoint_identity(lambda name: struct.pack(f"<{len(values[name])}f", *values[name]))
-    assert got == IDENTITY_VECTOR
+def _xxh_vectors():
+    v37 = bytes((i * 7 + 3) & 255 for i in range(37))
+    v1032 = bytes(range(256)) * 4 + b"starling"
+    # The same reference values as test_vectors() in npu_fingerprint_test.cpp (xxhsum -H1).
+    return [(b"", 0xEF46DB3751D8E999), (b"abc", 0x44BC2CF5AD770999), (v37, 0xE32EF63802F5A3FD),
+            (v1032, 0x89D35540496386B9)]
 
 
-def test_identity_tensors_match_the_cpp_list():
+def test_xxh64_matches_the_reference_vectors():
     ee = _exporter()
-    header = (EXPORTER.parents[2] / "cpp" / "npu" / "encoder_contract.hpp").read_text()
-    body = header.split("kQwen3EncFingerprintTensors[] = {", 1)[1].split("};", 1)[0]
-    cpp_names = [s.strip().strip('"') for s in body.replace("\n", " ").split(",") if s.strip()]
-    assert cpp_names == [g for g, _ in ee.FINGERPRINT_TENSORS]
+    for data, want in _xxh_vectors():
+        assert ee.xxh64_pure(data) == want
+        assert ee.xxh64(data) == want  # the xxhash package where installed
+
+
+def test_model_hash_matches_the_cpp_vectors(tmp_path, monkeypatch):
+    ee = _exporter()
+    paths = {}
+    for tweak in (0, 1, 2):
+        paths[tweak] = tmp_path / f"m{tweak}.gguf"
+        _write_model(paths[tweak], tweak)
+    for impl in (ee.xxh64, ee.xxh64_pure):
+        monkeypatch.setattr(ee, "xxh64", impl)
+        assert ee.model_hash(str(paths[0])) == DIGEST_VECTOR
+        assert ee.model_hash(str(paths[1])) == DIGEST_TWEAKED_VECTOR   # one weight byte: another hash
+        assert ee.model_hash(str(paths[2])) == DIGEST_VECTOR           # outside the encoder: the same
+
+
+def test_model_hash_needs_encoder_tensors(tmp_path):
+    ee = _exporter()
+    p = tmp_path / "llm-only.gguf"
+    w = gguf.GGUFWriter(str(p), "qwen3")
+    w.add_tensor("llm.embed.weight", np.zeros((2, 4), np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    with pytest.raises(ValueError, match="no audio-encoder tensors"):
+        ee.model_hash(str(p))
+    with pytest.raises(ValueError, match="not a GGUF"):
+        ee.model_hash(str(EXPORTER))
+
+
+def _write_qwen3_asr(path: Path, hd: int, byte: int = 0) -> None:
+    w = gguf.GGUFWriter(str(path), "qwen3")
+    w.add_uint32("qwen3.enc.hidden", 4)
+    w.add_uint32("qwen3.llm.hidden_size", hd)
+    w.add_array("tokenizer.ggml.tokens", ["a", "b", "c"])   # arrays are skipped, not parsed
+    a = np.arange(8, dtype=np.float32)
+    a.view(np.uint8)[0] ^= byte
+    w.add_tensor("enc.blk.0.attn_q.weight", a.reshape(2, 4))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def test_find_picks_the_gguf_with_the_hash_and_caches_it(tmp_path, monkeypatch):
+    ee = _exporter()
+    monkeypatch.setattr(ee, "CACHE", str(tmp_path / "cache" / "model-hashes.json"))
+    models = tmp_path / "models"
+    (models / "sub").mkdir(parents=True)
+    _write_qwen3_asr(models / "a.gguf", 1024)
+    _write_qwen3_asr(models / "sub" / "b.gguf", 2048, byte=1)   # a "fine-tune": one weight byte differs
+    (models / "notes.gguf").write_bytes(b"not a gguf")
+    ha, hb = ee.model_hash(str(models / "a.gguf")), ee.model_hash(str(models / "sub" / "b.gguf"))
+    assert ha != hb
+    assert ee.find(hb, [str(models)]) == str(models / "sub" / "b.gguf")
+    assert ee.find(ha, [str(models)], hd=1024) == str(models / "a.gguf")
+    assert ee.find(ha, [str(models)], hd=2048) is None
+    assert ee.find("0x1", [str(models)]) is None
+    assert os.path.exists(ee.CACHE)
+
+    # Cached: found again without rehashing ...
+    def no_hashing(*a, **k):
+        raise AssertionError("rehashed a cached file")
+
+    monkeypatch.setattr(ee, "model_hash", no_hashing)
+    assert ee.find(hb, [str(models)]) == str(models / "sub" / "b.gguf")
+    # ... until the file changes (size or mtime).
+    _write_qwen3_asr(models / "sub" / "b.gguf", 2048, byte=2)
+    with pytest.raises(AssertionError, match="rehashed"):
+        ee.find(hb, [str(models)])
+
+
+def test_every_encoder_tensor_maps_to_one_parameter():
+    ee = _exporter()
+    names = ["enc.conv1.weight", "enc.conv1.bias", "enc.conv2.weight", "enc.conv2.bias", "enc.conv3.weight",
+             "enc.conv3.bias", "enc.out.weight", "enc.ln_post.weight", "enc.ln_post.bias",
+             "proj.linear_1.weight", "proj.linear_1.bias", "proj.linear_2.weight", "proj.linear_2.bias"]
+    for part in ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_o", "ffn_norm", "ff_up", "ff_down"):
+        names += [f"enc.blk.17.{part}.weight", f"enc.blk.17.{part}.bias"]
+    mapped = [ee.module_name(n) for n in names]
+    assert None not in mapped and len(set(mapped)) == len(mapped)
+    assert ee.module_name("enc.blk.0.attn_q.weight") == "enc.layers.0.self_attn.q_proj.weight"
+    assert ee.module_name("enc.out.weight") == "enc.conv_out.weight"
+    assert ee.module_name("enc.blk.0.unknown.weight") is None
+
+
+def test_encoder_digest_layout():
+    ee = _exporter()
+    # One tensor: FNV-1a over name + NUL, type u32, ne[4] u64, size u64, xxh64 u64.
+    body = b"enc.x\0" + struct.pack("<I6Q", 8, 32, 2, 1, 1, 68, 0x1234)
+    assert ee.encoder_digest([("enc.x", 8, [32, 2], 68, 0x1234)]) == ee.fnv1a64(body)

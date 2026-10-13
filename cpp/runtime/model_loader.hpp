@@ -56,6 +56,9 @@ public:
 
     const std::string& last_error() const { return error_; }
 
+    // The GGUF file load() opened ("" before a successful load).
+    const std::string& path() const { return path_; }
+
     // ---- metadata -------------------------------------------------------
     const std::unordered_map<std::string, GgufValue>& kv() const { return kv_; }
 
@@ -153,6 +156,7 @@ private:
     std::unordered_map<std::string, ggml_tensor*> host_tensors_;
     std::unordered_map<std::string, GgufValue> kv_;
     std::string error_;
+    std::string path_;
     bool realized_ = false;
 };
 

@@ -1,6 +1,6 @@
 // Copyright 2026 The Starling Authors. Apache-2.0.
 //
-// The fingerprints of model_fingerprint.hpp from a GGUF file (npu_tool on the
+// The model hash of model_fingerprint.hpp from a GGUF file (npu_tool on the
 // phone, the tests on the host): ggml's GGUF parser for the tensor table, then
 // each tensor's bytes read from the file as stored.
 #include "gguf_fingerprint.hpp"
@@ -13,7 +13,7 @@
 
 namespace starling::npu {
 
-bool gguf_fingerprint(const std::string& path, ModelFingerprint& fp, std::string& err) {
+bool gguf_model_hash(const std::string& path, uint64_t& hash, std::string& err) {
     ggml_context* meta = nullptr;
     gguf_init_params params{};
     params.no_alloc = true;
@@ -49,7 +49,7 @@ bool gguf_fingerprint(const std::string& path, ModelFingerprint& fp, std::string
         t->data = buf.data();
         return t;
     };
-    if (!qwen3_identity(read, fp.identity, err) || !qwen3_model_hash(names, read, fp.model_hash, err)) {
+    if (!qwen3_model_hash(names, read, hash, err)) {
         err += " (" + path + ")";
         return false;
     }

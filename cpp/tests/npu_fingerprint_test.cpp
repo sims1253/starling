@@ -1,19 +1,19 @@
-// npu_fingerprint_test.cpp — the Pixel TPU encoder fingerprints
+// npu_fingerprint_test.cpp — the Pixel TPU encoder's model hash
 // (cpp/npu/encoder_contract.hpp, model_fingerprint.hpp, gguf_fingerprint.cpp).
 //
 //  * FNV-1a 64 and XXH64 against reference vectors (FNV's standard offset
 //    basis; XXH64 values from xxhsum -H1);
-//  * the checkpoint identity of a synthesized GGUF equals the value
-//    scripts/npu/export_encoder.py computes for the same tensor values
-//    (tests/test_npu_fingerprint.py pins the same constant);
-//  * the encoder digest (the artifact's model hash) is the same read from the
-//    file (starling-npu-tool) and from the loaded model (the engine), covers
-//    every encoder/projector tensor whatever its type — a change confined to
-//    a weight matrix changes it but not the identity — and ignores the rest.
+//  * the encoder digest (the artifact's model hash) of a synthesized GGUF is
+//    pinned — scripts/npu/export_encoder.py computes the same value from the
+//    same file (tests/test_npu_fingerprint.py pins the same constants) — is
+//    the same read from the file (starling-npu-tool) and from the loaded
+//    model (the engine), covers every encoder/projector tensor whatever its
+//    type — a change confined to one byte of a weight matrix changes it —
+//    and ignores the rest.
 //
 // Usage: npu_fingerprint_test [MODEL.gguf ...]
-//   With Qwen3-ASR GGUFs: both fingerprints from the file and from
-//   ModelLoader (must agree), and how long the engine's digest takes.
+//   With Qwen3-ASR GGUFs: the model hash from the file and from ModelLoader
+//   (must agree), and how long the engine's digest takes.
 // Exit 0 = pass, 1 = failure.
 #include "ggml.h"
 #include "gguf.h"
@@ -51,17 +51,18 @@ void check_hex(uint64_t got, uint64_t want, const std::string& what) {
     check(got == want, what + b);
 }
 
-// Shared with tests/test_npu_fingerprint.py: identity tensor k (in
-// kQwen3EncFingerprintTensors order) holds 4 + k f32 values (16k + i) / 4 - 1.
-constexpr uint64_t kIdentityVector = 0xad085128de48605dull;
-// The encoder digest of write_model(path, 0): pinned so the digest's layout
-// cannot drift silently (artifacts are named by it).
+// The encoder digest of write_model(path, 0), and of write_model(path, 1):
+// pinned so the digest's layout cannot drift silently (artifacts are named
+// by it); tests/test_npu_fingerprint.py writes the same GGUFs and pins the
+// same values for export_encoder.py.
 constexpr uint64_t kDigestVector = 0xae909cf3a449d7f7ull;
+constexpr uint64_t kDigestTweakedVector = 0x7de98079b43d9342ull;
 
-// A tiny Qwen3-ASR-like GGUF: the five identity tensors, an encoder weight
-// matrix of each stored kind (Q8_0 blocks, BF16), and two tensors outside the
-// encoder. `tweak` flips one byte: 1 in the Q8_0 encoder matrix, 2 in the
-// non-encoder tensor.
+// A tiny Qwen3-ASR-like GGUF: five F32 encoder vectors, k = 0..4 holding
+// 4 + k values (16k + i) / 4 - 1, an encoder weight matrix of each stored
+// kind (Q8_0 blocks, BF16), and two tensors outside the encoder; every other
+// byte b of a tensor is (b * 37 + 11 + strlen(name)) & 255. `tweak` flips one
+// byte: 1 in the Q8_0 encoder matrix, 2 in the non-encoder tensor.
 bool write_model(const char* path, int tweak) {
     ggml_context* ctx = ggml_init({1 << 20, nullptr, false});
     gguf_context* g = gguf_init_empty();
@@ -73,8 +74,10 @@ bool write_model(const char* path, int tweak) {
         for (size_t i = 0; i < ggml_nbytes(t); ++i) p[i] = (uint8_t)(i * 37 + 11 + std::strlen(name));
         return t;
     };
+    static const char* const kVectors[] = {"enc.conv1.bias", "enc.ln_post.weight", "enc.ln_post.bias",
+                                           "proj.linear_2.bias", "enc.blk.0.attn_norm.weight"};
     for (int k = 0; k < 5; ++k) {
-        ggml_tensor* t = add(kQwen3EncFingerprintTensors[k], GGML_TYPE_F32, {4 + k});
+        ggml_tensor* t = add(kVectors[k], GGML_TYPE_F32, {4 + k});
         float* f = static_cast<float*>(t->data);
         for (int i = 0; i < 4 + k; ++i) f[i] = (16 * k + i) * 0.25f - 1.0f;
     }
@@ -92,16 +95,15 @@ bool write_model(const char* path, int tweak) {
 }
 
 // The engine's path: ModelLoader's mapped tensors.
-bool loaded_fingerprint(const char* path, ModelFingerprint& fp, double& digest_ms, std::string& err) {
+bool loaded_model_hash(const char* path, uint64_t& hash, double& digest_ms, std::string& err) {
     starling::ggml::ModelLoader ml;
     if (!ml.load(path)) {
         err = ml.last_error();
         return false;
     }
     const TensorLookup tensor = [&ml](const std::string& n) -> const ggml_tensor* { return ml.tensor(n.c_str()); };
-    if (!qwen3_identity(tensor, fp.identity, err)) return false;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = qwen3_model_hash(ml.tensor_names(), tensor, fp.model_hash, err);
+    const bool ok = qwen3_model_hash(ml.tensor_names(), tensor, hash, err);
     digest_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return ok;
 }
@@ -130,24 +132,22 @@ void test_synthesized() {
         check(false, "synthesized GGUFs written");
         return;
     }
-    ModelFingerprint f0, f1, f2, l0;
+    uint64_t f0 = 0, f1 = 0, f2 = 0, l0 = 0;
     std::string err;
     double ms = 0;
-    const bool ok = gguf_fingerprint(base, f0, err) && gguf_fingerprint(tw1, f1, err) && gguf_fingerprint(tw2, f2, err);
-    check(ok, "gguf_fingerprint reads the synthesized GGUFs " + err);
-    const bool ok_loaded = loaded_fingerprint(base, l0, ms, err);
-    check(ok_loaded, "the loaded model's fingerprints " + err);
+    const bool ok = gguf_model_hash(base, f0, err) && gguf_model_hash(tw1, f1, err) && gguf_model_hash(tw2, f2, err);
+    check(ok, "gguf_model_hash reads the synthesized GGUFs " + err);
+    const bool ok_loaded = loaded_model_hash(base, l0, ms, err);
+    check(ok_loaded, "the loaded model's hash " + err);
     if (ok) {
-        check_hex(f0.identity, kIdentityVector, "identity = export_encoder.py's value for the same tensors");
-        check_hex(f0.model_hash, kDigestVector, "encoder digest (pinned)");
-        check_hex(l0.model_hash, f0.model_hash, "digest from the loaded model = from the file");
-        check_hex(l0.identity, f0.identity, "identity from the loaded model = from the file");
-        check(f1.model_hash != f0.model_hash, "a changed encoder weight matrix changes the digest");
-        check_hex(f1.identity, f0.identity, "... but not the checkpoint identity (its documented limit)");
-        check_hex(f2.model_hash, f0.model_hash, "a changed non-encoder tensor leaves the digest alone");
+        check_hex(f0, kDigestVector, "encoder digest (pinned, = export_encoder.py's)");
+        check_hex(l0, f0, "digest from the loaded model = from the file");
+        check_hex(f1, kDigestTweakedVector, "one changed byte of an encoder weight matrix: another digest (pinned)");
+        check(f1 != f0, "... which differs from the original's");
+        check_hex(f2, f0, "a changed non-encoder tensor leaves the digest alone");
     }
-    ModelFingerprint none;
-    check(!gguf_fingerprint("/nonexistent/model.gguf", none, err), "a missing file is an error");
+    uint64_t none = 0;
+    check(!gguf_model_hash("/nonexistent/model.gguf", none, err), "a missing file is an error");
     std::remove(base);
     std::remove(tw1);
     std::remove(tw2);
@@ -159,21 +159,19 @@ int main(int argc, char** argv) {
     test_vectors();
     test_synthesized();
     for (int i = 1; i < argc; ++i) {
-        ModelFingerprint file, loaded;
+        uint64_t file = 0, loaded = 0;
         std::string err;
         double digest_ms = 0;
         // The engine's digest first: on a cold page cache it pays the reads.
-        const bool ok_loaded = loaded_fingerprint(argv[i], loaded, digest_ms, err);
-        check(ok_loaded, std::string("loaded fingerprints of ") + argv[i] + " " + err);
+        const bool ok_loaded = loaded_model_hash(argv[i], loaded, digest_ms, err);
+        check(ok_loaded, std::string("loaded model hash of ") + argv[i] + " " + err);
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok_file = gguf_fingerprint(argv[i], file, err);
+        const bool ok_file = gguf_model_hash(argv[i], file, err);
         const double file_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        check(ok_file, "file fingerprints " + err);
-        check_hex(loaded.model_hash, file.model_hash, "  model hash: loaded = file");
-        check_hex(loaded.identity, file.identity, "  identity: loaded = file");
-        std::printf("%s: model_hash 0x%016llx identity 0x%016llx; engine digest %.1f ms, tool (file) %.1f ms\n",
-                    argv[i], (unsigned long long)file.model_hash, (unsigned long long)file.identity, digest_ms,
-                    file_ms);
+        check(ok_file, "file model hash " + err);
+        check_hex(loaded, file, "  model hash: loaded = file");
+        std::printf("%s: model_hash 0x%016llx; engine digest %.1f ms, tool (file) %.1f ms\n", argv[i],
+                    (unsigned long long)file, digest_ms, file_ms);
     }
     if (g_fail) {
         std::printf("npu_fingerprint_test: %d check(s) FAILED\n", g_fail);

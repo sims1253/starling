@@ -489,10 +489,9 @@ struct NpuStart {
 
 #if defined(STARLING_HAVE_NPU)
 struct NpuJob {
-    std::string tag, key, model, dirs;
+    std::string tag, key, model, gguf, dirs;
     uint32_t nm = 0, frames = 0, tokens = 0, eout = 0;
     bool verbose = false;
-    uint64_t identity = 0;
 };
 
 // The worker's half after hashing: find, check, open and warm up the artifact.
@@ -505,7 +504,7 @@ NpuResult npu_open(const NpuJob& j, uint64_t h) {
     };
     const std::string name = npu::qwen3_enc_artifact_name(h);
     auto report = [&](npu::PieceState st, const std::string& msg) {
-        npu::report_piece("qwen3-asr-enc", h, j.identity, j.model, st, msg);
+        npu::report_piece("qwen3-asr-enc", h, j.gguf, j.model, st, msg);
     };
     std::string path;
     for (size_t b = 0; b <= j.dirs.size() && path.empty();) {
@@ -574,14 +573,13 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
     if (j.dirs.empty()) return note("no STARLING_NPU_DIR");
     if (!npu::tpu_present()) return note("no TPU runtime on this device");
     const npu::TensorLookup tensor = [&ml](const std::string& n) -> const ggml_tensor* { return ml.tensor(n.c_str()); };
-    std::string err;
-    if (!npu::qwen3_identity(tensor, j.identity, err)) return note(err);
     j.frames = sp.n_window_infer;
     j.tokens = 13 * (j.frames / 100);
     j.nm = sp.n_mels;
     j.eout = sp.EOUT;
     j.key = npu::qwen3_enc_key(j.nm, j.frames, j.tokens, sp.ED, sp.EL, sp.EH, sp.EFF, sp.DS, sp.EOUT);
     j.model = "arch=qwen3 hd=" + std::to_string(sp.HD);
+    j.gguf = ml.path();
     std::promise<void> hashed;
     r.hashed = hashed.get_future();
     r.note = "checking the TPU artifact";

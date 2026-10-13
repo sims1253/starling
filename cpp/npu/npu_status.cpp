@@ -35,7 +35,7 @@ std::string npu_dirs() {
     return {};
 }
 
-void report_piece(const std::string& piece, uint64_t model_hash, uint64_t identity, const std::string& model,
+void report_piece(const std::string& piece, uint64_t model_hash, const std::string& gguf, const std::string& model,
                   PieceState state, const std::string& message) {
     static const char* const kNames[] = {"ok", "missing", "stale", "error"};
     const char* st = kNames[(int)state];
@@ -44,9 +44,8 @@ void report_piece(const std::string& piece, uint64_t model_hash, uint64_t identi
     // once an artifact is there).
     if (state == PieceState::Missing && !tpu_present()) return;
     const std::string firmware = state == PieceState::Missing ? std::string() : vendor_version();
-    char hash[24], ident[24];
+    char hash[24];
     std::snprintf(hash, sizeof hash, "%016llx", (unsigned long long)model_hash);
-    std::snprintf(ident, sizeof ident, "%016llx", (unsigned long long)identity);
     if (state == PieceState::Stale || state == PieceState::Error) {
         static std::mutex mu;
         static std::set<std::string> logged;
@@ -61,7 +60,9 @@ void report_piece(const std::string& piece, uint64_t model_hash, uint64_t identi
 #endif
         }
     }
-    const std::string body = std::string("piece=") + piece + "\nhash=0x" + hash + "\nidentity=0x" + ident +
+    // One line per key: a path with a line break in it is not written.
+    const std::string path_line = gguf.find_first_of("\r\n") == std::string::npos ? gguf : std::string();
+    const std::string body = std::string("piece=") + piece + "\nhash=0x" + hash + "\ngguf=" + path_line +
                              "\nmodel=" + model + "\nstate=" + st + "\nfirmware=" + firmware + "\nmessage=" + message +
                              "\n";
     const std::string dirs = npu_dirs();

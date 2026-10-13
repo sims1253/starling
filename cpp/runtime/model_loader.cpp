@@ -255,6 +255,7 @@ bool ModelLoader::load(const char* path) {
         }
         kv_[key] = std::move(v);
     }
+    path_ = path;
     return true;
 }
 

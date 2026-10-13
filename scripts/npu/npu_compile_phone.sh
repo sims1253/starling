@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
 # Phone half of npu_compile.sh (run under the phone lock):
-#   npu_compile_phone.sh NPU_TOOL TFLITE SRC EXPECT_IDENTITY KEY DIR APPS WORKDIR
+#   npu_compile_phone.sh NPU_TOOL TFLITE HASH KEY DIR APPS WORKDIR
 # compiles TFLITE, a Qwen3-ASR audio encoder window from export_encoder.py,
-# into an artifact. The phone's compiler can exhaust the phone's memory and
-# panic its kernel (graphs below the size cap did), so this entry point checks
-# everything itself, however it is called:
+# into the artifact qwen3-asr-enc-<HASH>.stnpu. The phone's compiler can
+# exhaust the phone's memory and panic its kernel (graphs below the size cap
+# did), so this entry point checks everything itself, however it is called:
 #  * KEY is one of the supported encoder windows (Qwen3-ASR 0.6B or 1.7B,
 #    cpp/npu/encoder_contract.hpp), and TFLITE's single subgraph has exactly
 #    that window's inputs and output and the operator signature (operator and
 #    tensor counts, operators per builtin) export_encoder.py produces for it;
 #    the artifact's I/O sizes follow from KEY;
-#  * SRC is the GGUF the app loads (a path on the phone; starling-npu-tool
-#    fingerprints it there) or its two fingerprints HASH,IDENTITY (0x..., from
-#    the app's status-*.txt). HASH, the digest of the GGUF's encoder tensors,
-#    names the artifact; IDENTITY must equal EXPECT_IDENTITY, the identity of
-#    the checkpoint TFLITE was exported from (export_encoder.py --fingerprint);
+#  * HASH (0x...) is the model hash export_encoder.py printed for the GGUF
+#    TFLITE's weights came from (the digest of its encoder tensors, which the
+#    engine computes from the GGUF it loads); it names the artifact;
 #  * the phone has at least NPU_MIN_MEM_MB (default 4096) available and TFLITE
 #    is no larger than its window's graph has been (0.6B: 640 MB; 1.7B, which
 #    exports with f32 weights: 1300 MB; both compiled cleanly).
@@ -23,8 +21,8 @@
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 8 ] || { sed -n 2,24p "$0" >&2; exit 2; }
-NPU_TOOL=$1; TFL=$2; SRC=$3; EXPECT=$4; KEY=$5; DIR=$6; APPS=$7; T=$8
+[ $# -eq 7 ] || { sed -n 2,22p "$0" >&2; exit 2; }
+NPU_TOOL=$1; TFL=$2; HASH=$3; KEY=$4; DIR=$5; APPS=$6; T=$7
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
 for APP in "${PKGS[@]}"; do
@@ -51,9 +49,12 @@ canon() {
 # 99 SQUARED_DIFFERENCE, 126 BATCH_MATMUL, 150 GELU), so a different graph
 # (a constant, a no-op) cannot pass under an encoder's key. 1.7B converts
 # with lightweight_conversion and keeps f32 weights (no DEQUANTIZE).
-# Measured with litert-torch 0.9.4 and ai-edge-quantizer 0.9.0; a converter
-# that emits a different graph needs these updated (and the graph compiled
-# once with care: see docs/fast-engine.md, Pixel TPU encoder).
+# Measured on exports of qwen3-asr-0.6b-q4e8.gguf and
+# qwen3-asr-1.7b-q4e8-imx.gguf with litert-torch 0.9.4 and ai-edge-quantizer
+# 0.9.0 (the weights' storage type in the GGUF does not change the graph,
+# only its constants); a converter that emits a different graph needs these
+# updated (and the graph compiled once with care: see docs/fast-engine.md,
+# Pixel TPU encoder).
 case $KEY in
   "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024")
     OUTD=1024 MAXMB=640
@@ -182,8 +183,12 @@ if (len(tensors), n_ops, hist) != (want_tensors, want_ops, want_hist):
 EOF
 
 # ---- the model it belongs to ----
-EXP=$(canon "$EXPECT")
-[ -n "$EXP" ] || { echo "bad expected identity '$EXPECT'" >&2; exit 2; }
+HC=$(canon "$HASH")
+[ -n "$HC" ] && [ "$HC" != 0x0000000000000000 ] || { echo "bad model hash '$HASH'" >&2; exit 2; }
+NAME="qwen3-asr-enc-${HC#0x}.stnpu"
+echo "model hash $HC -> $NAME"
+
+# ---- compile ----
 adb shell "mkdir -p $(q "$T") $(q "$DIR")" </dev/null
 adb push -q "$NPU_TOOL" "$T/starling-npu-tool" </dev/null >/dev/null
 # The tool links ggml-base (GGUF parsing); it sits next to the tool or, in a
@@ -195,27 +200,6 @@ done
 [ -n "$BASE_LIB" ] || { echo "no libggml-base.so next to $NPU_TOOL (or in its ggml/src)" >&2; exit 1; }
 adb push -q "$BASE_LIB" "$T/libggml-base.so" </dev/null >/dev/null
 TOOL="LD_LIBRARY_PATH=$(q "$T") $(q "$T/starling-npu-tool")"
-case $SRC in
-  0x*|0X*)
-    HASH=${SRC%%,*}
-    ID=${SRC#*,}
-    [ "$ID" != "$SRC" ] || { echo "SRC '$SRC': expected HASH,IDENTITY" >&2; exit 2; } ;;
-  *)
-    FP=$(adb shell "$TOOL fingerprint $(q "$SRC")" </dev/null | tr -d "\r" || true)
-    HASH=$(printf '%s\n' "$FP" | sed -n 's/^model_hash //p')
-    ID=$(printf '%s\n' "$FP" | sed -n 's/^identity //p') ;;
-esac
-HC=$(canon "$HASH"); IC=$(canon "$ID")
-[ -n "$HC" ] && [ -n "$IC" ] || { echo "fingerprint failed: '$HASH' '$ID'" >&2; exit 1; }
-if [ "$IC" != "$EXP" ]; then
-  echo "refusing: the app's model (identity $IC) is not the checkpoint the graph was exported from ($EXP)." >&2
-  echo "  A fine-tune or other weights with the same shapes would get the wrong encoder." >&2
-  exit 1
-fi
-NAME="qwen3-asr-enc-${HC#0x}.stnpu"
-echo "model hash $HC (identity $IC) -> $NAME"
-
-# ---- compile ----
 AVAIL=$(adb shell "grep MemAvailable /proc/meminfo" </dev/null | tr -dc '0-9')
 [ "${AVAIL:-0}" -ge $((${NPU_MIN_MEM_MB:-4096} * 1024)) ] ||
   { echo "phone has $((${AVAIL:-0} / 1024)) MB available, below ${NPU_MIN_MEM_MB:-4096} MB: not compiling now" >&2; exit 1; }

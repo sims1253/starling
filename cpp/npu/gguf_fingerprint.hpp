@@ -7,8 +7,8 @@
 
 namespace starling::npu {
 
-// Both fingerprints (model_fingerprint.hpp) of a Qwen3-ASR GGUF file, read
+// The model hash (model_fingerprint.hpp) of a Qwen3-ASR GGUF file, read
 // tensor by tensor: what the engine computes from the same GGUF once loaded.
-bool gguf_fingerprint(const std::string& path, ModelFingerprint& fp, std::string& err);
+bool gguf_model_hash(const std::string& path, uint64_t& hash, std::string& err);
 
 }  // namespace starling::npu

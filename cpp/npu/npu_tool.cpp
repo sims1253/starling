@@ -4,10 +4,11 @@
 // Compiling must run as the shell user: the firmware compile service refuses
 // apps not on Google's EdgeTPU allowlist (loading and running an artifact
 // works from any app, see tpu_runtime.hpp).
-//   starling-npu-tool fingerprint MODEL.gguf    prints "model_hash 0x.." and "identity 0x.."
-//   starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. [--fn F] [--key K]
-//                             [--gguf MODEL.gguf | --hash 0x..]
+//   starling-npu-tool fingerprint MODEL.gguf    prints "model_hash 0x.."
+//   starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. --hash 0x.. [--fn F] [--key K]
 //   starling-npu-tool info ART
+// The artifact's model hash (--hash) is the one export_encoder.py printed for
+// the GGUF the graph's weights came from.
 #include "gguf_fingerprint.hpp"
 #include "tpu_runtime.hpp"
 
@@ -71,22 +72,21 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: starling-npu-tool fingerprint MODEL.gguf\n"
-                     "       starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. [--fn F] [--key K]\n"
-                     "                                 [--gguf MODEL.gguf | --hash 0x..]\n"
+                     "       starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. --hash 0x.. [--fn F]\n"
+                     "                                 [--key K]\n"
                      "       starling-npu-tool info ART\n");
         return 2;
     }
     const std::string cmd = argv[1];
     std::string err;
     if (cmd == "fingerprint") {
-        ModelFingerprint fp;
+        uint64_t hash = 0;
         const double t0 = now_ms();
-        if (!gguf_fingerprint(argv[2], fp, err)) {
+        if (!gguf_model_hash(argv[2], hash, err)) {
             std::fprintf(stderr, "%s\n", err.c_str());
             return 1;
         }
-        std::printf("model_hash 0x%016llx\nidentity 0x%016llx\n", (unsigned long long)fp.model_hash,
-                    (unsigned long long)fp.identity);
+        std::printf("model_hash 0x%016llx\n", (unsigned long long)hash);
         std::fprintf(stderr, "fingerprinted in %.1f ms\n", now_ms() - t0);
         return 0;
     }
@@ -99,14 +99,10 @@ int main(int argc, char** argv) {
             else if (!std::strcmp(argv[i], "--out")) info.out_bytes = sizes(argv[i + 1]);
             else if (!std::strcmp(argv[i], "--key")) info.key = argv[i + 1];
             else if (!std::strcmp(argv[i], "--hash")) info.model_hash = std::strtoull(argv[i + 1], nullptr, 0);
-            else if (!std::strcmp(argv[i], "--gguf")) {
-                ModelFingerprint fp;
-                if (!gguf_fingerprint(argv[i + 1], fp, err)) {
-                    std::fprintf(stderr, "%s\n", err.c_str());
-                    return 1;
-                }
-                info.model_hash = fp.model_hash;
-            }
+        }
+        if (info.model_hash == 0) {
+            std::fprintf(stderr, "compile: --hash 0x.. (the model hash export_encoder.py printed) is required\n");
+            return 2;
         }
         if (!compile(argv[2], argv[3], info, err)) {
             std::fprintf(stderr, "compile: %s\n", err.c_str());
