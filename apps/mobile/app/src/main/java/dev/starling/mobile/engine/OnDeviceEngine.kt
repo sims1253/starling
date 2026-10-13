@@ -434,13 +434,16 @@ class OnDeviceEngine(
         var moved = 0
         var remaining = 0
         for (source in sources) {
-            // Compared and dropped under the folder lock: another build
-            // cannot delete the shared copy in between.
-            val duplicate = withFolderLock(dir) {
-                val existing = File(dir, source.name)
-                val same = runCatching { existing.isFile && sameContents(existing, source) }.getOrDefault(false)
-                if (same) deleteFile(source, "moved model")
-                same
+            // Compared outside the folder lock (it reads both files end to
+            // end), then dropped under it once the shared copy is still the
+            // one compared: another build may have deleted or replaced it.
+            val existing = File(dir, source.name)
+            val stamp = existing.length() to existing.lastModified()
+            val same = runCatching { existing.isFile && sameContents(existing, source) }.getOrDefault(false)
+            val duplicate = same && withFolderLock(dir) {
+                val unchanged = existing.isFile && (existing.length() to existing.lastModified()) == stamp
+                if (unchanged) dropAdopted(source, existing)
+                unchanged
             }
             if (duplicate) {
                 moved++
@@ -484,10 +487,20 @@ class OnDeviceEngine(
                     }
                 }
             }
-            deleteFile(source, "moved model")
+            dropAdopted(source, target)
             moved++
         }
         Adoption(moved, remaining)
+    }
+
+    /**
+     * Deletes [source] once [copy] holds the same bytes. Under the engine
+     * lock, like [deleteModel], so a load never opens a path that is going
+     * away; a model resident from [source] counts as loaded from [copy].
+     */
+    private fun dropAdopted(source: File, copy: File) = synchronized(lock) {
+        if (loadedFile == source) loadedFile = copy
+        deleteFile(source, "moved model")
     }
 
     /** Whether [a] and [b] hold the same bytes. */
@@ -523,8 +536,10 @@ class OnDeviceEngine(
      * every other Starling build (a `.lock` file there, plus an in-process
      * monitor: Java file locks are per process). Guards what must not
      * interleave with another build: choosing a free name and renaming into
-     * it, and deleting. Best effort: a folder that refuses the lock file runs
-     * [block] unguarded, as before sharing existed.
+     * it, and deleting; it is only ever held for those short steps. Best
+     * effort: a folder that refuses the lock file, or a lock another process
+     * holds for over [FOLDER_LOCK_WAIT_MILLIS] (frozen in the background,
+     * say), runs [block] unguarded, as before sharing existed.
      */
     private inline fun <T> withFolderLock(dir: File, block: () -> T): T {
         dir.mkdirs()
@@ -534,7 +549,7 @@ class OnDeviceEngine(
             }.onFailure { e -> runCatching { Log.w(TAG, "model folder lock file unavailable in $dir", e) } }
                 .getOrNull() ?: return block()
             try {
-                val held = runCatching { channel.lock() }
+                val held = runCatching { lockWithin(channel, FOLDER_LOCK_WAIT_MILLIS) }
                     .onFailure { e -> runCatching { Log.w(TAG, "model folder lock unavailable in $dir", e) } }
                     .getOrNull()
                 try {
@@ -545,6 +560,16 @@ class OnDeviceEngine(
             } finally {
                 runCatching { channel.close() }
             }
+        }
+    }
+
+    /** [channel]'s exclusive lock, polled for up to [millis]; throws when it stays taken. */
+    private fun lockWithin(channel: FileChannel, millis: Long): java.nio.channels.FileLock {
+        val deadline = System.nanoTime() + millis * 1_000_000
+        while (true) {
+            channel.tryLock()?.let { return it }
+            if (System.nanoTime() > deadline) throw IOException("held by another process for over $millis ms")
+            Thread.sleep(FOLDER_LOCK_POLL_MILLIS)
         }
     }
 
@@ -1133,6 +1158,8 @@ class OnDeviceEngine(
 
         /** The lock file builds sharing a model folder coordinate on (hidden: not a model). */
         private const val FOLDER_LOCK_NAME = ".lock"
+        private const val FOLDER_LOCK_WAIT_MILLIS = 30_000L
+        private const val FOLDER_LOCK_POLL_MILLIS = 50L
 
         private val folderMonitors = java.util.concurrent.ConcurrentHashMap<String, Any>()
 

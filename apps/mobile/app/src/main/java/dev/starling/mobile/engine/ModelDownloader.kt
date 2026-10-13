@@ -51,7 +51,8 @@ class ModelDownloader(private val client: OkHttpClient = defaultClient()) {
      * checksum runs.
      */
     fun download(spec: ModelDownload, partial: File, progress: (Long, Long, Boolean) -> Unit): Result {
-        cancelled = false
+        // Single use: a cancel that came before the download started stands.
+        if (cancelled) return Result.Cancelled
         partial.parentFile?.mkdirs()
         if (partial.length() > spec.sizeBytes) partial.delete()
         if (partial.length() < spec.sizeBytes) {

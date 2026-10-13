@@ -103,6 +103,9 @@ object NativeSupport {
      */
     fun applyFastEngineDefaults(cacheDir: File?) {
         if (cacheDir == null || !System.getenv(FAST_CACHE_ENV).isNullOrEmpty()) return
+        // The engine writes there but never creates it (a reinstall that
+        // finds its models in shared storage has no private model folder).
+        cacheDir.mkdirs()
         runCatching { Os.setenv(FAST_CACHE_ENV, cacheDir.absolutePath, false) }
     }
 

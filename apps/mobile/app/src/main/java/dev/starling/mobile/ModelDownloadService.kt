@@ -35,6 +35,10 @@ class ModelDownloadService : Service() {
     private var listening = false
     private var lastProgressPost = 0L
 
+    // The newest start command: stopping with it leaves a service that a
+    // newer download already started again running.
+    private var lastStartId = 0
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -42,6 +46,7 @@ class ModelDownloadService : Service() {
             downloads.cancel()
             return START_NOT_STICKY
         }
+        lastStartId = startId
         // startForegroundService() obliges startForeground() even when the
         // download already ended; the service then leaves again at once.
         val started = runCatching {
@@ -53,7 +58,7 @@ class ModelDownloadService : Service() {
             )
         }.onFailure { Log.w(TAG, "download foreground service refused", it) }.isSuccess
         if (!started) {
-            stopSelf()
+            stopSelf(startId)
             return START_NOT_STICKY
         }
         if (!listening) {
@@ -79,10 +84,17 @@ class ModelDownloadService : Service() {
         }
     }
 
-    /** Android 15+ ends a `dataSync` service after its daily budget: pause, keeping the partial file. */
+    /**
+     * Android 15+ ends a `dataSync` service after its daily budget: pause,
+     * keeping the partial file, and say so (a user pause says nothing).
+     */
     override fun onTimeout(startId: Int, fgsType: Int) {
         downloads.cancel()
         finish(null)
+        notificationManager()?.notify(
+            RESULT_ID,
+            baseNotification().setContentText(getString(R.string.download_notification_timeout, label())).setAutoCancel(true).build(),
+        )
     }
 
     override fun onDestroy() {
@@ -97,7 +109,7 @@ class ModelDownloadService : Service() {
         listening = false
         releaseWakeLock()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        stopSelf(lastStartId)
         val text = when (state) {
             is ModelDownloadController.State.Finished -> when (val result = state.result) {
                 is OnDeviceEngine.ImportResult.Imported -> getString(R.string.download_notification_done, label())

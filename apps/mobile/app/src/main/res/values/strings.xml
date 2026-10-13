@@ -189,6 +189,7 @@
     <string name="download_notification_progress">%1$d of %2$d MB. Continues in the background.</string>
     <string name="download_notification_done">%1$s is downloaded and ready to use.</string>
     <string name="download_notification_model">speech model</string>
+    <string name="download_notification_timeout">Android paused the download of %1$s after its daily background time. Open Starling and tap Resume to continue where it stopped.</string>
     <string name="take_notification_channel">Dictation in progress</string>
     <string name="take_notification_title">Starling is recording</string>
     <string name="take_notification_text">The take keeps recording while the keyboard is hidden.</string>

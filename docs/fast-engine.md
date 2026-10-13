@@ -30,7 +30,7 @@ devices (SwiftShader, llvmpipe) are ignored.
 | Variable | Effect |
 | --- | --- |
 | `STARLING_FAST_F16=0` | f32 products in the GEMMs (default: packed-f16 products with f32 accumulation per 32-deep slice where the device has `shaderFloat16`) |
-| `STARLING_FAST_CACHE_DIR` | where the Vulkan pipeline cache and autotuning results persist (the Android app sets it to its model directory) |
+| `STARLING_FAST_CACHE_DIR` | where the Vulkan pipeline cache and autotuning results persist (the Android app sets it to its private model directory, never the model folder it may share with other builds) |
 | `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR and AMD, which otherwise ship measured defaults) |
 | `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR and AMD) |
 | `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |

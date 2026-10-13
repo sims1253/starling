@@ -107,6 +107,9 @@ class ModelDownloadController(private val context: Context, private val engine: 
             if (downloader !== job) return@post
             downloader = null
             publish(next)
+            // A download that started before the models moved to shared
+            // storage finished in the private folder: move it along.
+            if (next is State.Finished) (context.applicationContext as? StarlingApplication)?.moveModelsToSharedStorage()
         }
     }
 
