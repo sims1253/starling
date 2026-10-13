@@ -2317,7 +2317,16 @@ bool AudioLlmEngine::Impl::run(vk::Recording& prefill, uint32_t S, uint32_t max_
                                bool& eos, int& rounds, double& t_pre, std::string& err) {
     Impl& I = *this;
     const char* tag = sp.tag;
-    const uint32_t steps = (uint32_t)std::max(1, std::atoi(std::getenv("STARLING_FAST_KSTEP") ? std::getenv("STARLING_FAST_KSTEP") : "16"));
+    // Decode steps per command buffer; STARLING_FAST_KSTEP overrides the 16.
+    static const uint32_t steps = [] {
+        const char* e = std::getenv("STARLING_FAST_KSTEP");
+        if (!e || !*e) return 16u;
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(e, &end, 10);
+        if (*e >= '0' && *e <= '9' && *end == '\0' && v >= 1 && v <= 256) return (uint32_t)v;
+        std::fprintf(stderr, "[fast] ignoring STARLING_FAST_KSTEP='%s' (want 1..256)\n", e);
+        return 16u;
+    }();
     if (!dec_rec || dec_steps != steps) {
         if (!record_decode(steps, err)) return false;
     }

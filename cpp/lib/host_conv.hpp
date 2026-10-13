@@ -25,8 +25,9 @@ namespace starling::ggml::lib {
 // `pad_r` after. `w` is [OC, IC, 3] f32 (HF order), `bias` [OC] f32. Writes
 // the oc-contiguous [OC, OL] output (element (oc, t) at oc*OL + t),
 // OL = (L + pad_l + pad_r - 3) / stride + 1, then applies `post` to each
-// finished run of one output row inside the worker threads (nullptr: none).
-// Returns OL.
+// finished run of one output row inside the worker threads (nullptr: none),
+// so `post` runs concurrently on disjoint runs and must be thread-safe.
+// `bias` must not be null. Returns OL.
 using ConvPost = std::function<void(float* row, int64_t n)>;
 int64_t host_conv1d_k3(const float* w, const float* bias, int64_t OC, int64_t IC,
                        const ggml_bf16_t* x, int64_t L, int64_t pad_l, int64_t pad_r,

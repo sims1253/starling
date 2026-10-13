@@ -39,6 +39,8 @@ constexpr int64_t kMR = 4, kNR = 4;  // fits the 16 SSE registers
 constexpr int64_t kMc = 64;   // oc per work item (multiple of kMR)
 constexpr int64_t kTc = 64;   // t per work item (multiple of kNR)
 constexpr int64_t kKc = 64;   // input channels per chunk (3*kKc steps)
+static_assert(kMc % kMR == 0 && kTc % kNR == 0 && kNR % 2 == 0,
+              "work items must be whole register tiles (of f64 pairs)");
 
 // acc[i][:] += sum over `steps` of wp[s][i] * xp[s][:] (s ascending).
 // wp: [steps][kMR] f64; xp: [steps][ldx] f64 (this tile's kNR columns at

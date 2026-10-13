@@ -28,7 +28,7 @@ std::vector<float> reference(const std::vector<float>& wf, const std::vector<flo
                              const std::vector<ggml_bf16_t>& in, int64_t IC, int64_t L,
                              int64_t pad_l, int64_t pad_r, int64_t stride) {
     const int64_t OC = (int64_t) bf.size(), K = 3, Lp = L + pad_l + pad_r;
-    const int64_t OL = (Lp - K) / stride + 1;
+    const int64_t OL = Lp >= K ? (Lp - K) / stride + 1 : 0;
     std::vector<float> x((size_t) IC * Lp, 0.0f);
     for (int64_t c = 0; c < IC; ++c)
         for (int64_t t = 0; t < L; ++t)
