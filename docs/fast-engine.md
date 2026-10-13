@@ -432,6 +432,47 @@ that keeps whole weight columns in registers (± 10 %), cheaper unorm
 dequant in the tile loads (±), larger or smaller register tiles, 256-
 thread workgroups, and hoisting the conv im2col divisions (+1 %).
 
+**Subgroup-broadcast GEMM (2026-10-13, RESEARCH_LOG P6).** LiteRT's GPU
+accelerator ran the Qwen3-ASR encoder 3.4× faster than P5's GEMMs, and
+its kernels showed why (`benchmarks/litert_gpu`): no shared memory at
+all. `gemm_sg.comp` now takes every encoder/prefill GEMM on PowerVR —
+W4 / W8 / F16 weights, the 3×3 conv GEMMs, the attention scores; P·V
+stays on gemm.comp — with one row of A per lane, 16 output columns per
+subgroup-sized workgroup, each 8-deep slice of the 16 columns' weights
+loaded and dequantized to f32 by 16 lanes and handed to all 128 with
+`subgroupBroadcast`, f32 dot products, and A read through texel-buffer
+views (the texture path; row-blocked under the driver's 65536-texel
+limit, the conv by input window). Per class on Qwen3-0.6B short: LLM
+linears 489 → 246 ms, encoder linears 195 → 106, conv 137 → 69,
+attention 33 → 28. Not bit-exact with gemm.comp, but more exact against
+an f64 reference (W4/W8 weights stay f32 after dequantization) and
+transcript-equal: identical transcripts on the phone for all seven
+models on short and medium, and identical FLEURS en_us WER on 100 clips
+per model with 0 of 100 transcripts differing. Decode is unchanged; on
+RADV gemm.comp's packed-f16 tiles stay 2–2.5× faster, so the kernel is
+PowerVR-only (`STARLING_FAST_SG`).
+
+| Model (enc+prefill short / medium) | gemm.comp | gemm_sg.comp | wall short / medium |
+| --- | --- | --- | --- |
+| Qwen3-ASR-0.6B q4e8 | 0.99 / 2.41 s | **0.57 / 1.54 s** | 1.64 / 4.54 s (was 2.03 / 5.40) |
+| Qwen3-ASR-1.7B q4e8-imx | 2.32 / 5.26 s | **1.22 / 3.58 s** | 3.62 / 10.46 s (was 4.70 / 12.04) |
+| MOSS q4e8 | 2.76 / 6.30 s | **1.49 / 4.80 s** | 3.66 / 11.33 s (was 4.87 / 12.35) |
+| ARK-0.6B q4k | 2.88 / 9.00 s | **1.82 / 7.15 s** | 2.75 / 10.49 s (was 3.81 / 11.98) |
+| Granite dynq4 | 3.28 / 8.23 s | **2.05 / 5.73 s** | 4.51 / 11.83 s (was 5.65 / 13.42) |
+| Voxtral q4k | 9.06 / 19.9 s | **6.23 / 14.2 s** | 21.4 / 63.1 s (was 22.7 / 63.4) |
+| Parakeet (encoder) | 0.71 / 1.98 s | **0.43 / 1.51 s** | 0.65 / 1.87 s (was 0.93 / 2.38) |
+
+One binary, `STARLING_FAST_SG` 0 / 1 interleaved (rounds 0 1 1 0, screen
+off, wake hold), medians of 6 per arm. The long session heated the
+phone and the big models' decode drifted up in the middle rounds, which
+understates the wall gains (Voxtral most: its decode is 2/3 of the
+wall); with a cool-down before every invocation decode measured equal.
+Measured not to pay: f16 products (no 2× f16 rate through Vulkan on this
+driver — LiteRT's fp16 margin is an OpenCL-compiler effect), vec4
+accumulators, two rows per lane, 8 or 32 columns per workgroup. The
+next lever is a ML-Drift-style pre-packed weight layout (~15 % more in
+the probe), which needs a second resident layout next to decode's.
+
 **Model load (2026-10-12).** Load used to read the whole GGUF into
 anonymous memory, repack every matrix into host vectors, allocate the
 device buffers, copy, and free the host vectors — from eight threads at

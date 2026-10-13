@@ -11,6 +11,8 @@
 #                   RUNS timed runs each (enc+prefill, decode, wall)
 #   nb              gemmx at the small-N shapes with 8 vs 16 columns per workgroup
 #   ablate          Qwen3-0.6B short, both arms: STARLING_FAST_SKIP per GEMM class
+#   decheat         decode after the fast prefill: Granite / MOSS medium, arms sg0, sg1,
+#                   sg1 without texel views, each after a 60 s cool-down, GPU clock sampled
 #   energy          (on battery only) charge counter over N transcriptions per arm
 # MODELS overrides the model list ("slug:gguf ..."). Models and fixtures are
 # read from /data/local/tmp/starling; only $D is written (+ the wake-hold dex).
@@ -40,7 +42,8 @@ screen_off || exit 1
 run_sb() {
   local tag=$1 sg=$2 wav=$3 runs=$4 extra=${5:-} q=${6---quiet}
   wait_benches || true
-  timeout 2400 adb shell "cd $D && LD_LIBRARY_PATH=$D STARLING_ENGINE=fast STARLING_GGML_THREADS=6 STARLING_FAST_TIMING=1 STARLING_FAST_CACHE_DIR=$D/cache STARLING_FAST_SG=$sg $extra ./starling-bench --model $slug --gguf $S/$gguf --warmup --runs $runs $q $S/$wav" > "$LOG/$tag.txt" 2>&1
+  # STARLING_NPU=0: Qwen3-ASR's TPU encoder path stays off (the GPU GEMMs are timed).
+  timeout 2400 adb shell "cd $D && LD_LIBRARY_PATH=$D STARLING_ENGINE=fast STARLING_NPU=0 STARLING_GGML_THREADS=6 STARLING_FAST_TIMING=1 STARLING_FAST_CACHE_DIR=$D/cache STARLING_FAST_SG=$sg $extra ./starling-bench --model $slug --gguf $S/$gguf --warmup --runs $runs $q $S/$wav" > "$LOG/$tag.txt" 2>&1
   echo "exit $?" >> "$LOG/$tag.txt"
 }
 
@@ -114,6 +117,21 @@ for phase in "$@"; do
         run_sb "abl_sg${sg}_$cls" $sg short.wav 3 "STARLING_FAST_SKIP='$sk'"
         echo "sg$sg skip=$cls: $(grep -oE 'enc\+prefill=[0-9.]+ms' "$LOG/abl_sg${sg}_$cls.txt" | tail -3 | tr '\n' ' ')"
         cp "$LOG/abl_sg${sg}_$cls.txt" "$LOG/abl_sg${sg}_${cls}_$(date +%H%M%S).txt"
+      done
+    done
+    ;;
+  decheat)
+    for e in granite:granite-2b-dynq4.imx.gguf moss:moss-transcribe-preview-2b-q4e8-fullimx.gguf; do
+      slug=${e%%:*}; gguf=${e#*:}
+      for arm in sg0 sg1 sg1t0 sg1t0 sg1 sg0; do
+        case $arm in sg0) sg=0; ex="" ;; sg1) sg=1; ex="" ;; sg1t0) sg=1; ex="STARLING_FAST_SG_TEX=0" ;; esac
+        sleep 60
+        adb shell "rm -f $D/freq.txt; nohup sh -c 'while :; do cat /sys/class/devfreq/34f00000.gpu0/cur_freq; sleep 0.2; done' > $D/freq.txt 2>/dev/null & echo \$! > $D/freq.pid"
+        tag="dh_${gguf%.gguf}_${arm}_$(date +%H%M%S)"
+        run_sb "$tag" $sg medium.wav 2 "$ex"
+        adb shell "kill \$(cat $D/freq.pid) 2>/dev/null; rm -f $D/freq.pid"
+        adb pull -q $D/freq.txt "$LOG/$tag.freq" >/dev/null 2>&1
+        echo "${gguf%.gguf} $arm: $(grep -oE 'decode=[0-9.]+ms \([0-9]+' "$LOG/$tag.txt" | sed -E 's/decode=([0-9.]+)ms \(([0-9]+)/\1 \2/' | awk '{printf "%.1f ", $1/$2}') ms/tok | enc+prefill $(grep -oE 'enc\+prefill=[0-9.]+' "$LOG/$tag.txt" | cut -d= -f2 | tr '\n' ' ') | GPU MHz median $(sort -n "$LOG/$tag.freq" | awk '{a[NR]=$1} END {print a[int(NR/2)+1]/1e6}') min $(sort -n "$LOG/$tag.freq" | head -1 | awk '{print $1/1e6}')"
       done
     done
     ;;

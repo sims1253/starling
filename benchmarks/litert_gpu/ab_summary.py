@@ -4,7 +4,8 @@ wall per transcription and decode ms/token, per model, clip and arm.
 
 python -I ab_summary.py LOGDIR
 Every ab_<model>_<clip>_r<round>_sg<arm>.txt holds one starling-bench
-invocation (--warmup --runs N); all timed runs of an arm are pooled.
+invocation (--warmup --runs N); the warm-up line is dropped and all timed
+runs of an arm are pooled.
 """
 import collections
 import glob
@@ -21,7 +22,8 @@ for f in glob.glob(f"{d}/ab_*_r*_sg*.txt"):
         continue
     key = (m.group(1), m.group(2), m.group(3))
     txt = open(f).read()
-    for line in txt.splitlines():
+    lines = [l for l in txt.splitlines() if re.search(r"(?:enc\+prefill|encoder)=", l) and "total=" in l]
+    for line in lines[1:]:   # the first is the --warmup run
         ep = re.search(r"(?:enc\+prefill|encoder)=([\d.]+)ms", line)
         tot = re.search(r"total=([\d.]+)ms", line)
         dec = re.search(r"decode=([\d.]+)ms \((\d+) tokens", line)

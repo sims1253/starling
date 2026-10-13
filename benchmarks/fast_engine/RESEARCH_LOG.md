@@ -1162,3 +1162,121 @@ Remaining levers, in order: P5-15 (4-bit B tiles, the LLM and encoder W4
 linears are ~70 % of Qwen3 enc+prefill); a flash-style fused prefill
 attention (LLM attention + RoPE/KV ~10 %); ARK's 32-layer global-attention
 Whisper encoder (enc+prefill 2.8 / 8.7 s) deserves its own ablation.
+
+## P6: the subgroup-broadcast GEMM from LiteRT's PowerVR kernels (2026-10-13, branch fast-ldrift-gemm)
+
+Goal: P5 left every encoder/prefill GEMM at ~200 GFLOPS, bound by
+operand reads from shared memory. Base: `t3/optimize-phone-model-serving`
+32b9aa39. Protocol as P5 (screen off, shell wake hold, `flock`,
+interleaved rounds 0 1 1 0, medians); one binary, `STARLING_FAST_SG=0`
+(gemm.comp) vs `=1` (gemm_sg.comp).
+
+**Where it came from** (`benchmarks/litert_gpu`, the LiteRT study).
+LiteRT 2.3's GPU accelerator (ML Drift, OpenCL on this phone) runs the
+Qwen3-ASR-0.6B audio encoder window in 120 ms fp16 / 347 ms fp32 against
+our 409 ms (encoder-only by `STARLING_FAST_SKIP`); its fp32 numbers match
+torch (rel-L2 2e-6), fp16 gives rel-L2 2.7e-2 with the reference
+transcript. An OpenCL interposer (`clshim`) dumped its kernels: no shared
+memory and no barriers in any matmul; a 128-lane workgroup (= one
+subgroup) with one thread per output row; 8 lanes load the weights of
+the step and `sub_group_broadcast(w, const)` hands them to every lane;
+activations come per thread through `read_imageh` (texture path, clamp
+bounds); register blocks as small as one half4 accumulator.
+
+**Probes** (Vulkan, standalone, `benchmarks/litert_gpu/vk_probe`):
+
+| # | Probe / hypothesis | Result |
+| --- | --- | --- |
+| P6-1 | ML Drift's FC kernel ported to Vulkan (pre-packed f16 weights, A in a texel buffer) | 450–570 GFLOPS at our shapes vs gemm.comp's 180–270; f32 math as fast as f16 |
+| P6-2 | f16 arithmetic in Vulkan on this driver (`alu.comp`: f32 / f16vec4 mad, fma, f16vec2 fma, broadcast loops) | f16vec4 = f32 rate (~1.45 TFLOPS); f16vec4 `fma()` −20 %; broadcast loop f16 only 1.37× f32 (OpenCL: 2×, and OpenCL `fma(half)` is emulated, 60 GFLOPS). ML Drift's fp16 margin is an OpenCL-compiler effect: not portable, f32 products stay |
+| P6-3 | The same structure on the engine's own layouts (`fc3.comp`: row-major W4/W8/F16 weights, lane j dequantizes 8 weights of column j, `dot` per column) | NB 16 columns, 1 row per lane, texel-buffer A: W4 350–434, W8 346–425, F16 366–439 GFLOPS (gemm.comp 152–279), rel. err ~3e-8 |
+| P6-4 | A from the storage buffer instead of the texture path | −5..−15 % (kept as the fallback past the view limit) |
+| P6-5 | vec4 accumulators (component FMAs, reduce at the end) instead of `dot` | −25..−35 %. discard |
+| P6-6 | 2 rows per lane (RM 2) | −50 % and worse (registers). discard |
+| P6-7 | 32 columns per workgroup | −15..−25 %. discard |
+| P6-8 | 8 columns per workgroup for small grids (d × d projections, 56 workgroups at N = 896) | equal at best, −45 % at K = 7680. discard |
+| P6-9 | Conv input through row-blocked texture views (blocks of whole workgroups whose input window fits 65536 texels; Qwen3 conv2 reads 24 MiB, ~0.7 MiB per 128 rows) | conv GEMMs 100 → 69 ms (gemm.comp 137). **keep** |
+| P6-10 | RADV (host iGPU, 64-lane subgroups) | correct, but gemm.comp's packed-f16 tiles are 2–2.5× faster there: PowerVR only |
+
+**What landed** (`gemm_sg.comp`, `Kernels::gemm` routes to it on PowerVR
+when the device has subgroup broadcast in compute shaders and ≥ 16-lane
+subgroups): every W4 / W8 / F16 GEMM and the implicit 3×3/s2 convs (P·V
+with F16ᵀ stays on gemm.comp), one thread per row of A, 16 output
+columns per subgroup-sized workgroup, per 8-deep k chunk lanes 0–15
+load and dequantize their column's 8 weights to f32 and
+`subgroupBroadcast` hands them to every lane, f32 `dot` accumulation, no
+shared memory, no barriers, gemm.comp's push constants and epilogues
+(bias modes, activations, GLU/SwiGLU, residual, QUV, batching, causal
+skip). A reads through `R32G32B32A32_UINT` texel-buffer views (8 halves
+per texel); `maxTexelBufferElements` is 65536 on this driver, so
+dispatches whose A window exceeds 1 MiB are split into row blocks with a
+view each, and anything that still does not fit reads the storage
+buffer. vk_runtime gained uniform-texel-buffer bindings (a per-shader
+texel mask) and a buffer-view cache dropped with its buffer.
+
+Not bit-exact with gemm.comp (two 4-term dots per chunk; and W4/W8
+weights stay f32 after dequantization where gemm.comp rounds them to f16
+in shared memory — the `gemmx` CPU-reference error drops from 1–4e-5 to
+~3e-8).
+
+**Where enc+prefill went** (Qwen3-0.6B short, `STARLING_FAST_SKIP` by
+class, medians of 6 per arm):
+
+| class | gemm.comp | gemm_sg.comp |
+| --- | --- | --- |
+| LLM linears | 489 ms | 246 ms |
+| encoder linears | 195 ms | 106 ms |
+| conv GEMMs | 137 ms | 69 ms |
+| attention products | 33 ms | 28 ms |
+| enc+prefill | 990 ms | 570 ms |
+
+**Accuracy.** Transcripts identical with and without the kernel on the
+phone for all seven models on short and medium. FLEURS en_us, 100 clips,
+on the host GPU with the PowerVR numerics (f32 products, kernel forced,
+texel views capped at 65536): WER identical for every model and 0 of 100
+transcripts differ — Qwen3-0.6B 5.85 %, Qwen3-1.7B 3.91 %, Parakeet
+5.33 %, MOSS 7.87 %, ARK-0.6B 5.09 %, Granite 5.52 %, Voxtral 13.58 %.
+
+**On the phone** (one binary, `STARLING_FAST_SG` 0 / 1, rounds 0 1 1 0,
+3 timed runs each after a warm-up; medians of 6 per arm):
+
+| Model | clip | enc+prefill old → new | wall old → new | decode ms/tok old / new | n |
+| --- | --- | --- | --- | --- | --- |
+| ARK-0.6B q4k | short | 2876 → **1822** ms (-37 %) | 3.81 → **2.75** s (-28 %) | 28.6 / 28.5 | 6+6 |
+| ARK-0.6B q4k | medium | 9000 → **7150** ms (-21 %) | 11.98 → **10.49** s (-12 %) | 30.4 / 33.4 | 6+6 |
+| Granite dynq4 | short | 3282 → **2049** ms (-38 %) | 5.65 → **4.51** s (-20 %) | 73.3 / 76.0 | 6+6 |
+| Granite dynq4 | medium | 8229 → **5728** ms (-30 %) | 13.42 → **11.83** s (-12 %) | 78.3 / 91.5 | 6+6 |
+| MOSS q4e8 | short | 2756 → **1487** ms (-46 %) | 4.87 → **3.66** s (-25 %) | 60.8 / 61.5 | 6+6 |
+| MOSS q4e8 | medium | 6297 → **4796** ms (-24 %) | 12.35 → **11.33** s (-8 %) | 64.3 / 70.9 | 6+6 |
+| Parakeet (encoder) | short | 712 → **433** ms (-39 %) | 0.93 → **0.65** s (-30 %) | — | 6+6 |
+| Parakeet (encoder) | medium | 1980 → **1509** ms (-24 %) | 2.38 → **1.87** s (-21 %) | — | 6+6 |
+| Qwen3-ASR-0.6B q4e8 | short | 992 → **572** ms (-42 %) | 2.03 → **1.64** s (-20 %) | 25.1 / 25.2 | 6+6 |
+| Qwen3-ASR-0.6B q4e8 | medium | 2407 → **1539** ms (-36 %) | 5.40 → **4.54** s (-16 %) | 27.1 / 27.0 | 6+6 |
+| Qwen3-ASR-1.7B q4e8-imx | short | 2318 → **1223** ms (-47 %) | 4.70 → **3.62** s (-23 %) | 62.5 / 62.8 | 6+6 |
+| Qwen3-ASR-1.7B q4e8-imx | medium | 5263 → **3577** ms (-32 %) | 12.04 → **10.46** s (-13 %) | 64.9 / 66.1 | 6+6 |
+| Voxtral q4k | short | 9063 → **6230** ms (-31 %) | 22.72 → **21.40** s (-6 %) | 132.4 / 147.4 | 6+6 |
+| Voxtral q4k | medium | 19918 → **14174** ms (-29 %) | 63.40 → **63.06** s (-1 %) | 150.1 / 168.9 | 6+6 |
+
+Decode is unchanged: the interleaved window above heated the phone, and
+the ms/token of the big models drifted up through the session, more in
+the middle (new-kernel) rounds (e.g. Granite medium 78 → 92). Re-measured
+with a 60 s cool-down before every invocation (arms 0 1 1 0, plus 1
+without texel views; Granite and MOSS medium, rebased build): Granite
+73.4 / 76.5 / 77.0 / 76.2 ms/token, MOSS 62.7–64.8 in every arm, GPU
+clock at 1094 MHz 62–90 % of the samples in every arm. Qwen3 decode
+matches to 0.1 ms in the session (24.3 / 24.2, 61.3 / 61.3). Voxtral's
+wall gain (−6 % / −1 %) is understated for the same reason: its decode
+(13 / 43 s) dominates and ran hot in the new-kernel rounds.
+
+Rebased on 8c2bc3ee (the TPU encoder merge) and re-checked with
+`STARLING_NPU=0` (log: "npu: disabled"): transcripts identical, Qwen3-0.6B
+enc+prefill 983 → 567 / 2389 → 1534 ms, 1.7B 2302 → 1226 / 5219 → 3479 ms.
+Energy was not measured: the phone was on AC power (`/tmp/phone/power.sh`
+needs a discharging battery).
+
+Remaining levers: the LLM linears are still ~43 % of Qwen3 enc+prefill
+at ~370 GFLOPS; ML Drift's pre-packed layout (a lane holds 4 output
+columns of one k, vec4 FMAs into independent accumulators) measured
+another ~15 % in the probe (P6-1 vs P6-3) but needs a second resident
+weight layout next to the decode GEMVs' one; P·V (F16ᵀ) is still a
+shared-tile kernel.
