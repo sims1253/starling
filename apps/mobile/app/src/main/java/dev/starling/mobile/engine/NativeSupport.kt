@@ -110,6 +110,9 @@ object NativeSupport {
             cacheDir.mkdirs()
             runCatching { Os.setenv(FAST_CACHE_ENV, cacheDir.absolutePath, false) }
         }
+        // The engine reports what it needs (status-*.txt) only into existing
+        // directories, and npu_compile_all.sh reads those reports.
+        npuDirs.forEach { runCatching { it.mkdirs() } }
         npuDirValue(npuDirs)?.let { dirs ->
             if (System.getenv(NPU_DIR_ENV).isNullOrEmpty()) runCatching { Os.setenv(NPU_DIR_ENV, dirs, false) }
         }
