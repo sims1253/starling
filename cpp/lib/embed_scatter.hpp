@@ -12,6 +12,11 @@
 
 namespace starling::ggml::lib {
 
+// f32 rows of llm.embed.weight for `ids` ([ids.size() * hidden]), looked up
+// on the backend so only those rows are dequantized (any weight dtype).
+bool embed_rows(const ModelLoader& ml, const std::vector<int32_t>& ids,
+                std::vector<float>& out);
+
 // Token-embedding lookup over `ids`, then overwrite each audio slot (mask
 // != 0) with the corresponding audio feature row. When the audio path emits
 // fewer features than there are slots (long audio, mel capped), the overflow

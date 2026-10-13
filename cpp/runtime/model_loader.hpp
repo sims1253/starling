@@ -38,8 +38,9 @@ struct GgufValue {
 };
 
 // Loads a GGUF file and owns the weight tensors. The GGUF context + the weight
-// data stay memory-backed for the loader's lifetime (zero-copy on CPU; mirrored
-// to the device by realize_weights on GPU).
+// data (a private file mapping; see weight_data) stay host-backed for the
+// loader's lifetime (zero-copy on CPU; mirrored to the device by
+// realize_weights on GPU).
 class ModelLoader {
 public:
     ModelLoader();
@@ -54,6 +55,9 @@ public:
     bool load(const char* path);
 
     const std::string& last_error() const { return error_; }
+
+    // The GGUF file load() opened ("" before a successful load).
+    const std::string& path() const { return path_; }
 
     // ---- metadata -------------------------------------------------------
     const std::unordered_map<std::string, GgufValue>& kv() const { return kv_; }
@@ -73,9 +77,21 @@ public:
     // All tensor names (for diagnostics / "is the expected set present?").
     std::vector<std::string> tensor_names() const;
 
-    // The ggml context that owns the weight tensors (memory-backed by the GGUF
-    // allocation on CPU; realized to the device by realize_weights on GPU).
+    // The ggml context that owns the weight tensors (realized to the device
+    // by realize_weights on GPU).
     ggml_context* ctx() const { return ctx_; }
+
+    // The host memory holding the GGUF weight data: a private mapping of the
+    // file (Linux/Android/macOS; pages load on first touch and can be
+    // dropped again with madvise — the file still backs them), or the ggml
+    // context's own allocation when the file was read (other platforms, a
+    // GGUF aligned to less than 32 bytes, or a file that cannot be mapped).
+    // Pages ggml's CPU repack rewrote are private copies that dropping would
+    // revert to the file's bytes, so only weights no ggml graph runs (those a
+    // fast engine took over) are ever dropped.
+    void* weight_data() const { return data_; }
+    size_t weight_bytes() const { return data_size_; }
+    bool weights_mapped() const { return map_addr_ != nullptr; }
 
     // Give every weight a backend buffer on `backend` (zero-copy on CPU, a
     // mirrored upload on GPU). Idempotent. Called automatically by clone_weight
@@ -129,6 +145,16 @@ private:
     template<class T> struct Cache : CacheBase { std::unique_ptr<T> value; };
     mutable std::vector<std::pair<std::type_index, std::unique_ptr<CacheBase>>> caches_;
     void release_runtime_resources();
+    // Mapped: weights point into the mapping. ReadInstead: nothing is kept
+    // (loosely aligned GGUF, or the file cannot be mapped); load() reads it.
+    // Failed: a malformed GGUF, error_ says why; nothing is kept either.
+    enum class MapResult { Mapped, ReadInstead, Failed };
+    MapResult map_weights(const char* path);
+    void drop_mapping();
+    void* map_addr_ = nullptr;              // the GGUF file mapping (mmap loads)
+    size_t map_len_ = 0;
+    uint8_t* data_ = nullptr;               // weight data region (see weight_data)
+    size_t data_size_ = 0;
     ggml_context* device_ctx_ = nullptr;
     ggml_backend_buffer* weight_buffer_ = nullptr;
     ggml_context* ctx_ = nullptr;          // owns the weight tensors
@@ -138,6 +164,7 @@ private:
     std::unordered_map<std::string, ggml_tensor*> host_tensors_;
     std::unordered_map<std::string, GgufValue> kv_;
     std::string error_;
+    std::string path_;
     bool realized_ = false;
 };
 

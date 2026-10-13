@@ -1,9 +1,15 @@
 // kernels.cpp — see kernels.hpp.
 
 #include "kernels.hpp"
+#include "packed_file.hpp"
+
+#include "ggml.h"
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <new>
 #include <mutex>
 #include <thread>
 #include <chrono>
@@ -12,12 +18,39 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace starling::fast {
 
 // ---------------------------------------------------------------------------
 // Arena
 // ---------------------------------------------------------------------------
+
+namespace {
+
+bool env_flag(const char* name, bool dflt) {
+    const char* e = std::getenv(name);
+    return e && e[0] ? e[0] != '0' : dflt;
+}
+
+// Return the whole pages inside [p, p + n) of a private file mapping to the
+// kernel (they refault from the file if read again).
+void drop_pages(const void* p, size_t n) {
+#if defined(__linux__)
+    static const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t b = ((uintptr_t)p + page - 1) / page * page;
+    const uintptr_t e = ((uintptr_t)p + n) / page * page;
+    if (e > b) madvise((void*)b, e - b, MADV_DONTNEED);
+#else
+    (void)p;
+    (void)n;
+#endif
+}
+
+} // namespace
 
 Arena::Id Arena::add(std::vector<uint32_t> words) {
     Blob b;
@@ -33,25 +66,285 @@ Arena::Id Arena::add_f32(const std::vector<float>& v) {
     return add(std::move(w));
 }
 
+Arena::Id Arena::add_deferred(size_t words, Producer fn) {
+    Blob b;
+    b.bytes = std::max<size_t>(words * 4, 4);
+    b.fn = std::move(fn);
+    blobs_.push_back(std::move(b));
+    return blobs_.size() - 1;
+}
+
+GMat deferred_f16(Arena& a, uint32_t N, uint32_t K,
+                  std::function<bool(std::vector<float>&, std::string&)> make) {
+    const size_t n = (size_t)N * K;
+    GMat g;
+    g.fmt = GpuFmt::F16;
+    g.N = N;
+    g.K = K;
+    g.q = a.add_deferred((n + 1) / 2, [n, make = std::move(make)](uint32_t* dst, std::string& err) {
+        std::vector<float> v;
+        if (!make(v, err)) return false;
+        if (v.size() != n) { err = "fast engine: deferred matrix size mismatch"; return false; }
+        const std::vector<uint32_t> w = pack_f16(v.data(), n);
+        std::memcpy(dst, w.data(), w.size() * 4);
+        return true;
+    });
+    return g;
+}
+
+MatSpec raw_rows(int type, const void* data, uint32_t N, uint32_t K, const std::string& name) {
+    MatSpec m;
+    m.name = name;
+    m.N = N;
+    m.K = K;
+    MatPart p;
+    p.type = type;
+    p.data = data;
+    p.rows = N;
+    p.K = K;
+    m.parts.push_back(p);
+    return m;
+}
+
+MatSpec tensor_rows(const ggml_tensor* t, const std::string& name) {
+    const uint32_t K = (uint32_t)t->ne[0];
+    return raw_rows((int)t->type, t->data, (uint32_t)(ggml_nelements(t) / t->ne[0]), K, name);
+}
+
+MatSpec row_range(const MatSpec& m, uint32_t r0, uint32_t n) {
+    MatSpec r = m;
+    MatPart& p = r.parts.at(0);
+    if (p.packed) p.packed_row0 += r0;
+    else p.data = (const uint8_t*)p.data + (size_t)r0 * ggml_row_size((ggml_type)p.type, m.K);
+    p.rows = n;
+    r.N = n;
+    return r;
+}
+
+MatSpec spec_concat(MatSpec a, const MatSpec& b) {
+    for (MatPart p : b.parts) {
+        p.dst.first += a.N;   // (tables are only made by spec_permute, last)
+        a.parts.push_back(std::move(p));
+    }
+    a.N += b.N;
+    return a;
+}
+
+MatSpec spec_interleave(MatSpec a, const MatSpec& b) {
+    for (MatPart& p : a.parts) { p.dst.first *= 2; p.dst.step *= 2; }
+    for (MatPart p : b.parts) {
+        p.dst.first = 2 * p.dst.first + 1;
+        p.dst.step *= 2;
+        a.parts.push_back(std::move(p));
+    }
+    a.N += b.N;
+    return a;
+}
+
+MatSpec spec_permute(MatSpec m, const std::vector<uint32_t>& order) {
+    auto inv = std::make_shared<std::vector<uint32_t>>(order.size());
+    for (uint32_t r = 0; r < order.size(); ++r) (*inv)[order[r]] = r;
+    MatPart& p = m.parts.at(0);
+    p.table = inv;
+    p.dst.table = inv->data();
+    return m;
+}
+
+bool plan_matrix(MatSpec& m, GpuFmt& fmt, LayoutDesc& layout, std::string& err) {
+    uint64_t rows = 0;
+    bool inside = true;   // every destination row inside [0, N)
+    for (const MatPart& p : m.parts) {
+        rows += p.rows;
+        if (!p.packed && !p.data) {
+            err = "fast engine: " + m.name + ": tensor data missing";
+            return false;
+        }
+        if (p.K != m.K) {
+            err = "fast engine: " + m.name + ": parts of different row lengths";
+            return false;
+        }
+        if (p.rows == 0) continue;
+        if (p.table) {
+            inside = inside && p.table->size() == p.rows && p.dst.table == p.table->data();
+            for (uint32_t r : *p.table) inside = inside && r < m.N;
+        } else {
+            inside = inside && !p.dst.table && p.dst.first + (uint64_t)(p.rows - 1) * p.dst.step < m.N;
+        }
+    }
+    if (m.parts.empty() || m.N == 0 || m.K == 0 || rows != m.N || !inside) {
+        err = "fast engine: " + m.name + ": parts do not cover the matrix";
+        return false;
+    }
+    std::vector<GpuFmt> f(m.parts.size());
+    std::vector<LayoutDesc> lay(m.parts.size());
+    auto plan_part = [&](size_t i, bool force_w8) {
+        MatPart& p = m.parts[i];
+        bool lossless;
+        if (!plan_gpu_rows(p.type, m.K, force_w8, f[i], lossless, err)) {
+            err = m.name + ": " + err;
+            return false;
+        }
+        lay[i] = f[i] == GpuFmt::W8 ? LayoutDesc{8, 16, true} : LayoutDesc{};   // w8g16sym / w4g32asym
+        return true;
+    };
+    for (size_t i = 0; i < m.parts.size(); ++i) {
+        const PackedTensor* pt = m.parts[i].packed;
+        if (!pt) {
+            if (!plan_part(i, false)) return false;
+            continue;
+        }
+        // Kernel support: exactly the two legacy shapes (see PackedWeights::matrix).
+        if (!pt->desc.is_legacy_w4() && !pt->desc.is_legacy_w8()) {
+            err = "packed file: " + m.name + " uses layout " + layout_to_string(pt->desc) +
+                  ", which has no kernel support in this build";
+            return false;
+        }
+        f[i] = pt->desc.is_legacy_w4() ? GpuFmt::W4 : GpuFmt::W8;
+        lay[i] = pt->desc;
+    }
+    // Fused row groups need one format: when the parts come in different
+    // formats (Granite: Q5_K gate -> W8, Q4_K up -> W4), the others are
+    // repacked from their GGUF rows to W8.
+    for (size_t i = 1; i < f.size(); ++i) {
+        if (f[i] == f[0]) continue;
+        for (size_t j = 0; j < f.size(); ++j) {
+            if (f[j] == GpuFmt::W8) continue;
+            m.parts[j].packed = nullptr;
+            if (!plan_part(j, true)) return false;
+        }
+        break;
+    }
+    fmt = f[0];
+    layout = lay[0];
+    if (fmt == GpuFmt::F16 && m.K % 2) {
+        err = "fast engine: " + m.name + ": f16 rows need an even K";
+        return false;
+    }
+    if (m.scale != 1.0f && fmt != GpuFmt::F16 && !layout.is_legacy_w4() && !layout.is_legacy_w8()) {
+        err = "scale_matrix: packed-file layout " + layout_to_string(layout);
+        return false;
+    }
+    return true;
+}
+
+bool Arena::add_matrix(MatSpec m, GMat& g, std::string& err) {
+    GpuFmt fmt;
+    LayoutDesc layout;
+    if (!plan_matrix(m, fmt, layout, err)) return false;
+    g = GMat{};
+    g.fmt = fmt;
+    g.N = m.N;
+    g.K = m.K;
+    g.layout = layout;
+    // Codes and scales are placed in one buffer (finalize fills a buffer at
+    // a time where it stages).
+    Blob q;
+    q.bytes = std::max<VkDeviceSize>((VkDeviceSize)m.N * q_row_words(fmt, m.K) * 4, 4);
+    q.group = 1;
+    blobs_.push_back(q);
+    g.q = blobs_.size() - 1;
+    Planned pm{std::move(m), fmt, g.q, SIZE_MAX};
+    const VkDeviceSize sb = (VkDeviceSize)pm.spec.N * s_row_words(fmt, pm.spec.K) * 4;
+    if (sb) {
+        Blob s;
+        s.bytes = sb;
+        blobs_.push_back(s);
+        g.s = pm.s = blobs_.size() - 1;
+        g.has_s = true;
+        blobs_[g.q].group = 2;
+    }
+    mats_.push_back(std::move(pm));
+    return true;
+}
+
+bool Arena::fill_unit(const Unit& u, const std::vector<uint8_t*>& base, std::string& err) const {
+    if (u.mat == SIZE_MAX) {   // a deferred blob
+        const Blob& b = blobs_[u.part];
+        return b.fn((uint32_t*)(base[b.buffer] + b.off), err);
+    }
+    const Planned& pm = mats_[u.mat];
+    const Blob& qb = blobs_[pm.q];
+    uint32_t* q = (uint32_t*)(base[qb.buffer] + qb.off);
+    uint32_t* s = nullptr;
+    if (pm.s != SIZE_MAX) s = (uint32_t*)(base[blobs_[pm.s].buffer] + blobs_[pm.s].off);
+    if (!fill_spec_rows(pm.spec, pm.fmt, u.part, u.row0, u.rows, q, s, err)) return false;
+    const MatPart& p = pm.spec.parts[u.part];
+    if (release_sources_ && !p.packed) {
+        const size_t rb = ggml_row_size((ggml_type)p.type, pm.spec.K);
+        drop_pages((const uint8_t*)p.data + (size_t)u.row0 * rb, (size_t)u.rows * rb);
+    }
+    return true;
+}
+
+bool fill_spec_rows(const MatSpec& m, GpuFmt fmt, size_t pi, uint32_t row0, uint32_t rows,
+                    uint32_t* q, uint32_t* s, std::string& err) {
+    const MatPart& p = m.parts[pi];
+    const uint32_t K = m.K;
+    RowMap map = p.dst;   // rows [row0, row0 + rows) of the part
+    if (map.table) map.table += row0;
+    else map.first += (uint64_t)row0 * map.step;
+    if (p.packed) {
+        const uint32_t qw = q_row_words(fmt, K), sw = s_row_words(fmt, K);
+        const size_t cb = (size_t)layout_code_bytes(p.packed->desc, K);
+        const size_t sbytes = (size_t)layout_scale_bytes(p.packed->desc, K);
+        for (uint32_t i = 0; i < rows; ++i) {
+            const size_t r = (size_t)p.packed_row0 + row0 + i;
+            const uint64_t d = map(i);
+            std::memcpy(q + d * qw, p.packed->codes.data() + r * cb, cb);
+            std::memcpy(s + d * sw, p.packed->scales.data() + r * sbytes, sbytes);
+            if (m.scale != 1.0f) scale_f16_words(s + d * sw, sw, m.scale);
+        }
+        return true;
+    }
+    const size_t rb = ggml_row_size((ggml_type)p.type, K);
+    if (!pack_gpu_rows(p.type, (const uint8_t*)p.data + (size_t)row0 * rb, rows, K, fmt, m.scale, q, s, map, err)) {
+        err = m.name + ": " + err;
+        return false;
+    }
+    return true;
+}
+
+bool materialize(MatSpec m, HostMatrix& out, std::string& err) {
+    out = HostMatrix{};
+    if (!plan_matrix(m, out.fmt, out.layout, err)) return false;
+    out.N = m.N;
+    out.K = m.K;
+    out.q.assign((size_t)m.N * q_row_words(out.fmt, m.K), 0);
+    out.s.assign((size_t)m.N * s_row_words(out.fmt, m.K), 0);
+    for (size_t pi = 0; pi < m.parts.size(); ++pi)
+        if (!fill_spec_rows(m, out.fmt, pi, 0, m.parts[pi].rows, out.q.data(),
+                            out.s.empty() ? nullptr : out.s.data(), err))
+            return false;
+    return true;
+}
+
 bool Arena::finalize(vk::Context& ctx, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
     const auto& info = ctx.info();
     VkDeviceSize cap = 256ull << 20;
     cap = std::min<VkDeviceSize>(cap, info.max_storage_range);
     if (info.max_alloc) cap = std::min<VkDeviceSize>(cap, info.max_alloc);
     const VkDeviceSize align = std::max<VkDeviceSize>(info.min_storage_align, 256);
-    // First-fit placement in insertion order.
+    auto up = [&](VkDeviceSize x) { return (x + align - 1) / align * align; };
+    // First-fit placement in insertion order; a matrix's codes and scales
+    // share a buffer.
     std::vector<VkDeviceSize> sizes;
-    for (Blob& b : blobs_) {
-        if (b.bytes > cap) {
-            err = "fast engine: tensor of " + std::to_string(b.bytes >> 20) +
+    for (size_t i = 0; i < blobs_.size();) {
+        const size_t n = std::max<size_t>(blobs_[i].group, 1);
+        VkDeviceSize need = 0;
+        for (size_t j = i; j < i + n; ++j) need = up(need) + blobs_[j].bytes;
+        if (need > cap) {
+            err = "fast engine: tensor of " + std::to_string(need >> 20) +
                   " MiB exceeds the device's storage-buffer range";
             return false;
         }
-        if (sizes.empty() || (sizes.back() + align - 1) / align * align + b.bytes > cap) sizes.push_back(0);
-        VkDeviceSize off = (sizes.back() + align - 1) / align * align;
-        b.buffer = sizes.size() - 1;
-        b.off = off;
-        sizes.back() = off + b.bytes;
+        if (sizes.empty() || up(sizes.back()) + need > cap) sizes.push_back(0);
+        for (size_t j = i; j < i + n; ++j) {
+            blobs_[j].buffer = sizes.size() - 1;
+            blobs_[j].off = up(sizes.back());
+            sizes.back() = blobs_[j].off + blobs_[j].bytes;
+        }
+        i += n;
     }
     // #325 preflight: refuse the load cleanly when the GPU cannot fit the
     // arena (budget query where the driver exposes it; no-op elsewhere).
@@ -61,34 +354,184 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
         std::string berr;
         if (!ctx.check_memory_budget(total, berr)) { err = berr; return false; }
     }
+    // Mapped device memory where the CPU writes it fast (UMA phones):
+    // repacked rows land in place. Elsewhere (desktop APUs map device memory
+    // uncached; discrete GPUs) each buffer is filled in host memory and
+    // staged. STARLING_FAST_MAPPED_WEIGHTS=0/1 overrides.
+    const bool mapped = env_flag("STARLING_FAST_MAPPED_WEIGHTS", info.uma_cached);
     buffers_.clear();
-    for (VkDeviceSize sz : sizes) {
-        auto buf = std::make_unique<vk::Buffer>();
-        // Mapped uploads (plain memcpy) when device memory is CPU-cached
-        // (phones: 8x faster than staging); staged copies where mapped device
-        // memory is uncached for the CPU (desktop APUs).
-        const char* mw = std::getenv("STARLING_FAST_MAPPED_WEIGHTS");
-        const bool mapped = mw ? mw[0] == '1' : ctx.info().uma_cached;
-        const vk::Mem kind = mapped ? vk::Mem::Device : vk::Mem::DeviceOnly;
-        if (!ctx.create_buffer(*buf, sz, kind, err)) return false;
-        buffers_.push_back(std::move(buf));
-        total_ += sz;
+    total_ = 0;
+
+    // Fill units: ~1 MiB of repacked rows each, or one deferred blob, in
+    // buffer order (the order the buffers are allocated in).
+    std::vector<Unit> units;
+    for (size_t i = 0; i < blobs_.size(); ++i)
+        if (blobs_[i].fn) units.push_back({SIZE_MAX, i, 0, 0});
+    for (size_t mi = 0; mi < mats_.size(); ++mi) {
+        const Planned& pm = mats_[mi];
+        const size_t row_bytes = ((size_t)q_row_words(pm.fmt, pm.spec.K) + s_row_words(pm.fmt, pm.spec.K)) * 4;
+        const uint32_t step = (uint32_t)std::max<size_t>(1, (1u << 20) / std::max<size_t>(row_bytes, 1));
+        for (size_t pi = 0; pi < pm.spec.parts.size(); ++pi)
+            for (uint32_t r = 0; r < pm.spec.parts[pi].rows; r += step)
+                units.push_back({mi, pi, r, std::min(step, pm.spec.parts[pi].rows - r)});
     }
-    // Uploads are independent copies (memcpy into mapped memory on UMA
-    // devices), so they run in parallel; staged uploads serialize internally.
+    auto unit_buffer = [&](const Unit& u) { return blobs_[u.mat == SIZE_MAX ? u.part : mats_[u.mat].q].buffer; };
+    std::stable_sort(units.begin(), units.end(),
+                     [&](const Unit& a, const Unit& b) { return unit_buffer(a) < unit_buffer(b); });
+    // Failures, exceptions included (an allocation failure while loading
+    // is recoverable: the load returns an error), stop every thread through
+    // `ok`; nothing escapes a worker or allocator thread.
     std::atomic<bool> ok{true};
     std::string first_err;
     std::mutex mu;
-    parallel_for(blobs_.size(), [&](size_t i) {
-        Blob& b = blobs_[i];
-        std::string e;
-        if (ok && !ctx.upload(*buffers_[b.buffer], b.off, b.words.data(), b.words.size() * 4, e)) {
-            std::lock_guard<std::mutex> lk(mu);
-            if (ok.exchange(false)) first_err = e;
+    auto fail = [&](const char* e) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (ok.exchange(false)) {
+            try {
+                first_err = e;
+            } catch (...) {
+            }
         }
-        std::vector<uint32_t>().swap(b.words);   // release the host copy
-    });
-    if (!ok) { err = first_err; return false; }
+    };
+    auto guarded = [&](auto&& body) {
+        try {
+            body();
+        } catch (const std::bad_alloc&) {
+            fail("fast engine: out of memory while loading the weights");
+        } catch (const std::exception& e) {
+            fail(e.what());
+        } catch (...) {
+            fail("fast engine: weight load failed");
+        }
+    };
+    // first_err stays empty only if copying the message itself ran out of memory.
+    auto load_error = [&] { return first_err.empty() ? std::string("fast engine: out of memory") : first_err; };
+    auto run_units = [&](const std::vector<uint8_t*>& base, const std::vector<size_t>& idx) {
+        parallel_for(idx.size(), [&](size_t k) {
+            guarded([&] {
+                std::string e;
+                if (ok && !fill_unit(units[idx[k]], base, e)) fail(e.c_str());
+            });
+        });
+    };
+    std::vector<uint8_t*> base(sizes.size(), nullptr);
+    std::chrono::steady_clock::time_point t1;
+    if (mapped) {
+        // Allocation (the driver zeroes the pages: ~6 GB/s per thread on the
+        // Pixel) overlaps the fill: allocator threads create the buffers in
+        // order while the workers repack into those already mapped.
+        const size_t nb = sizes.size();
+        std::vector<std::unique_ptr<vk::Buffer>> bufs(nb);
+        std::unique_ptr<std::atomic<bool>[]> ready(new std::atomic<bool>[nb]);
+        for (size_t i = 0; i < nb; ++i) ready[i] = false;
+        std::atomic<bool> abort{false};
+        std::condition_variable cv;
+        std::mutex cv_mu;
+        std::atomic<size_t> next{0}, next_buf{0};
+        const size_t nt = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 8);
+        auto work = [&] {
+            for (size_t i; (i = next.fetch_add(1)) < units.size();) {
+                guarded([&] {
+                    const size_t bi = unit_buffer(units[i]);
+                    if (!ready[bi].load(std::memory_order_acquire)) {
+                        std::unique_lock<std::mutex> lk(cv_mu);
+                        cv.wait(lk, [&] { return ready[bi].load(std::memory_order_acquire) || abort.load(); });
+                    }
+                    std::string e;
+                    if (ok && !abort && !fill_unit(units[i], base, e)) fail(e.c_str());
+                });
+            }
+        };
+        auto allocate = [&] {
+            for (size_t i; ok && (i = next_buf.fetch_add(1)) < nb;) {
+                guarded([&] {
+                    auto buf = std::make_unique<vk::Buffer>();
+                    std::string e;
+                    if (!ctx.create_buffer(*buf, sizes[i], vk::Mem::Device, e)) fail(e.c_str());
+                    else if (!buf->host) fail("fast engine: weight buffer is not host-mapped");
+                    if (!ok) return;
+                    base[i] = (uint8_t*)buf->host;
+                    bufs[i] = std::move(buf);
+                    for (Blob& b : blobs_)
+                        if (b.buffer == i && !b.words.empty())
+                            std::memcpy(base[i] + b.off, b.words.data(), b.words.size() * 4);
+                    {
+                        std::lock_guard<std::mutex> lk(cv_mu);
+                        ready[i].store(true, std::memory_order_release);
+                    }
+                    cv.notify_all();
+                });
+            }
+        };
+        // Workers, and two allocator threads (this one and one more). Every
+        // thread is joined on every path: a failure (or a thread that cannot
+        // be started) stops the allocators, then `abort` releases workers
+        // waiting on buffers that never came.
+        std::vector<std::thread> workers, allocators;
+        guarded([&] {
+            workers.reserve(nt);
+            for (size_t t = 0; t < nt; ++t) workers.emplace_back(work);
+            if (nb > 1) allocators.emplace_back(allocate);
+        });
+        allocate();
+        for (auto& t : allocators) t.join();
+        t1 = std::chrono::steady_clock::now();
+        if (!ok) {
+            {
+                std::lock_guard<std::mutex> lk(cv_mu);
+                abort = true;
+            }
+            cv.notify_all();
+        }
+        for (auto& t : workers) t.join();
+        if (!ok) { err = load_error(); return false; }
+        for (size_t i = 0; i < nb; ++i) {
+            total_ += sizes[i];
+            ctx.flush(*bufs[i], 0, bufs[i]->size);
+            buffers_.push_back(std::move(bufs[i]));
+        }
+    } else {
+        for (VkDeviceSize sz : sizes) {
+            auto buf = std::make_unique<vk::Buffer>();
+            if (!ctx.create_buffer(*buf, sz, vk::Mem::DeviceOnly, err)) return false;
+            buffers_.push_back(std::move(buf));
+            total_ += sz;
+        }
+        t1 = std::chrono::steady_clock::now();
+        // One buffer at a time through host memory: the host holds at most
+        // one buffer's worth of repacked rows.
+        std::vector<std::vector<size_t>> by_buf(buffers_.size());
+        for (size_t i = 0; i < units.size(); ++i) {
+            const Unit& u = units[i];
+            by_buf[blobs_[u.mat == SIZE_MAX ? u.part : mats_[u.mat].q].buffer].push_back(i);
+        }
+        std::vector<uint32_t> stage((size_t)(*std::max_element(sizes.begin(), sizes.end()) + 3) / 4);
+        for (size_t bi = 0; bi < buffers_.size(); ++bi) {
+            std::fill(base.begin(), base.end(), nullptr);
+            base[bi] = (uint8_t*)stage.data();
+            for (Blob& b : blobs_)
+                if (b.buffer == bi && !b.words.empty())
+                    std::memcpy(base[bi] + b.off, b.words.data(), b.words.size() * 4);
+            run_units(base, by_buf[bi]);
+            if (!ok) { err = load_error(); return false; }
+            if (!ctx.upload(*buffers_[bi], 0, stage.data(), (size_t)sizes[bi], err)) return false;
+        }
+    }
+    // The planned matrices keep only their shapes; small host blobs and the
+    // producers (and whatever they captured) go too.
+    for (Blob& b : blobs_) {
+        std::vector<uint32_t>().swap(b.words);
+        b.fn = nullptr;
+    }
+    std::vector<Planned>().swap(mats_);
+    if (env_flag("STARLING_FAST_TIMING", false)) {
+        using ms = std::chrono::duration<double, std::milli>;
+        // Mapped: the fill runs from the first allocation on; "allocated" is
+        // when the last buffer was created, "filled" when the last unit was.
+        std::fprintf(stderr, "[fast] arena: %zu buffers %.1f MiB (%s), allocated %.1f ms, filled %.1f ms\n",
+                     buffers_.size(), total_ / 1048576.0, mapped ? "mapped" : "staged", ms(t1 - t0).count(),
+                     ms(std::chrono::steady_clock::now() - t0).count());
+    }
     return true;
 }
 
@@ -104,26 +547,32 @@ void parallel_for(size_t n, const std::function<void(size_t)>& f) {
         for (size_t i = 0; i < n; ++i) f(i);
         return;
     }
+    // The first exception (from f or from starting a thread) stops the
+    // remaining work and is rethrown here once every thread has joined.
     std::atomic<size_t> next{0};
+    std::exception_ptr first;
+    std::mutex mu;
+    auto stop = [&](std::exception_ptr e) {
+        next.store(n);
+        std::lock_guard<std::mutex> lk(mu);
+        if (!first) first = e;
+    };
     std::vector<std::thread> th;
-    for (size_t t = 0; t < nt; ++t)
-        th.emplace_back([&] {
-            for (size_t i; (i = next.fetch_add(1)) < n;) f(i);
-        });
-    for (auto& t : th) t.join();
-}
-
-bool PackJobs::run(Arena& ar, std::string& err) {
-    std::vector<Job*> v;
-    for (Job& j : jobs_) v.push_back(&j);
-    parallel_for(v.size(), [&](size_t i) { v[i]->ok = v[i]->fn(v[i]->out, v[i]->err); });
-    for (Job& j : jobs_) {
-        if (!j.ok) { err = j.err.empty() ? "fast engine: weight repack failed" : j.err; return false; }
-        if (j.dst) *j.dst = arena_matrix(ar, std::move(j.out));
-        else *j.sink = std::move(j.out);
+    try {
+        th.reserve(nt);
+        for (size_t t = 0; t < nt; ++t)
+            th.emplace_back([&] {
+                try {
+                    for (size_t i; (i = next.fetch_add(1)) < n;) f(i);
+                } catch (...) {
+                    stop(std::current_exception());
+                }
+            });
+    } catch (...) {
+        stop(std::current_exception());
     }
-    jobs_.clear();
-    return true;
+    for (auto& t : th) t.join();
+    if (first) std::rethrow_exception(first);
 }
 
 GMat arena_matrix(Arena& a, HostMatrix&& m) {
@@ -170,7 +619,12 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // STARLING_FAST_TUNE=1 runs it anyway, STARLING_FAST_TILE / _GEMV_ROWS
     // override either. Other vendors keep the tuner's pick.
     if (ctx.info().vendor_id == 0x1010 && !tune_forced) {
-        tile = TileCfg{32, 128, 4, 8};
+        // BK = 16: the half-depth k-tile halves each thread's tile-load
+        // registers and the shared tiles (10 -> 5 KiB), and more workgroups
+        // stay resident: encoder/prefill GEMMs +20-40 % isolated, Qwen3-ASR
+        // 0.6B enc+prefill -12 % short / -15 % medium, Parakeet encoder -20 %
+        // (bit-exact; BK = 8 gains less, RESEARCH_LOG P5).
+        tile = TileCfg{32, 128, 4, 8, 16};
         // Decode GEMV rows=16, pinned: measured best-or-tied at every MOSS
         // decode shape on the Pixel 10 Pro (N 2048..151936, K 2048/6144; the
         // rows=8 default cost 15-31 % on the small-N shapes, growing to 32
@@ -182,6 +636,10 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
         gemv_tgt_wgs = ~0u;   // no adaptive growth
         gemv_min_wgs = 0;     // and no shrink-to-256-workgroups floor: rows=16
                               // measured best at N=2048 with just 128 WGs
+        // ...but at least 16 rows per row slot (rows 64 at K = 1024, 32 at
+        // K = 2048), kept at >= 64 workgroups: Qwen3-0.6B decode 39.8 ->
+        // 31.1 ms/step, MOSS 74.7 -> 72.6 (RESEARCH_LOG P4-2).
+        gemv_rpp_min = 16;
     } else if (ctx.info().vendor_id == 0x1002 && !tune_forced) {
         // AMD (measured on a RADV RENOIR iGPU, MOSS q4e8 decode): cap rows at
         // 16 with no growth — the grow-to-384-WGs rule took the big-N GEMVs
@@ -204,14 +662,38 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // top of the rows pin above. STARLING_FAST_W4U=0/1 overrides.
     w4_unpack_ = ctx.info().vendor_id == 0x1010 || ctx.info().vendor_id == 0x1002;
     if (const char* e = std::getenv("STARLING_FAST_W4U")) w4_unpack_ = e[0] == '1';
-    // Diagnostics: STARLING_FAST_MICRO runs one isolated kernel probe.
-    if (const char* mi = std::getenv("STARLING_FAST_MICRO"))
-        if (!micro(mi, err)) return false;
+    // The same for W8: xor 0x80 turns the int8 into a biased byte, and one
+    // unpackUnorm4x8 replaces four bitfieldExtracts + int-to-float
+    // conversions. Neutral where only the lm_head is W8 (Qwen3/MOSS q4e8),
+    // -10 % decode on Granite, whose Q5_K linears are repacked to W8
+    // (Pixel 10 Pro; RESEARCH_LOG P4-7). STARLING_FAST_W8U
+    // overrides.
+    w8_unpack_ = ctx.info().vendor_id == 0x1010;
+    if (const char* e = std::getenv("STARLING_FAST_W8U")) w8_unpack_ = e[0] == '1';
     rsplit_on_ = !(std::getenv("STARLING_FAST_NORSPLIT") && std::getenv("STARLING_FAST_NORSPLIT")[0] == '1');
+    // Subgroup-broadcast GEMM (gemm_sg.comp, the structure of LiteRT's
+    // PowerVR matmul): one row of A per lane, 16 output columns per
+    // workgroup, the weights loaded and dequantized by 16 lanes and handed
+    // to all of them with subgroupBroadcast, A through the texture path, no
+    // shared memory. PowerVR (DXT, subgroup 128): ~2x gemm.comp's GFLOPS at
+    // the encoder/prefill shapes (RESEARCH_LOG P6).
+    // Needs subgroup broadcast in compute shaders and a subgroup of >= 16
+    // lanes that fits one workgroup. STARLING_FAST_SG=0/1 overrides the
+    // vendor default. A is read through texel-buffer views unless the
+    // device's texel limit is tiny, then from the storage buffer.
+    {
+        const vk::DeviceInfo& di = ctx.info();
+        const bool sg_ok = di.subgroup_compute && (di.subgroup_ops & VK_SUBGROUP_FEATURE_BALLOT_BIT) &&
+                           di.subgroup_size >= 16 && di.subgroup_size <= di.max_wg_invocations;
+        sg_gemm_ = sg_ok && di.vendor_id == 0x1010;
+        if (const char* e = std::getenv("STARLING_FAST_SG")) sg_gemm_ = sg_ok && e[0] == '1';
+        sg_texel_max_ = di.max_texel_elems;
+        if (sg_texel_max_ < 1024) sg_tex_ = false;
+    }
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn;
         if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) {
-            tile = TileCfg{bm, bn, tm, tn};
+            tile = TileCfg{bm, bn, tm, tn, tile.BK};
             tile_pinned_ = true;
         }
     }
@@ -222,10 +704,142 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
             gemv_tgt_wgs = ~0u;   // pinned: no adaptive growth
         }
     }
+    // Diagnostics: STARLING_FAST_MICRO runs one isolated kernel probe.
+    if (const char* mi = std::getenv("STARLING_FAST_MICRO"))
+        if (!micro(mi, err)) return false;
+    return true;
+}
+
+bool Kernels::sg_eligible(const GemmCall& c) const {
+    if (!sg_gemm_ || c.b == BKind::F16T || c.a.K % 8 || !c.a.M || !c.a.N) return false;
+    if ((c.b == BKind::W4 || c.b == BKind::W8) && c.a.K % 32) return false;
+    if (c.a.lda % 8 || c.a.a_off % 8 || c.a.sa_hi % 8 || c.a.sa_lo % 8) return false;
+    if (c.a_conv) return c.b == BKind::F16 && c.a.cv_cin % 8 == 0 && c.a.cv_cin >= 8;
+    if (c.b == BKind::F16 && (c.a.ldb % 8 || c.a.b_off % 8 || c.a.sb_hi % 8 || c.a.sb_lo % 8)) return false;
+    return true;
+}
+
+// gemm_sg.comp's push block: gemm.comp's plus the A view's first texel and
+// the first row of the dispatch.
+struct SgArgs {
+    GemmArgs a;
+    uint32_t a_tex0 = 0, m_first = 0;
+};
+static_assert(sizeof(SgArgs) <= vk::kPushBytes, "gemm_sg push constants");
+
+bool Kernels::gemm_sg(vk::Recording& rec, const GemmCall& c, std::string& err) {
+    const vk::DeviceInfo& di = ctx_->info();
+    const uint32_t WG = di.subgroup_size;
+    const std::string base = c.a_conv ? "gemm_sg_conv" : c.b == BKind::W4 ? "gemm_sg_w4"
+                           : c.b == BKind::W8 ? "gemm_sg_w8" : "gemm_sg_f16";
+    const uint32_t gx = ceil_div(c.a.N, 16);
+    const std::vector<uint32_t> spec{WG, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode};
+    auto bindings = [&](vk::Ref a) {
+        return std::vector<vk::Ref>{a, or_dummy(c.Bq), or_dummy(c.Bs), or_dummy(c.C),
+                                    or_dummy(c.bias), or_dummy(c.bias2), or_dummy(c.C2)};
+    };
+    // Elements of A (relative to the Ref) that rows [m0, m1) read: [lo, hi).
+    // Conv rows (chunk, to, fo) read input rows 2*to-1 .. 2*to+1 of their chunk.
+    auto conv_span = [&](uint32_t m0, uint32_t m1, uint64_t& elo, uint64_t& ehi) {
+        const uint32_t per = c.a.cv_to * c.a.cv_fo;
+        const uint64_t row_el = (uint64_t)c.a.cv_fi * c.a.cv_cin;
+        const uint32_t ca = m0 / per, ta = (m0 % per) / c.a.cv_fo;
+        const uint32_t cb = (m1 - 1) / per, tb = ((m1 - 1) % per) / c.a.cv_fo;
+        const uint64_t tia = ta ? 2u * ta - 1u : 0u, tib = std::min<uint64_t>(2u * tb + 1u, c.a.cv_ti - 1u);
+        elo = c.a.a_off + ((uint64_t)ca * c.a.cv_ti + tia) * row_el;
+        ehi = c.a.a_off + ((uint64_t)cb * c.a.cv_ti + tib + 1u) * row_el;
+    };
+    const uint64_t lo = c.a.a_off;
+    uint64_t hi;
+    if (c.a_conv) {
+        uint64_t l2;
+        conv_span(0, c.a.M, l2, hi);
+    } else {
+        const uint64_t zh = (c.batch - 1) / c.a.nb_lo, zl = std::min(c.batch - 1, c.a.nb_lo - 1);
+        hi = lo + zh * c.a.sa_hi + zl * c.a.sa_lo + (uint64_t)(c.a.M - 1) * c.a.lda + c.a.K;
+    }
+    const uint64_t max_bytes = (uint64_t)sg_texel_max_ * 16;
+    const uint64_t align = di.min_texel_align;
+    // A texture-path dispatch of rows [m_first, m_first + rows) reading
+    // elements [elo, ehi): a view from the aligned byte below elo.
+    auto tex_dispatch = [&](uint32_t m_first, uint32_t rows, uint64_t elo, uint64_t ehi) -> bool {
+        const VkDeviceSize a0 = c.A.off + elo * 2;
+        const VkDeviceSize voff = a0 / align * align;
+        const VkDeviceSize need = c.A.off + ehi * 2 - voff;
+        const VkDeviceSize avail = c.A.buf->size - voff;
+        const VkDeviceSize range = std::min<VkDeviceSize>(std::min<VkDeviceSize>(avail, max_bytes), (need + 15) / 16 * 16);
+        const vk::Pipeline* p = ctx_->pipeline((base + "_t").c_str(), spec, err);
+        if (!p) return false;
+        SgArgs a;
+        a.a = c.a;
+        // texel = (element >> 3) - a_tex0, with the element counted from the
+        // Ref (A.off is 16-byte aligned, checked by the caller).
+        a.a_tex0 = (uint32_t)(((int64_t)voff - (int64_t)c.A.off) / 16);
+        a.m_first = m_first;
+        rec.dispatch(*p, bindings(vk::Ref(*c.A.buf, voff, range)), &a, sizeof(a), gx, ceil_div(rows, WG),
+                     c.batch);
+        return true;
+    };
+    if (sg_tex_ && c.A.buf && c.A.off % 16 == 0) {
+        const VkDeviceSize a0 = c.A.off + lo * 2;
+        if (c.A.off + hi * 2 - a0 / align * align <= max_bytes) return tex_dispatch(0, c.a.M, lo, hi);
+        // Conv: blocks of whole workgroups grown while their input window
+        // fits one view (Qwen3's conv2 reads 24 MiB in all, ~0.6 MiB per
+        // 128 output rows).
+        if (c.a_conv && c.batch == 1) {
+            bool ok = true;
+            std::vector<std::pair<uint32_t, uint32_t>> blocks;
+            for (uint32_t m0 = 0; m0 < c.a.M && ok;) {
+                uint32_t rows = 0;
+                for (uint32_t r = WG; ; r += WG) {
+                    const uint32_t m1 = std::min(c.a.M, m0 + r);
+                    uint64_t elo, ehi;
+                    conv_span(m0, m1, elo, ehi);
+                    const VkDeviceSize a0 = c.A.off + elo * 2;
+                    if (c.A.off + ehi * 2 - a0 / align * align > max_bytes) break;
+                    rows = m1 - m0;
+                    if (m1 == c.a.M) break;
+                }
+                if (!rows) { ok = false; break; }
+                blocks.push_back({m0, rows});
+                m0 += rows;
+            }
+            if (ok) {
+                for (const auto& b : blocks) {
+                    uint64_t elo, ehi;
+                    conv_span(b.first, b.first + b.second, elo, ehi);
+                    if (!tex_dispatch(b.first, b.second, elo, ehi)) return false;
+                }
+                return true;
+            }
+        }
+        // Too large for one view: row blocks of whole workgroups, each with
+        // its own view (plain row-major A).
+        if (!c.a_conv && c.batch == 1) {
+            const uint64_t row_bytes = (uint64_t)c.a.lda * 2;
+            const uint64_t fit = max_bytes > align + c.a.K * 2u ? (max_bytes - align - c.a.K * 2u) / row_bytes + 1 : 0;
+            const uint32_t rb = (uint32_t)std::min<uint64_t>(fit / WG * WG, c.a.M);
+            if (rb >= WG) {
+                for (uint32_t m0 = 0; m0 < c.a.M; m0 += rb) {
+                    const uint32_t rows = std::min(rb, c.a.M - m0);
+                    const uint64_t elo = lo + (uint64_t)m0 * c.a.lda;
+                    const uint64_t ehi = elo + (uint64_t)(rows - 1) * c.a.lda + c.a.K;
+                    if (!tex_dispatch(m0, rows, elo, ehi)) return false;
+                }
+                return true;
+            }
+        }
+    }
+    const vk::Pipeline* p = ctx_->pipeline(base.c_str(), spec, err);
+    if (!p) return false;
+    SgArgs a;
+    a.a = c.a;
+    rec.dispatch(*p, bindings(or_dummy(c.A)), &a, sizeof(a), gx, ceil_div(c.a.M, WG), c.batch);
     return true;
 }
 
 bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
+    if (sg_eligible(c)) return gemm_sg(rec, c, err);
     std::string name = c.b == BKind::W4 ? "gemm_w4" : c.b == BKind::W8 ? "gemm_w8"
                      : c.b == BKind::F16 ? "gemm_f16" : "gemm_f16t";
     if (c.a_conv) {
@@ -238,10 +852,10 @@ bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
     // waste most of a BN=128 tile's columns; a BN=64 tile of the same
     // proven family doubles the useful fraction. Tile shape only partitions
     // outputs — each element's K accumulation order is unchanged.
-    if (c.a.N <= 64 && t.BN > 64 && !tile_pinned_) t = TileCfg{32, 64, 4, 4};
+    if (c.a.N <= 64 && t.BN > 64 && !tile_pinned_) t = TileCfg{32, 64, 4, 4, t.BK};
     const uint32_t wg = (t.BM / t.TM) * (t.BN / t.TN);
     const vk::Pipeline* p = ctx_->pipeline(
-        name.c_str(), {wg, t.BM, t.BN, t.TM, t.TN, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode}, err);
+        name.c_str(), {wg, t.BM, t.BN, t.TM, t.TN, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode, t.BK}, err);
     if (!p) return false;
     if ((c.b == BKind::W4 || c.b == BKind::W8) && c.a.K % 32) {
         err = "gemm: weight K must be a multiple of 32";
@@ -312,7 +926,7 @@ bool Kernels::pk_conv(vk::Recording& rec, uint32_t op, const PkConvArgs& a, uint
     return true;
 }
 
-uint32_t Kernels::gemv_rows(uint32_t N) {
+uint32_t Kernels::gemv_rows(uint32_t N, uint32_t K) {
     uint32_t rows = gemv_rows_max;
     // Grow rows for large N: every workgroup re-reads the x vector once, so
     // at rows=8 the x traffic rivals the weights (ff_up: 12.6 MB x vs
@@ -325,13 +939,36 @@ uint32_t Kernels::gemv_rows(uint32_t N) {
     // stay in cache. Per-row math is unchanged.
     if (gemv_min_wgs > 256)
         while (rows > 4 && N / rows < gemv_min_wgs) rows -= 4;
+    // Rows-per-thread floor: a thread's fixed work (its x slice, the fused
+    // RMSNorm statistic, the shared-memory reduction) is amortized over
+    // rows / RSPLIT row dots, so small K (more row slots per workgroup)
+    // needs more rows. Never below 64 workgroups (the floor would starve
+    // the small-N projections of a 0.6B model: o/down at N = 1024).
+    if (gemv_rpp_min && K) {
+        const uint32_t floor_rows = gemv_rpp_min * gemv_rsplit_target(K / 32);
+        uint32_t r = std::max(rows, floor_rows);
+        while (r > rows && N / r < 64) r /= 2;
+        rows = std::max(rows, r);
+    }
     return rows;
+}
+
+const char* Kernels::gemv_shader(GpuFmt f) const {
+    return f == GpuFmt::W4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4")
+         : f == GpuFmt::W8 ? (w8_unpack_ ? "gemv_w8u" : "gemv_w8") : "gemv_f16";
+}
+
+uint32_t Kernels::gemv_rsplit_target(uint32_t lanes) const {
+    const uint32_t target = std::max(32u, ctx_->info().subgroup_size);
+    uint32_t rs = 1;
+    while (rs < 8 && lanes * rs < target) rs *= 2;
+    return rs;
 }
 
 bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x, vk::Ref y,
                    vk::Ref g, vk::Ref state, vk::Ref bias, uint32_t epi, GemvArgs a,
                    std::string& err) {
-    const char* name = w.fmt == GpuFmt::W4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4") : w.fmt == GpuFmt::W8 ? "gemv_w8" : "gemv_f16";
+    const char* name = gemv_shader(w.fmt);
     const uint32_t lanes = w.K / 32;      // one thread per 32-wide K group
     if (w.K % 32 || a.x_off % 4 || a.x_off2 % 4 || lanes > ctx_->info().max_wg_invocations ||
         lanes > 1024) {
@@ -339,7 +976,7 @@ bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x
         return false;
     }
     // Enough workgroups to fill the GPU: fewer rows per workgroup for small N.
-    uint32_t rows = gemv_rows(w.N);
+    uint32_t rows = gemv_rows(w.N, w.K);
     // Pad the workgroup to a full subgroup with parallel row slots: GPUs
     // issue whole subgroups, so lanes < subgroup_size strands issue slots
     // (W4 K=1024: ~7 GB/s at 32 threads, ~27 at 128 on PowerVR).
@@ -373,6 +1010,14 @@ TuneResult& tune_result() { static TuneResult r; return r; }
 
 double time_ms(vk::Recording& rec, std::string& err) {
     double best = 1e30;
+    // Warm up for >= 100 ms first: GPU governors (PowerVR's polls every
+    // 20 ms) start a short probe at an idle clock.
+    {
+        const auto w0 = std::chrono::steady_clock::now();
+        do {
+            if (!rec.submit_and_wait(err)) return -1.0;
+        } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count() < 100.0);
+    }
     for (int i = 0; i < 3; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
         if (!rec.submit_and_wait(err)) return -1.0;
@@ -629,7 +1274,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
         err = "STARLING_FAST_MICRO: alt/altx cannot be combined with the rows sweep";
         return false;
     }
-    if (!rows) rows = gemv_rows(n);
+    if (!rows) rows = gemv_rows(n, k);
     std::mt19937 rng(99);
     auto rnd = [&](size_t cnt) {
         std::vector<uint32_t> w(cnt);
@@ -653,8 +1298,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (!up32(wq, wv.data(), qw * 4) || (sw && !up32(ws, sv.data(), sw * 4)) ||
         !up32(x, xf.data(), xf.size() * 4) || !up32(y, y0.data(), y0.size() * 4))
         return false;
-    const char* name = bits == 4 ? (m2 ? "gemv_w4um" : w4_unpack_ ? "gemv_w4u" : "gemv_w4")
-                      : bits == 8 ? "gemv_w8" : "gemv_f16";
+    const char* name = m2 ? "gemv_w4um" : gemv_shader(bits == 4 ? GpuFmt::W4 : bits == 8 ? GpuFmt::W8 : GpuFmt::F16);
     const uint32_t lanes = k / 32;
     GemvArgs ga;
     ga.N = n;
@@ -938,7 +1582,7 @@ bool Kernels::autotune(std::string& err) {
     gemv_tgt_wgs = ~0u;   // candidates are pinned; growth would blur the sweep
     for (uint32_t rows : {8u, 16u, 32u, 64u}) {
         gemv_rows_max = rows;
-        const uint32_t r = gemv_rows(F);
+        const uint32_t r = gemv_rows(F, 0);
         const vk::Pipeline* p = ctx_->pipeline("gemv_w4", {D / 32, r, 0u, 0u, 0u, 1u, D / 32}, err);
         if (!p) return false;
         vk::Recording rec(*ctx_);

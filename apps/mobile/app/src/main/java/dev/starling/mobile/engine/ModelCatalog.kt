@@ -109,9 +109,8 @@ object ModelCatalog {
      * Every catalog model, the recommended one first; their file names are
      * reserved for verified downloads (an import never takes one). Every
      * entry pins a repository revision with its size and SHA-256 (see
-     * ModelCatalogTest). ARK-ASR-3B and Voxtral Realtime stay import-only:
-     * the 3B throttles past real time on a phone CPU, and Voxtral has no
-     * validated quant yet.
+     * ModelCatalogTest). ARK-ASR-3B stays import-only: it throttles past
+     * real time on a phone CPU.
      */
     val ALL = listOf(
         RECOMMENDED_PARAKEET,

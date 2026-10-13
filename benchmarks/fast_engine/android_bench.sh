@@ -8,6 +8,11 @@
 # Environment: ANDROID_NDK (default: newest under $ANDROID_HOME/ndk),
 # PARAKEET_GGUF / MOSS_GGUF (file names inside --models; empty = skip),
 # RUNS (timed runs per file, default 3), EXTRA_ENV (e.g. "STARLING_FAST_F16=1").
+# ggml CPU knobs worth A/B-ing through EXTRA_ENV: STARLING_GGML_THREADS,
+# STARLING_GGML_POLL (worker spin before parking, 0-100, default 50),
+# STARLING_GGML_CPUMASK (hex worker affinity), GGML_CPU_TINY_OP_MAX (0 turns
+# off single-thread runs of tiny nodes), STARLING_GGML_CPU_REPACK=0.
+# The build matches the app's: no OpenMP, ggml's own persistent worker pool.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)

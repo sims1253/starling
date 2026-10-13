@@ -6,8 +6,8 @@ windowed-attention conv encoder + 2-layer MLP projector + Qwen3 decoder
 topology, with a narrower audio tower (18 layers, d896, 14 heads, FFN 3584,
 projector output 1024) and a 1024-wide decoder trunk with a 3072-wide SwiGLU.
 The trunk KEEPS the 1.7B's 16Q/8KV GQA at head_dim 128, so the attention width
-(2048) is wider than the trunk (1024) — the shared decode stack supports this
-(since voxtral), and the engine loader validates the widths against the actual
+(2048) is wider than the trunk (1024) — the shared decode stack supports this,
+and the engine loader validates the widths against the actual
 tensor shapes instead of assuming hidden == heads*head_dim.
 
 The tensor-name map, mel frontend, tokenizer and chat-template prompt layout

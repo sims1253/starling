@@ -14,8 +14,8 @@
 //   Batched over gl_WorkGroupID.z with a two-level (hi, lo) decomposition so
 //   attention heads/windows map onto one dispatch (GQA via `gqa`).
 //
-// Tiles: BM x BN per workgroup, BK = 32 (one quant group), each thread owns a
-// TM x TN register tile. Both operand tiles live in shared memory as f16
+// Tiles: BM x BN per workgroup, BK = 32 (one quant group) or 16/8 deep,
+// each thread owns a TM x TN register tile. Both operand tiles live in shared memory as f16
 // pairs packed along M / N, which halves shared-memory traffic and size
 // (16 KiB for 128x128 tiles — the Vulkan minimum) and lets the A tile be
 // rearranged with bit operations instead of conversions. Products are
@@ -50,7 +50,11 @@ layout(constant_id = 6) const uint ACT = 0;
 layout(constant_id = 7) const uint HAS_BIAS = 0;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-const uint BK = 32;
+// k per tile: 32 (one quant group), or 16 / 8 where shared memory bounds
+// occupancy (PowerVR: the workgroups resident per USC share 32 KiB, and a
+// 32x128 tile pair at BK = 32 takes 10 KiB of it).
+layout(constant_id = 8) const uint BK = 32;
+const uint KC = BK / 8;   // 8-k chunks per tile row
 
 layout(std430, binding = 0) readonly buffer ABuf { uint a_w[]; };
 layout(std430, binding = 0) readonly buffer ABuf4 { uvec4 a_w4[]; };
@@ -77,6 +81,11 @@ layout(push_constant) uniform PC {
     // A_CONV: implicit-GEMM view of a 3x3 / stride-2 / pad-1 conv over an
     // input laid out [chunk][t][f][cin]; row m = (chunk, to, fo), k = (kt*3+kf)*cin + ic.
     uint cv_cin, cv_ti, cv_fi, cv_to, cv_fo;
+    // Causal attention (0xffffffff = off): query row m sees keys <= m + causal.
+    // B_F16 (scores Q·Kᵀ, N = keys): tiles wholly above the diagonal are
+    // skipped (the softmax never reads them). B_F16T (P·V, K = keys): the
+    // K loop stops after the last key a row tile can see (P is 0 beyond).
+    uint causal;
 } p;
 
 // f16 pairs: As[k][r] = (A[2r][k], A[2r+1][k]); Bs[k][c] = (B[2c][k], B[2c+1][k]).
@@ -137,12 +146,19 @@ void main() {
     float acc[TM * TN];
     [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = 0.0;
 
-    const uint n_k = (p.K + BK - 1) / BK;
+#if defined(B_F16) && !defined(A_CONV)
+    if (p.causal != 0xffffffffu && n0 > m0 + BM - 1u + p.causal) return;
+#endif
+    uint k_end = p.K;
+#if defined(B_F16T)
+    if (p.causal != 0xffffffffu) k_end = min(p.K, m0 + BM + p.causal);
+#endif
+    const uint n_k = (k_end + BK - 1) / BK;
     for (uint kt = 0; kt < n_k; ++kt) {
         const uint k0 = kt * BK;
-        // ---- A tile: (BM/2 row pairs) x (4 chunks of 8 k) ----
-        for (uint u = tid; u < BM * 2; u += WG) {
-            const uint r = u >> 2, kc = (u & 3u) * 8;
+        // ---- A tile: (BM/2 row pairs) x (KC chunks of 8 k) ----
+        for (uint u = tid; u < (BM / 2) * KC; u += WG) {
+            const uint r = u / KC, kc = (u % KC) * 8;
             const uvec4 x0 = load8_a(m0 + 2 * r, k0 + kc, a_base);
             const uvec4 x1 = load8_a(m0 + 2 * r + 1, k0 + kc, a_base);
             [[unroll]] for (uint i = 0; i < 8; ++i)
@@ -150,50 +166,52 @@ void main() {
         }
         // ---- B tile ----
 #if defined(B_W4)
-        // (BN/2 row pairs) x 4 words; one word = 8 consecutive weights.
-        for (uint u = tid; u < BN * 2; u += WG) {
-            const uint r = u >> 2, wi = u & 3u;
+        // (BN/2 row pairs) x KC words; one word = 8 consecutive weights
+        // (word wo + wi of the k0's quant group).
+        for (uint u = tid; u < (BN / 2) * KC; u += WG) {
+            const uint r = u / KC, wi = u % KC, wo = (k0 & 31u) / 8u;
             const uint n = n0 + 2 * r;
             vec2 so0 = vec2(0.0), so1 = vec2(0.0);
             uint q0 = 0, q1 = 0;
             if (n < p.N) {
-                const uint g = n * (p.K / BK) + kt;
+                const uint g = n * (p.K / 32) + k0 / 32;
                 so0 = unpackHalf2x16(bs[g]);
-                q0 = bq[g * 4 + wi];
+                q0 = bq[g * 4 + wo + wi];
             }
             if (n + 1 < p.N) {
-                const uint g = (n + 1) * (p.K / BK) + kt;
+                const uint g = (n + 1) * (p.K / 32) + k0 / 32;
                 so1 = unpackHalf2x16(bs[g]);
-                q1 = bq[g * 4 + wi];
+                q1 = bq[g * 4 + wo + wi];
             }
             [[unroll]] for (uint i = 0; i < 8; ++i)
                 Bs[wi * 8 + i][r] = packHalf2x16(vec2(so0.x * float((q0 >> (4 * i)) & 15u) + so0.y,
                                                       so1.x * float((q1 >> (4 * i)) & 15u) + so1.y));
         }
 #elif defined(B_W8)
-        // (BN/2 row pairs) x 8 words; one word = 4 consecutive int8 weights.
-        for (uint u = tid; u < BN * 4; u += WG) {
-            const uint r = u >> 3, wi = u & 7u;
+        // (BN/2 row pairs) x BK/4 words; one word = 4 consecutive int8 weights.
+        for (uint u = tid; u < (BN / 2) * (BK / 4); u += WG) {
+            const uint wl = u % (BK / 4);                     // word within the tile
+            const uint r = u / (BK / 4), wi = wl + (k0 & 31u) / 4u;   // ... within the group
             const uint n = n0 + 2 * r;
             float s0 = 0.0, s1 = 0.0;
             int q0 = 0, q1 = 0;
             if (n < p.N) {
-                const uint g = n * (p.K / BK) + kt;
+                const uint g = n * (p.K / 32) + k0 / 32;
                 s0 = unpackHalf2x16(bs[g])[wi >> 2];
                 q0 = int(bq[g * 8 + wi]);
             }
             if (n + 1 < p.N) {
-                const uint g = (n + 1) * (p.K / BK) + kt;
+                const uint g = (n + 1) * (p.K / 32) + k0 / 32;
                 s1 = unpackHalf2x16(bs[g])[wi >> 2];
                 q1 = int(bq[g * 8 + wi]);
             }
             [[unroll]] for (uint i = 0; i < 4; ++i)
-                Bs[wi * 4 + i][r] = packHalf2x16(vec2(s0 * float(bitfieldExtract(q0, int(8 * i), 8)),
+                Bs[wl * 4 + i][r] = packHalf2x16(vec2(s0 * float(bitfieldExtract(q0, int(8 * i), 8)),
                                                       s1 * float(bitfieldExtract(q1, int(8 * i), 8))));
         }
 #elif defined(B_F16)
-        for (uint u = tid; u < BN * 2; u += WG) {
-            const uint r = u >> 2, kc = (u & 3u) * 8;
+        for (uint u = tid; u < (BN / 2) * KC; u += WG) {
+            const uint r = u / KC, kc = (u % KC) * 8;
             const uvec4 x0 = load8_b(n0 + 2 * r, k0 + kc, b_base);
             const uvec4 x1 = load8_b(n0 + 2 * r + 1, k0 + kc, b_base);
             [[unroll]] for (uint i = 0; i < 8; ++i)
@@ -218,7 +236,7 @@ void main() {
         }
 #endif
         barrier();
-        // ---- register-tiled products over the 32-deep slice ----
+        // ---- register-tiled products over the BK-deep slice ----
 #ifdef F16MATH
         f16vec2 acc16[TM * TN / 2];
         [[unroll]] for (uint i = 0; i < TM * TN / 2; ++i) acc16[i] = f16vec2(0.0hf);

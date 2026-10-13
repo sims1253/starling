@@ -115,45 +115,6 @@ ggml_tensor* spec_mlp(ggml_context* c, const ModelLoader& ml, ggml_tensor* n,
     return lin(c, ml, z, p + "ffn.down.weight");
 }
 
-// Voxtral's AdaRMSNorm modulation: fc2(gelu(fc0(t_cond))) over the baked
-// llm.t_cond leaf ([hidden] f32), returned bf16 [hidden, 1]. The branch runs
-// only under spec.ada_rms_norm, so other engines build no node here.
-// Oracle order (the Phase-2a linear_bf16_oracle discipline, bias-free):
-// GEMM rounds to bf16, exact GELU rounds to bf16, final GEMM rounds to bf16.
-ggml_tensor* ada_mod(ggml_context* c, const QwenDecodeSpec& s,
-                     const ModelLoader& ml, const std::string& p) {
-    ggml_tensor* t = weight(c, ml, "llm.t_cond");  // [hidden] f32 leaf
-    ggml_tensor* u = lin(c, ml, t, p + s.ada_fc0_suffix);
-    ggml_tensor* g = bf16(c, ggml_gelu_erf(c, f32(c, u)));  // exact (erf) GELU
-    ggml_tensor* m = lin(c, ml, g, p + s.ada_fc2_suffix);  // [hidden]
-    return ggml_reshape_2d(c, m, m->ne[0], 1);  // [hidden, 1] for broadcast
-}
-
-// Apply the ada modulation to the MLP-branch input n ([hidden, S] bf16):
-// n * (1 + mod) with mod [hidden, 1] broadcast over the S columns, f32 math,
-// one bf16 round. The ones are the loader-owned llm.ada_ones leaf (1-D
-// [hidden] f32, synthesized once per model like the mel constants): 1-D
-// keeps it at 12 KiB for the real model, inside the compat context's 1 MiB
-// budget (a [hidden, max_cache] leaf would be 50 MiB). The [hidden, 1] sum
-// repeats over S via a scratch template (repeat overwrites every element,
-// so the template needs no initialization); the leaf itself is stable and
-// device-resident, so captured prefill graphs replay with no host upload.
-ggml_tensor* apply_ada(ggml_context* c, const QwenDecodeSpec& s,
-                       const ModelLoader& ml, ggml_tensor* n,
-                       const std::string& p, int64_t S) {
-    if (!s.ada_rms_norm) return n;
-    ggml_tensor* mod = ada_mod(c, s, ml, p);  // [hidden, 1] bf16
-    const int64_t H = n->ne[0];
-    ggml_tensor* ones = weight(c, ml, "llm.ada_ones");  // [hidden] f32
-    ggml_tensor* sum = ggml_add(c, f32(c, ones), f32(c, mod));  // [hidden, 1]
-    // Stock runs h * (1 + m) as two bf16 stores: round (1 + m) first (it is
-    // [hidden, 1], so the round is free), then round the product.
-    sum = bf16(c, sum);
-    ggml_tensor* tpl = ggml_new_tensor_2d(c, GGML_TYPE_F32, H, S);
-    ggml_tensor* scale = ggml_repeat(c, f32(c, sum), tpl);  // [hidden, S]
-    return bf16(c, ggml_mul(c, f32(c, n), scale));
-}
-
 // Append `add` new rows of k/v (src layout [heads, add, D] f32) to the cache
 // (layout [heads, old+add, D] bf16).
 void append_kv(std::vector<ggml_bf16_t>& dst, const std::vector<float>& src,
@@ -407,7 +368,6 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
         if (st0 && stage.is("xmid")) return ff(c, x);
 
         n = rms(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
-        n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
         ggml_tensor* dn = spec_mlp(c, m.loader, n, p);
         if (st0 && stage.is("down")) return ff(c, dn);
         x = residual_add(c, m.spec, r, dn);
@@ -564,6 +524,8 @@ struct KStepKeyHash { size_t operator()(const KStepKey& k) const noexcept {
 // Captured graphs borrow this model's weights and KV cache.
 struct SpecState {
     std::unique_ptr<DeviceCache> device_cache;
+    // forward_decode's step plan.
+    std::unique_ptr<Backend::StepAlloc> decode_alloc;
     std::unique_ptr<PrefillCache> prefill_cache;
     std::unordered_map<KStepKey, std::unique_ptr<KStepGraph>, KStepKeyHash> kstep;
 };
@@ -574,12 +536,23 @@ SpecState& state_for(const ModelLoader& loader) {
     return *state;
 }
 
+// Whether attention can read KV slots no step of this utterance wrote: the
+// GPU graphs attend over masked full-capacity/bucket widths (a masked slot
+// must hold a finite value: 0 * NaN is NaN), and so does <env>_FULLCAP. The
+// CPU's exact-width graphs only ever read written slots, so their cache is
+// never cleared: no per-utterance memset of the whole cache (hundreds of
+// MiB at max_cache 4096) and its untouched tail never becomes resident.
+bool kv_needs_clear(const QwenDecodeSpec& spec) {
+    return global_backend().is_gpu() || env(spec, "_FULLCAP") != nullptr;
+}
+
 DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
     SpecState& st = state_for(m.loader);
     if (st.device_cache) return st.device_cache.get();
     const auto& lc = m.dims;
     auto cache = std::make_unique<DeviceCache>();
-    if (!cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e)) {
+    if (!cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e,
+                     kv_needs_clear(m.spec))) {
         return nullptr;
     }
     st.device_cache = std::move(cache);
@@ -590,12 +563,12 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
 // (device-resident, flows straight from the previous layer). Writes this step's
 // k/v into the device cache in-graph and assembles kall/vall for attention.
 //   kv_mode 0 = prefill exact (cpy slots [0,S), attend to new k/v)
-//   kv_mode 1 = decode exact-width (cpy slot `past`, attend [0, past+S))
+//   kv_mode 1 = decode exact-width (set_rows slot `past`, attend its [0, past+S) prefix)
 //   kv_mode 2 = decode full-capacity (set_rows slot `past`, attend [0, max_cache))
 //   kv_mode 3 = batched verify (copy S slots; by default each query row reduces
 //               over its own [0, past+row+1) prefix; <label>_VERIFY_BATCH_ATTN
 //               uses one [0, past+S) reduction with a causal mask)
-// idx_past is the runtime i32[S] write-index vector used only by mode 2.
+// idx_past is the runtime i32[S] write-index vector used by modes 1 and 2.
 // cs/sn are [D, S] bf16 (RoPE rows). mask is f32 [K, S] (K = past+S for modes
 // 0/1/3, max_cache for mode 2).
 ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
@@ -696,42 +669,79 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     // KV cache: write this step's k/v into the device cache in-graph and
     // assemble kall/vall. Depending on the cpy/set_rows result (via attention)
     // forces the write to execute before the read.
+    //
+    // On the CPU the V cache is kept transposed (v_transposed): attention
+    // needs V^T @ probs, and ggml's matmul reduces over each operand's
+    // contiguous axis, so a [D, pos, KV] cache had to be copied into
+    // [pos, D, KV] for every layer of every step (the dominant per-token
+    // cost growing with the context). The transposed cache is written one
+    // element per row with set_rows and read in place as vt_all. Same bf16
+    // values feed the same per-row dot products, so results are unchanged.
+    // GPU graphs keep the [D, pos, KV] layout (their K-step reads it).
+    const bool VT = !global_backend().is_gpu();
     ggml_tensor* kall;
-    ggml_tensor* vall;
+    ggml_tensor* vall = nullptr;   // [D, Kw, KV] (GPU)
+    ggml_tensor* vt_all = nullptr; // [Kw, D, KV] (CPU, transposed cache)
+    if (VT) {
+        // v_transposed: cache_v's bytes as [1, pos, D, KV]; each (d, kv) is a
+        // row of one element, so set_rows writes slot idx of every row.
+        const int64_t MC = cache_v->ne[1];
+        ggml_tensor* vT = ggml_reshape_4d(c, cache_v, 1, MC, D, KV);
+        ggml_tensor* vb = ggml_permute(c, ggml_reshape_4d(c, ff(c, v), D, S, KV, 1),
+                                       2, 1, 3, 0);                  // [1, S, D, KV]
+        ggml_tensor* vw = ggml_set_rows(c, vT, vb, kv_mode == 0 ? rope_pos : idx_past);
+        const int64_t Kw = kv_mode == 2 ? cache_k->ne[1] : past + S;
+        vt_all = ggml_view_3d(c, vw, Kw, D, KV, vw->nb[1] * MC, vw->nb[1] * MC * D, 0);
+    }
     if (kv_mode == 0) {            // prefill exact
         ggml_tensor* kview = ggml_view_3d(c, cache_k, D, S, KV,
                                           cache_k->nb[1], cache_k->nb[2], 0);
-        ggml_tensor* vview = ggml_view_3d(c, cache_v, D, S, KV,
-                                          cache_v->nb[1], cache_v->nb[2], 0);
         // F: round k/v for the BF16 cache (exact-width views: cheap); the
         // attention core stays BF16, like the K-step path.
         kall = ggml_cpy(c, F ? bf(c, k) : k, kview);  // [D, S, KV], slots [0,S)
-        vall = ggml_cpy(c, F ? bf(c, v) : v, vview);
+        if (!VT) {
+            ggml_tensor* vview = ggml_view_3d(c, cache_v, D, S, KV,
+                                              cache_v->nb[1], cache_v->nb[2], 0);
+            vall = ggml_cpy(c, F ? bf(c, v) : v, vview);
+        }
     } else if (kv_mode == 2) {     // decode full-capacity (captured, dynamic slot)
         // set_rows writes ff(k) (f32) into the bf16 cache at slot `past`; the
         // values are bf16-representable so the f32->bf16 round is exact. The
         // result is a view of the WHOLE cache (slot `past` now updated), which
         // we use directly as kall -> the set_rows executes before attention.
         kall = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
-        vall = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
-    } else {                       // single-step prefix or bounded batched prefix
+        if (!VT) vall = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
+    } else if (kv_mode == 1) {     // decode exact-width
+        // Same slot write as mode 2 (bit-exact: k/v are bf16 values), but
+        // attention reads the [D, past+S, KV] prefix of the updated cache in
+        // place. The view hangs off the set_rows result, so the write runs
+        // first; no per-step f32 concat copy of the whole cache.
+        ggml_tensor* kc = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
+        kall = ggml_view_3d(c, kc, D, past + S, KV, kc->nb[1], kc->nb[2], 0);
+        if (!VT) {
+            ggml_tensor* vc = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
+            vall = ggml_view_3d(c, vc, D, past + S, KV, vc->nb[1], vc->nb[2], 0);
+        }
+    } else {                       // bounded batched prefix (verify)
         ggml_tensor* kslot = ggml_view_3d(c, cache_k, D, S, KV,
                                           cache_k->nb[1], cache_k->nb[2],
                                           (size_t)past * cache_k->nb[1]);
-        ggml_tensor* vslot = ggml_view_3d(c, cache_v, D, S, KV,
-                                          cache_v->nb[1], cache_v->nb[2],
-                                          (size_t)past * cache_v->nb[1]);
         ggml_tensor* knew = ggml_cpy(c, k, kslot);  // writes S slots from `past`
-        ggml_tensor* vnew = ggml_cpy(c, v, vslot);
         ggml_tensor* kprev = ggml_view_3d(c, cache_k, D, past, KV,
                                           cache_k->nb[1], cache_k->nb[2], 0);
-        ggml_tensor* vprev = ggml_view_3d(c, cache_v, D, past, KV,
-                                          cache_v->nb[1], cache_v->nb[2], 0);
         // CUDA concat is F32-only (concat.cu GGML_ASSERT); cast via ff/bf like
         // the legacy concat over the cached+new KV. The concat depends on the
         // cpy results, which forces the in-graph cache writes to execute first.
         kall = past ? bf(c, ggml_concat(c, ff(c, kprev), ff(c, knew), 1)) : knew;
-        vall = past ? bf(c, ggml_concat(c, ff(c, vprev), ff(c, vnew), 1)) : vnew;
+        if (!VT) {
+            ggml_tensor* vslot = ggml_view_3d(c, cache_v, D, S, KV,
+                                              cache_v->nb[1], cache_v->nb[2],
+                                              (size_t)past * cache_v->nb[1]);
+            ggml_tensor* vnew = ggml_cpy(c, v, vslot);
+            ggml_tensor* vprev = ggml_view_3d(c, cache_v, D, past, KV,
+                                              cache_v->nb[1], cache_v->nb[2], 0);
+            vall = past ? bf(c, ggml_concat(c, ff(c, vprev), ff(c, vnew), 1)) : vnew;
+        }
     }
 
     // Attention. Two formulations, switchable for an A/B exactness gate:
@@ -763,15 +773,17 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
                                                 (size_t)row * q->nb[1]);
                 ggml_tensor* kr = ggml_view_3d(c, kall, D, width, KV,
                                                 kall->nb[1], kall->nb[2], 0);
-                ggml_tensor* vr = ggml_view_3d(c, vall, D, width, KV,
-                                                vall->nb[1], vall->nb[2], 0);
+                ggml_tensor* vt = VT
+                    ? ggml_view_3d(c, vt_all, width, D, KV, vt_all->nb[1], vt_all->nb[2], 0)
+                    : ggml_cont(c, ggml_permute(c, ggml_view_3d(c, vall, D, width, KV,
+                                                                vall->nb[1], vall->nb[2], 0),
+                                                1, 0, 2, 3));
                 ggml_tensor* mr = ggml_view_2d(c, mask, width, 1,
                                                 mask->nb[1],
                                                 (size_t)row * mask->nb[1]);
                 ggml_tensor* sc = ggml_mul_mat(c, kr, qr);
                 sc = bf(c, ggml_scale(c, ff(c, sc), scale));
                 ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mr), 1.0f, 0.0f));
-                ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vr, 1, 0, 2, 3));
                 ggml_tensor* one = ggml_mul_mat(c, vt, pr);
                 co = co ? ggml_concat(c, co, one, 1) : one;
             }
@@ -779,15 +791,14 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
             ggml_tensor* sc = ggml_mul_mat(c, kall, q);             // [K, S, H]
             sc = bf(c, ggml_scale(c, ff(c, sc), scale));
             ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mask), 1.0f, 0.0f));
-            // context = V^T @ probs: permute vall [D,K,KV] -> [K,D,KV], GQA broadcast.
-            ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vall, 1, 0, 2, 3));
+            // context = V^T @ probs: permute vall [D,K,KV] -> [K,D,KV] (the
+            // CPU's transposed cache already is), GQA broadcast.
+            ggml_tensor* vt = VT ? vt_all : ggml_cont(c, ggml_permute(c, vall, 1, 0, 2, 3));
             co = ggml_mul_mat(c, vt, pr);
         }
         // heads -> features: [D,S,H] -> [D,H,S] -> [D*H, S]. Spelled
-        // relationally: voxtral's q-width (D*H = 4096) is WIDER than its
-        // hidden (3072); the o_proj weight (ne0 = D*H) takes it from here.
-        // Every existing engine has D*H == hidden, so their graphs are
-        // unchanged by the spelling.
+        // relationally: Qwen3-ASR-0.6B's q-width (D*H = 2048) is WIDER than
+        // its hidden (1024); the o_proj weight (ne0 = D*H) takes it from here.
         joined = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, co, 0, 2, 1, 3)),
                                  (int64_t)D * H, S);                  // [D*H, S]
         joined = bf(c, joined);
@@ -797,11 +808,13 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
             int kvh = h / (H / KV);
             ggml_tensor* qh = ggml_view_2d(c, q, D, S, q->nb[1], (size_t)h * q->nb[2]);
             ggml_tensor* kh = ggml_view_2d(c, kall, D, K, kall->nb[1], (size_t)kvh * kall->nb[2]);
-            ggml_tensor* vh = ggml_view_2d(c, vall, D, K, vall->nb[1], (size_t)kvh * vall->nb[2]);
             ggml_tensor* sc = bf(c, ggml_mul_mat(c, kh, qh));          // [K, S]
             sc = bf(c, ggml_scale(c, ff(c, sc), scale));
             ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mask), 1.0f, 0.0f));
-            ggml_tensor* vtt = ggml_cont(c, ggml_transpose(c, vh));    // [K, D]
+            ggml_tensor* vtt = VT                                      // [K, D]
+                ? ggml_view_2d(c, vt_all, K, D, vt_all->nb[1], (size_t)kvh * vt_all->nb[2])
+                : ggml_cont(c, ggml_transpose(c, ggml_view_2d(c, vall, D, K, vall->nb[1],
+                                                              (size_t)kvh * vall->nb[2])));
             ggml_tensor* co = bf(c, ggml_mul_mat(c, vtt, pr));         // [D, S]
             joined = joined ? bf(c, ggml_concat(c, ff(c, joined), ff(c, co), 0)) : co;
         }
@@ -814,7 +827,6 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     r = x;
     n = F ? rmsf(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps)
           : rms(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
-    n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
     ggml_tensor* dn = F ? spec_mlp_f(c, m, n, p) : spec_mlp(c, m.loader, n, p);
     x = F ? residual_add_f(c, m.spec, r, dn) : residual_add(c, m.spec, r, dn);
     return x;  // [hidden, S] bf16 (F32 in F mode)
@@ -896,7 +908,7 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
     ensure_weights_realized(m.loader);
     DeviceCache* dc = get_device_cache(m, e);
     if (!dc) return false;
-    dc->zero();  // fresh utterance
+    if (kv_needs_clear(m.spec)) dc->zero();  // fresh utterance
     state.length = 0;
     if (state.layers.empty()) state.layers.resize(lc.n_layers);
 
@@ -950,13 +962,12 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
 
 // Whole-model decode-step graph (S=1): embed(prev) -> layers -> lm_head.
 // Exact-width KV (one-shot per step). Reads slots [0, past), writes slot
-// `past`, attention over [0, past). Under spec.decode_add with a non-null
-// audio_row, the [hidden] f32 row is added (bf16 round) to the looked-up
-// embedding — voxtral's additive injection. Null row keeps the historical
-// op sequence for every other engine.
+// `past`, attention over [0, past).
+constexpr int64_t kDecodePlanBucket = 256;
+
 bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                     LlmState& state, std::vector<float>& logits,
-                    std::string& e, const float* audio_row = nullptr) {
+                    std::string& e) {
     const auto& lc = m.dims;
     DeviceCache* dc = get_device_cache(m, e);
     if (!dc) return false;
@@ -977,23 +988,17 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
             mask_full[(size_t)j] = neg;
     }
     const std::vector<float>& mask = fullcap ? mask_full : mask_exact;
-    const int64_t mask_w = fullcap ? (int64_t)lc.max_cache : K;
+    // The graph's write slot: `past` for the real step, the bucket's last slot
+    // for the worst-case build the step plan is reserved with (below).
+    int64_t gp = past;
 
-    bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+    auto build = [&](ggml_context* c) -> ggml_tensor* {
+        const int64_t mask_w = fullcap ? (int64_t)lc.max_cache : gp + S;
         int64_t one[1] = {1};
         ggml_tensor* id_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
                                                &prev_token, sizeof(int32_t));
         ggml_tensor* x = ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), id_t);
         x = apply_embed_mul(c, m.spec, x);
-        if (m.spec.decode_add && audio_row) {
-            // Voxtral: inputs_embeds = token_embed + audio_row (stock adds in
-            // the model dtype; addb rounds once at the bf16 boundary).
-            int64_t rne[2] = {lc.hidden, 1};
-            ggml_tensor* row_t = graph_input_tensor(
-                c, GGML_TYPE_F32, 2, rne, audio_row,
-                (size_t)lc.hidden * sizeof(float));
-            x = addb(c, x, row_t);
-        }
         ggml_tensor* pos_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
                                                 pos.data(), sizeof(int32_t));
         ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, 1]
@@ -1002,18 +1007,35 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
         int64_t mne[2] = {mask_w, 1};
         ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
                                              mask.data(), mask.size() * sizeof(float));
-        ggml_tensor* idx_t = fullcap
-            ? graph_input_tensor(c, GGML_TYPE_I32, 1, one, idx_past.data(), sizeof(int32_t))
-            : nullptr;
+        ggml_tensor* idx_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
+                                                idx_past.data(), sizeof(int32_t));
         for (int li = 0; li < (int)lc.n_layers; ++li)
-            x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
+            x = append_layer_new(c, m, li, x, S, gp, dc->k[li], dc->v[li],
                                  cs, sn, mt, kv_mode, idx_t, nullptr);
         ggml_tensor* n = DF ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
                             : rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
-    }, logits);
-    if (!ok) { e = std::string(m.spec.label) + " decode graph failed"; return false; }
+    };
+
+    // Every step has the same topology; only the attention width grows. Plan
+    // the step allocation once per kDecodePlanBucket slots for the bucket's
+    // widest step, so the steps in between reuse it instead of re-planning
+    // (and regrowing the compute buffer) on every token.
+    std::lock_guard<std::recursive_mutex> lk(runtime_mutex());
+    auto& sa = state_for(m.loader).decode_alloc;
+    if (!sa) sa = std::make_unique<Backend::StepAlloc>();
+    if (!fullcap && K > sa->reserved) {
+        const int64_t W = std::min<int64_t>((int64_t)lc.max_cache,
+            (K + kDecodePlanBucket - 1) / kDecodePlanBucket * kDecodePlanBucket);
+        gp = W - S;
+        const bool planned = global_backend().reserve_steps(*sa, W, build);
+        gp = past;
+        if (!planned) { e = std::string(m.spec.label) + " decode plan failed"; return false; }
+    }
+    if (!global_backend().compute_step(*sa, build, logits)) {
+        e = std::string(m.spec.label) + " decode graph failed"; return false;
+    }
     state.length = past + S;
     return true;
 }
@@ -1070,8 +1092,7 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
                                              mask.data(), mask.size() * sizeof(float));
         for (int li = 0; li < (int)lc.n_layers; ++li)
             x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
-                                 cs, sn, mt, exact_width ? 3 : 2,
-                                 exact_width ? nullptr : pos, nullptr);
+                                 cs, sn, mt, exact_width ? 3 : 2, pos, nullptr);
         ggml_tensor* n = F ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
                            : rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
@@ -1435,18 +1456,6 @@ size_t prefill_replay_cache_size(const ModelLoader& loader) {
     return st && st->prefill_cache ? st->prefill_cache->by_S.size() : 0;
 }
 
-int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
-    return spec_argmax_impl(s, x);
-}
-
-bool llm_decode_step(const QwenDecodeCtx& m, int32_t prev_token,
-                     const float* audio_row, LlmState& state,
-                     std::vector<float>& logits, std::string& e) {
-    ensure_weights_realized(m.loader);
-    return forward_decode(m, prev_token, state.length, state, logits, e,
-                          audio_row);
-}
-
 bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,
                  PrefillResult& o, std::string& e) {
     if (i.n_tokens <= 0 || i.width != (int64_t)m.dims.hidden || i.n_tokens > maxc) {
@@ -1646,7 +1655,7 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
     if (!proposer || max_k < 1 || max_k > kMaxSpeculativeK || op.max_new_tokens < 1 ||
         op.max_cache_len > (int32_t)m.dims.max_cache ||
         i.n_tokens + op.max_new_tokens > op.max_cache_len ||
-        m.spec.decode_add || debug_probe_active(m.spec)) {
+        debug_probe_active(m.spec)) {
         e = std::string(m.spec.label) + " invalid speculative generation configuration";
         return false;
     }

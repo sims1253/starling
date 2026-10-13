@@ -13,9 +13,24 @@ package dev.starling.mobile.engine
  * for the 0.6B class; the LLM-decoder kinds add a KV cache (up to ~450 MiB,
  * allocated on the first prefill) and larger compute buffers, so they ask
  * for 768 MiB.
+ *
+ * [maxWindowSeconds] is the longest audio one engine call may take. The
+ * LLM-decoder kinds' encoders see at most 30 s (ARK's Whisper encoder caps
+ * its mel at 3000 frames), so longer recordings are windowed below that;
+ * Parakeet takes the serving layer's 30 s step plus 2 s of overlap.
  */
-enum class ModelKind(val nativeKind: Int, val label: String, val workingSetBytes: Long) {
-    PARAKEET(1, "Parakeet", PARAKEET_WORKING_SET_BYTES),
+enum class ModelKind(
+    val nativeKind: Int,
+    val label: String,
+    val workingSetBytes: Long,
+    val maxWindowSeconds: Double = LLM_DECODER_WINDOW_SECONDS,
+) {
+    PARAKEET(
+        1,
+        "Parakeet",
+        PARAKEET_WORKING_SET_BYTES,
+        ChunkedTranscription.CHUNK_SECONDS + ChunkedTranscription.OVERLAP_SECONDS,
+    ),
     MOSS(2, "MOSS-Transcribe", LLM_DECODER_WORKING_SET_BYTES),
 
     // ARK-ASR-0.6B rides the same engine (every dim comes from ark.* metadata),
@@ -25,7 +40,6 @@ enum class ModelKind(val nativeKind: Int, val label: String, val workingSetBytes
 
     // Likewise for Qwen3-ASR-0.6B and the QWEN3_06 alias.
     QWEN3(7, "Qwen3-ASR", LLM_DECODER_WORKING_SET_BYTES),
-    VOXTRAL(11, "Voxtral Realtime", LLM_DECODER_WORKING_SET_BYTES),
     ;
 
     /** Free memory a load of a [modelBytes] file of this kind asks for (see [workingSetBytes]). */
@@ -56,7 +70,6 @@ enum class ModelKind(val nativeKind: Int, val label: String, val workingSetBytes
             "ark" to ARK,
             "granite" to GRANITE,
             "qwen3" to QWEN3,
-            "voxtral" to VOXTRAL,
         )
 
         /**
@@ -105,3 +118,4 @@ enum class ModelKind(val nativeKind: Int, val label: String, val workingSetBytes
 // Top-level so the enum entries can use them (a companion is initialized after its entries).
 private const val PARAKEET_WORKING_SET_BYTES = 128L * 1024 * 1024
 private const val LLM_DECODER_WORKING_SET_BYTES = 768L * 1024 * 1024
+private const val LLM_DECODER_WINDOW_SECONDS = 30.0

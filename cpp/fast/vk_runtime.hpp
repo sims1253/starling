@@ -12,7 +12,8 @@
 // Portability rules (the target GPUs include mobile drivers of uneven
 // quality): shaders use only Vulkan 1.0 core features (16-bit values are
 // packed/unpacked from 32-bit words, no 8/16-bit storage, no subgroup ops);
-// every storage-buffer binding stays below maxStorageBufferRange; tuning knobs
+// every storage-buffer binding stays within maxStorageBufferRange (a larger
+// one fails the recording instead of being clamped); tuning knobs
 // are specialization constants, so the same SPIR-V runs everywhere.
 
 #pragma once
@@ -29,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace starling::fast::vk {
@@ -75,6 +77,8 @@ namespace starling::fast::vk {
     X(vkDestroyDescriptorPool)                 \
     X(vkAllocateDescriptorSets)                \
     X(vkUpdateDescriptorSets)                  \
+    X(vkCreateBufferView)                      \
+    X(vkDestroyBufferView)                     \
     X(vkCreateCommandPool)                     \
     X(vkDestroyCommandPool)                    \
     X(vkAllocateCommandBuffers)                \
@@ -118,10 +122,15 @@ struct DeviceInfo {
     bool uma = false;                    // a device-local memory type is host-visible
     bool uma_cached = false;             // ... and CPU-cached (mapped writes are fast)
     uint32_t subgroup_size = 0;
+    uint32_t subgroup_ops = 0;           // VkSubgroupFeatureFlags supported in ...
+    bool subgroup_compute = false;       // ... compute shaders
+    uint32_t max_texel_elems = 0;        // maxTexelBufferElements
+    uint64_t min_texel_align = 0;        // minTexelBufferOffsetAlignment
     uint32_t max_shared_bytes = 0;       // maxComputeSharedMemorySize
     uint32_t max_wg_invocations = 0;
     uint64_t max_storage_range = 0;      // maxStorageBufferRange
     uint64_t min_storage_align = 0;      // minStorageBufferOffsetAlignment
+    uint64_t non_coherent_atom = 1;      // nonCoherentAtomSize
     uint64_t max_alloc = 0;              // maxMemoryAllocationSize (0 = unknown)
     double timestamp_period_ns = 0.0;    // 0 = timestamps unsupported
     bool f16 = false;                    // shaderFloat16 enabled on the device
@@ -174,16 +183,20 @@ struct ShaderBlob {
     const uint32_t* words;
     size_t n_words;
     uint32_t n_bindings;
+    uint32_t texel_mask;   // bit i: binding i is a uniform texel buffer (R32G32B32A32_UINT view)
 };
 const ShaderBlob* find_shader(const char* name);
 
 // A specialized compute pipeline. All kernels share one layout shape: N
-// storage-buffer bindings in set 0 plus a 128-byte push-constant block.
+// storage-buffer bindings in set 0 plus a 128-byte push-constant block;
+// bindings in texel_mask are uniform texel buffers instead (the dispatch
+// Ref then names the bytes a 16-byte-texel view covers, see texel_view()).
 struct Pipeline {
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     uint32_t n_bindings = 0;
+    uint32_t texel_mask = 0;
     std::string label;
 };
 
@@ -217,7 +230,12 @@ public:
                   uint32_t gx, uint32_t gy = 1, uint32_t gz = 1);
     // Profiling label for the following dispatches (defaults to the shader).
     void label(const char* l) { label_ = l ? l : ""; }
-    // Compute->compute (and transfer) memory barrier.
+    // Memory + execution barrier between everything recorded before and
+    // after it. Emitted lazily at the next command, scoped to what it
+    // orders: compute -> compute unless a copy/fill precedes it (source
+    // gains the transfer stage) or follows it (destination is transfer).
+    // PowerVR prices the wide compute|transfer form measurably higher
+    // (decode -4..6 %).
     void barrier();
     void copy(const Buffer& src, VkDeviceSize soff, const Buffer& dst,
               VkDeviceSize doff, VkDeviceSize bytes);
@@ -247,6 +265,9 @@ private:
     uint32_t n_queries_ = 0, max_queries_ = 0;
     std::vector<std::string> q_labels_;
     std::string label_;
+    bool bar_pending_ = false;   // barrier() called, not yet emitted
+    bool bar_xfer_src_ = false;  // a copy/fill since the last emitted barrier
+    void emit_barrier(bool dst_xfer);
     VkDescriptorSet alloc_set(const Pipeline& p);
 };
 
@@ -271,6 +292,14 @@ public:
     // Host <-> device copies (staged unless the buffer is mapped).
     bool upload(Buffer& dst, VkDeviceSize off, const void* src, size_t bytes, std::string& err);
     bool download(const Buffer& src, VkDeviceSize off, void* dst, size_t bytes, std::string& err);
+    // Make host writes to [off, off + bytes) of a mapped, non-coherent
+    // buffer visible to the device (no-op for coherent or unmapped memory).
+    void flush(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes);
+
+    // A cached R32G32B32A32_UINT view of [off, off + range) of `b` (off a
+    // multiple of minTexelBufferOffsetAlignment, range <= 16 *
+    // maxTexelBufferElements). Lives until the buffer is released.
+    VkBufferView texel_view(const Buffer& b, VkDeviceSize off, VkDeviceSize range, std::string& err);
 
     // Pipeline for `shader` specialized with `spec` (constant_id i = spec[i]).
     // Cached; the pointer stays valid for the context's lifetime.
@@ -322,6 +351,9 @@ private:
     std::map<std::string, std::unique_ptr<Pipeline>> pipes_;
     std::map<uint32_t, std::pair<VkDescriptorSetLayout, VkPipelineLayout>> layouts_;
     std::map<std::string, VkShaderModule> modules_;
+    std::mutex view_mu_;
+    std::map<std::tuple<VkBuffer, VkDeviceSize, VkDeviceSize>, VkBufferView> views_;
+    void drop_views(VkBuffer b);
 
     // Transfer helpers (staging buffer + a one-shot command buffer).
     Buffer staging_;

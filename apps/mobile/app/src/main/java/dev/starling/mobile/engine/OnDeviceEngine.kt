@@ -59,6 +59,8 @@ class OnDeviceEngine(
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
     private val keepAwake: () -> AutoCloseable = { AutoCloseable {} },
     private val partialTag: String = "local",
+    /** Directories searched for Pixel TPU encoder artifacts (STARLING_NPU_DIR). */
+    private val npuDirs: List<File> = emptyList(),
 ) : OnDeviceStreamSession.LiveEngine {
     /** An engine whose models and active-model marker all live in [modelDir]. */
     constructor(
@@ -66,7 +68,8 @@ class OnDeviceEngine(
         memoryGate: (modelBytes: Long, kind: ModelKind) -> String? = { _, _ -> null },
         nativeSupport: () -> String? = NativeSupport::unsupportedReason,
         keepAwake: () -> AutoCloseable = { AutoCloseable {} },
-    ) : this({ modelDir }, modelDir, memoryGate, nativeSupport, keepAwake)
+        npuDirs: List<File> = emptyList(),
+    ) : this({ modelDir }, modelDir, memoryGate, nativeSupport, keepAwake, npuDirs = npuDirs)
 
     /**
      * What [adoptModels] did: models moved (an identical copy already in
@@ -149,6 +152,9 @@ class OnDeviceEngine(
 
     /** The model file [handle] was loaded from; a different active model forces a reload. */
     private var loadedFile: File? = null
+
+    /** The kind [loadedFile] loaded as: sets the transcription window length. */
+    private var loadedKind: ModelKind? = null
     private var loadError: String? = null
 
     // Live sessions in progress. Counted without the engine lock: a session
@@ -791,7 +797,7 @@ class OnDeviceEngine(
         NativeSupport.applyThreadDefault()
         // The fast engine's pipeline cache and GPU-wedge marker stay with
         // this install, not in a model folder other builds share.
-        NativeSupport.applyFastEngineDefaults(ownDir)
+        NativeSupport.applyFastEngineDefaults(ownDir, npuDirs)
         val abi = StarlingNative.abiVersion()
         if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
             loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
@@ -805,6 +811,7 @@ class OnDeviceEngine(
         }
         handle = loaded
         loadedFile = modelFile
+        loadedKind = kind
         loadGeneration++
         residentGeneration = loadGeneration
         loadError = null
@@ -1076,10 +1083,12 @@ class OnDeviceEngine(
                 false,
             )
         }
-        // Bound each engine call like the serving layer (30 s step, 2 s
-        // overlap): one full-attention pass over the whole clip would scale
-        // quadratically with the recording length.
-        val windows = ChunkedTranscription.planWindows(decoded.samples.size, decoded.sampleRate)
+        // Bound each engine call like the serving layer (Parakeet: 30 s step,
+        // 2 s overlap): one full-attention pass over the whole clip would
+        // scale quadratically with the recording length, and the LLM-decoder
+        // kinds' encoders see at most 30 s.
+        val windowSeconds = (loadedKind ?: ModelKind.PARAKEET).maxWindowSeconds
+        val windows = ChunkedTranscription.planWindows(decoded.samples.size, decoded.sampleRate, windowSeconds)
         val texts = ArrayList<String>(windows.size)
         val cancel = attempt?.let { StarlingNative.Cancel(it::cancelRequested) }
         for (window in windows) {
@@ -1135,6 +1144,7 @@ class OnDeviceEngine(
             awake { StarlingNative.free(handle) }
             handle = 0L
             loadedFile = null
+            loadedKind = null
             residentGeneration = -1L
             loadError = null
             observer.unloaded()

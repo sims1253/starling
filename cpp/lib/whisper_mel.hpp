@@ -4,7 +4,7 @@
 // split), clamp + normalize run in f32, and the output is f32 plus a bf16
 // copy. The engines differ only in the points MelPolicy captures:
 //   * valid-frame rule after fullT = S/H + 1 STFT frames:
-//       T_FULLT_MINUS_1  (moss/ark/qwen3/voxtral)  T = fullT - 1 = S/H
+//       T_FULLT_MINUS_1  (moss/ark/qwen3)  T = fullT - 1 = S/H
 //       T_FULLT          (granite)   T = fullT (torchaudio center=True keeps
 //                                        every frame; the odd-frame drop and
 //                                        the 80->160 pair-stack are
@@ -17,7 +17,6 @@
 #include "runtime/model_loader.hpp"
 #include "ggml.h"
 #include <cstdint>
-#include <limits>
 #include <string>
 #include <vector>
 
@@ -37,11 +36,6 @@ struct MelPolicy {
     bool cap_n_samples = false;
     uint32_t n_samples = 0;
 
-    // Fixed global log-mel max (streaming-safe normalization): when finite,
-    // replaces the computed per-utterance max as the clamp/normalize reference.
-    // NaN (default) keeps the legacy per-utterance max and is byte-identical
-    // for every existing engine.
-    double fixed_log_mel_max = std::numeric_limits<double>::quiet_NaN();
     const char* dump_env = nullptr;   // e.g. "STARLING_ARK_MEL_DUMP"
     const char* label = "GGUF";       // error-message prefix ("<label> mel ...")
 };

@@ -1,0 +1,52 @@
+#version 450
+// shaw_bias.comp — Granite's block-local Shaw relative-position term, added
+// to the raw content scores before the softmax:
+//
+//   S[w][h][c][r] += q[tok0 + w*Wn + c][h] · rel[c][r]     (c, r < Wn)
+//
+// rel is the layer's prebaked [CS][CS][D] f16 table (query position c, key
+// position r within the window). One workgroup per (query position c,
+// window w): the query row (all heads) is staged in shared memory, each
+// invocation owns key positions r and keeps one accumulator per head, so
+// every table word is loaded once per (c, r, w). The softmax applies the
+// attention scale to content and position terms alike.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint QROW = 1024;   // H * D (shared q row)
+layout(constant_id = 1) const uint HN = 8;        // heads (== p.H)
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Q { uint q[]; };
+layout(std430, binding = 1) readonly buffer REL { uint rel[]; };
+layout(std430, binding = 2) buffer S { float s[]; };
+
+layout(push_constant) uniform PC {
+    uint H, D;
+    uint ldq;        // q row stride (elements)
+    uint tok0;       // first token of window 0
+    uint Wn;         // window length (queries = keys)
+    uint CS;         // table extent
+} p;
+
+shared float qs[QROW];
+
+void main() {
+    const uint c = gl_WorkGroupID.x, w = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = (p.tok0 + w * p.Wn + c) * p.ldq;
+    for (uint i = tid; i < p.H * p.D; i += 256u) qs[i] = unpackHalf2x16(q[(row + i) >> 1])[i & 1u];
+    barrier();
+    const uint DW = p.D / 2u;
+    for (uint r = tid; r < p.Wn; r += 256u) {
+        const uint rb = (c * p.CS + r) * DW;
+        float acc[HN];
+        [[unroll]] for (uint h = 0; h < HN; ++h) acc[h] = 0.0;
+        for (uint j = 0; j < DW; ++j) {
+            const vec2 e = unpackHalf2x16(rel[rb + j]);
+            [[unroll]] for (uint h = 0; h < HN; ++h)
+                acc[h] += qs[h * p.D + 2u * j] * e.x + qs[h * p.D + 2u * j + 1u] * e.y;
+        }
+        [[unroll]] for (uint h = 0; h < HN; ++h) s[((w * HN + h) * p.Wn + c) * p.Wn + r] += acc[h];
+    }
+}

@@ -6,7 +6,8 @@
 // device: the host only reads the history after a multi-token submission.
 //
 // state: [0] position of the next input token, [1] tokens generated,
-//        [2] done flag, [3] reserved, [16...] generated token ids.
+//        [2] done flag, [3] this call's token budget (0 = max_steps),
+//        [16...] generated token ids.
 
 #include "common.glsl"
 
@@ -52,12 +53,14 @@ void main() {
         barrier();
     }
     const uint tok = bi[0];
-    for (uint k = tid; k < p.K; k += WG) x[k] = dequant(tok, k, p.K);
+    for (uint k = tid; k < p.K; k += WG)
+        x[k] = dequant(tok, k, p.K);
     if (tid == 0u) {
         const uint step = state[1];
         state[16 + step] = tok;
         state[1] = step + 1u;
         state[0] = state[0] + 1u;
-        if (tok == p.eos || step + 1u >= p.max_steps) state[2] = 1u;
+        const uint budget = state[3] != 0u ? min(state[3], p.max_steps) : p.max_steps;
+        if (tok == p.eos || step + 1u >= budget) state[2] = 1u;
     }
 }

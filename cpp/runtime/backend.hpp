@@ -92,6 +92,37 @@ public:
     bool compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                  std::vector<float>& out);
 
+    // Allocation plan for a run of one-shot graphs that share one topology
+    // and whose tensors only grow up to a bound (the exact-width decode step:
+    // only the attention width changes from token to token). The shared
+    // gallocr would re-plan every such graph, and regrow its buffer, because
+    // some node got larger. Instead the caller reserves the plan once for a
+    // worst-case build (reserve_steps) and runs the real steps against it
+    // (compute_step), which then only assigns the planned offsets. Owned by
+    // the caller; free it before the Backend.
+    class StepAlloc {
+    public:
+        StepAlloc() = default;
+        ~StepAlloc();
+        StepAlloc(const StepAlloc&) = delete;
+        StepAlloc& operator=(const StepAlloc&) = delete;
+        // Caller-defined size key of the reserved worst case (-1: none yet).
+        int64_t reserved = -1;
+    private:
+        friend class Backend;
+        ggml_gallocr_t galloc_ = nullptr;
+    };
+    // Plan `sa` for the graph `build` constructs (nothing runs; inputs are not
+    // read) and set sa.reserved = key. A later compute_step graph must have
+    // the same node/leaf structure and no tensor larger than this one.
+    bool reserve_steps(StepAlloc& sa, int64_t key,
+                       const std::function<ggml_tensor*(ggml_context*)>& build);
+    // compute() on sa's plan. A graph that does not fit the plan is re-planned
+    // by the gallocr like compute() would (correct, just not cheap).
+    bool compute_step(StepAlloc& sa,
+                      const std::function<ggml_tensor*(ggml_context*)>& build,
+                      std::vector<float>& out);
+
     // Internal hook used by add_graph_input / capture_graph_output (routed via
     // a thread-local pointer to the Backend driving the current compute).
     void register_input(ggml_tensor* t, const void* host, size_t nbytes);
@@ -100,6 +131,8 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    bool compute_impl(const std::function<ggml_tensor*(ggml_context*)>& build,
+                      std::vector<float>& out, StepAlloc* sa);
     int   n_threads_ = 1;
     std::string device_name_ = "cpu";
     // The selected registry device (null when only the CPU fallback engaged);

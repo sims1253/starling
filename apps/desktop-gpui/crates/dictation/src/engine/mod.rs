@@ -45,7 +45,7 @@ pub use sidecar::{HealthSnapshot, ReadyError, ReadyStage, Sidecar};
 /// lockstep contract the Python client pins in
 /// `tools/starling_ggml.py`. A mismatched engine is never run; it
 /// is reported with an actionable message instead (#362).
-pub const EXPECTED_ENGINE_ABI: u32 = 10;
+pub const EXPECTED_ENGINE_ABI: u32 = 11;
 
 /// An inference backend family. The bundle ships one server binary per
 /// family; [`probe::select_backend`] prefers `Vulkan` and falls back to

@@ -41,6 +41,21 @@ class ChunkedTranscriptionTest {
     }
 
     @Test
+    fun shorterWindowsKeepTheTwoSecondOverlap() {
+        val total = 70 * sampleRate
+        val windows = ChunkedTranscription.planWindows(total, sampleRate, windowSeconds = 30.0)
+
+        assertEquals(
+            listOf(
+                ChunkedTranscription.Window(0, 30 * sampleRate),
+                ChunkedTranscription.Window(28 * sampleRate, 30 * sampleRate),
+                ChunkedTranscription.Window(56 * sampleRate, 14 * sampleRate),
+            ),
+            windows,
+        )
+    }
+
+    @Test
     fun boundaryWordsTranscribedTwiceAppearOnce() {
         val first = "the quick brown fox jumps over"
         val second = "jumps over the lazy dog today"

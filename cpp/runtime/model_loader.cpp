@@ -1,7 +1,11 @@
 // model_loader.cpp — GGUF parse + weight realize.
 //
-// Opens the GGUF with gguf_init_from_file(no_alloc=false) so the whole weight
-// region lives in one contiguous memory-backed ggml_context (zero-copy on CPU).
+// Parses the GGUF header (gguf_init_from_file, no_alloc) and maps the file
+// privately: every tensor points into the mapping, so the weight region is
+// one contiguous host range (zero-copy on CPU) whose pages load on first
+// touch. The fast engines repack straight from it and drop the pages they
+// consumed; nothing holds a second copy. Platforms without mmap read the
+// file into the ggml context instead.
 // Reads KV metadata + maps tensor name -> ggml_tensor*. realize_weights() gives
 // each weight a backend buffer (zero-copy borrow on CPU, mirrored upload on
 // GPU) so clone_weight() can hand them to graphs as already-allocated leaves.
@@ -15,6 +19,19 @@
 #include "gguf.h"
 #include "ggml-backend.h"
 
+#if defined(__unix__) || defined(__APPLE__)
+#define STARLING_LOADER_MMAP 1
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#define STARLING_LOADER_MMAP 0
+#endif
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_set>
 #include <stdexcept>
@@ -57,27 +74,124 @@ ModelLoader::~ModelLoader() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex());
     release_runtime_resources();
     live_loaders().erase(this);
-    // The ggml context owns the weight tensors; freeing it frees them all.
-    if (ctx_) cpu_repack::forget(ggml_get_mem_buffer(ctx_), ggml_get_mem_size(ctx_));
+    // The ggml context owns the weight tensors (and, unless the file is
+    // mapped, their data); freeing it frees them all.
+    if (data_) cpu_repack::forget(data_, data_size_);
     if (ctx_) ggml_free(ctx_);
     if (compat_ctx_) ggml_free(compat_ctx_);
     if (gguf_ctx_) gguf_free(gguf_ctx_);
+#if STARLING_LOADER_MMAP
+    if (map_addr_) munmap(map_addr_, map_len_);
+#endif
+}
+
+void ModelLoader::drop_mapping() {
+#if STARLING_LOADER_MMAP
+    if (map_addr_) munmap(map_addr_, map_len_);
+#endif
+    map_addr_ = nullptr;
+    map_len_ = 0;
+    data_ = nullptr;
+    data_size_ = 0;
+    if (gguf_ctx_) gguf_free(gguf_ctx_);
+    gguf_ctx_ = nullptr;
+    if (ctx_) ggml_free(ctx_);
+    ctx_ = nullptr;
+}
+
+ModelLoader::MapResult ModelLoader::map_weights(const char* path) {
+#if STARLING_LOADER_MMAP
+    // Metadata only: the tensors get no data until pointed into the map.
+    gguf_init_params params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ &ctx_,
+    };
+    gguf_ctx_ = gguf_init_from_file(path, params);
+    if (!gguf_ctx_) {
+        drop_mapping();
+        error_ = std::string("failed to open GGUF: ") + path;
+        return MapResult::Failed;
+    }
+    // ggml's CPU buffers need 32-byte aligned tensor data: a file aligned
+    // more loosely is read instead.
+    if (gguf_get_alignment(gguf_ctx_) % 32 != 0) {
+        drop_mapping();
+        return MapResult::ReadInstead;
+    }
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        if (fd >= 0) close(fd);
+        drop_mapping();
+        return MapResult::ReadInstead;
+    }
+    const size_t file_size = (size_t)st.st_size;
+    const size_t data_off = gguf_get_data_offset(gguf_ctx_);
+    if (data_off > file_size) {
+        close(fd);
+        drop_mapping();
+        error_ = std::string("GGUF data offset past the end of ") + path;
+        return MapResult::Failed;
+    }
+    // Private and writable: pages stay shared with the page cache until
+    // written (ggml's CPU repack rewrites weights in place: copy-on-write),
+    // and the kernel can drop untouched pages under pressure instead of
+    // swapping them.
+    void* p = file_size ? mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) : nullptr;
+    close(fd);
+    if (file_size && p == MAP_FAILED) {   // e.g. no address space left: read it instead
+        drop_mapping();
+        return MapResult::ReadInstead;
+    }
+    map_addr_ = p;
+    map_len_ = file_size;
+    data_ = (uint8_t*)p + data_off;
+    data_size_ = file_size - data_off;
+    const int64_t n_tensors = gguf_get_n_tensors(gguf_ctx_);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char* name = gguf_get_tensor_name(gguf_ctx_, i);
+        ggml_tensor* t = name ? ggml_get_tensor(ctx_, name) : nullptr;
+        if (!t) continue;
+        const size_t off = gguf_get_tensor_offset(gguf_ctx_, i);
+        if (off > data_size_ || ggml_nbytes(t) > data_size_ - off) {
+            error_ = std::string("GGUF tensor ") + name + " extends past the end of " + path;
+            drop_mapping();
+            return MapResult::Failed;
+        }
+        t->data = data_ + off;
+    }
+    return MapResult::Mapped;
+#else
+    (void)path;
+    return MapResult::ReadInstead;
+#endif
 }
 
 bool ModelLoader::load(const char* path) {
     if (ctx_ || gguf_ctx_) { error_ = "model loader is already loaded"; return false; }
     if (!path || !*path) { error_ = "empty GGUF path"; return false; }
-    // gguf_init_params { no_alloc, ctx } — ctx!=NULL means allocate the weight
-    // tensors into a freshly-created ggml_context (host-memory-backed).
-    gguf_init_params params = {
-        /*.no_alloc =*/ false,
-        /*.ctx      =*/ &ctx_,
-    };
-    gguf_ctx_ = gguf_init_from_file(path, params);
-    if (!gguf_ctx_) {
-        error_ = std::string("failed to open GGUF: ") + path;
-        return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    const MapResult mapped = map_weights(path);
+    if (mapped == MapResult::Failed) return false;
+    if (mapped == MapResult::ReadInstead) {
+        // gguf_init_params { no_alloc, ctx } — ctx!=NULL means allocate the
+        // weight tensors into a freshly-created ggml_context (host memory).
+        gguf_init_params params = {
+            /*.no_alloc =*/ false,
+            /*.ctx      =*/ &ctx_,
+        };
+        gguf_ctx_ = gguf_init_from_file(path, params);
+        if (!gguf_ctx_) {
+            error_ = std::string("failed to open GGUF: ") + path;
+            return false;
+        }
+        data_ = (uint8_t*)ggml_get_mem_buffer(ctx_);
+        data_size_ = ggml_get_mem_size(ctx_);
     }
+    if (const char* e = std::getenv("STARLING_FAST_TIMING"); e && e[0] == '1')
+        std::fprintf(stderr, "[load] gguf %s %.1f ms (%.1f MiB)\n", map_addr_ ? "map" : "read",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                     data_size_ / 1048576.0);
     // Map every tensor name -> tensor*.
     const int64_t n_tensors = gguf_get_n_tensors(gguf_ctx_);
     for (int64_t i = 0; i < n_tensors; ++i) {
@@ -155,6 +269,7 @@ bool ModelLoader::load(const char* path) {
         }
         kv_[key] = std::move(v);
     }
+    path_ = path;
     return true;
 }
 
@@ -251,10 +366,9 @@ bool ModelLoader::realize_weights(Backend& backend) {
     // On CPU: borrow the loader's memory-backed context zero-copy.
     // On GPU: mirror each weight into a device-side context + upload.
     if (!backend.is_gpu()) {
-        // Borrow the loader's memory-backed ggml_context zero-copy. The public
-        // accessors ggml_get_mem_buffer / ggml_get_mem_size give the host region.
-        ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(
-            ggml_get_mem_buffer(ctx_), ggml_get_mem_size(ctx_));
+        // Borrow the loader's weight memory zero-copy (the file mapping, or
+        // the ggml context's allocation when the file was read).
+        ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(data_, data_size_);
         if (!buf) { error_ = "realize_weights: CPU buffer alloc failed"; return false; }
         weight_buffer_ = buf;
         // Point each tensor's ->buffer at the borrowed buffer.

@@ -105,6 +105,9 @@ class StarlingApplication : Application() {
             partialTag = packageName,
             memoryGate = ::memoryGate,
             keepAwake = partialWakeLock(),
+            // TPU encoder artifacts: files/npu (debug builds: run-as), else the
+            // adb-writable external files dir (release builds).
+            npuDirs = listOfNotNull(File(filesDir, "npu"), getExternalFilesDir("npu")),
         )
         modelDownloads = ModelDownloadController(this, onDeviceEngine)
         modelLifetime = ModelLifetime(

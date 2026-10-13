@@ -1,9 +1,28 @@
 // embed_scatter.cpp — prompt embedding + audio scatter (see embed_scatter.hpp).
 #include "embed_scatter.hpp"
+#include "runtime/model_loader.hpp"
 #include <algorithm>
 #include <cstdio>
 
 namespace starling::ggml::lib {
+
+bool embed_rows(const ModelLoader& ml, const std::vector<int32_t>& ids,
+                std::vector<float>& out) {
+    // An id past the table (corrupt GGUF prompt ids) would be read out of
+    // bounds by get_rows.
+    const ggml_tensor* table = ml.tensor("llm.embed.weight");
+    if (!table) return false;
+    for (int32_t id : ids)
+        if (id < 0 || id >= table->ne[1]) return false;
+    ensure_weights_realized(ml);
+    return run_graph([&](ggml_context* c) {
+        int64_t ne[1] = {(int64_t) ids.size()};
+        auto* it = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, ids.data(),
+                                      ids.size() * sizeof(ids[0]));
+        return ggml_cast(c, ggml_get_rows(c, clone_weight(c, ml, "llm.embed.weight"), it),
+                         GGML_TYPE_F32);
+    }, out);
+}
 
 bool embed_and_scatter_audio(const ModelLoader& ml, int64_t hidden,
                              const std::vector<int32_t>& ids,
@@ -24,22 +43,13 @@ bool embed_and_scatter_audio(const ModelLoader& ml, int64_t hidden,
     // count larger than the feature buffer would read past its end.
     const int64_t avail = (int64_t)(audio_len / (size_t) audio_width);
     const int64_t sa = std::max<int64_t>(0, std::min(audio_tokens, avail));
-    ensure_weights_realized(ml);
-    std::vector<int32_t> idv = ids;
     std::vector<ggml_bf16_t> ah;
     if (sa > 0) {
         ah.resize((size_t) sa * (size_t) audio_width);
         for (size_t i = 0; i < ah.size(); ++i) ah[i] = ggml_fp32_to_bf16(audio_data[i]);
     }
     std::vector<float> emb;
-    bool ok = run_graph([&](ggml_context* c) {
-        int64_t ne[1] = {(int64_t) idv.size()};
-        auto* it = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, idv.data(),
-                                      idv.size() * sizeof(idv[0]));
-        return ggml_cast(c, ggml_get_rows(c, clone_weight(c, ml, "llm.embed.weight"), it),
-                         GGML_TYPE_F32);
-    }, emb);
-    if (!ok) {
+    if (!embed_rows(ml, ids, emb)) {
         err = std::string(label) + " embedding lookup failed";
         return false;
     }

@@ -84,18 +84,16 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
     ggml_tensor* qv = ggml_add(ctx, qh, bv);  // [dk, T, H]
 
     // ---- bd = p^T @ qv -> [P(pos), T(query), H], then rel_shift -> [T,T,H] ----
-    // The skew is load-bearing — mirror parakeet.cpp relpos_attention.cpp:94-104
-    // EXACTLY (pad by 1 on dim0, reshape, view with offset nb[1], reshape back,
-    // view with offset 0, cont).
+    // The skew is load-bearing. parakeet.cpp's form (pad by 1 on dim0,
+    // reshape, view with offset nb[1], reshape back, view with offset 0,
+    // cont) is a pure gather: out(kj, qi, h) = bd(kj + T-1 - qi, qi, h).
+    // That gather is ONE strided view of the [P = 2T-1, T, H] product (row
+    // stride nb[1] - nb[0], offset T-1 elements), so the same values reach
+    // the score add without the padded copy and two full [T, T, H] conts.
+    // Rows stay contiguous, which the CPU add consumes directly.
     ggml_tensor* bd = ggml_mul_mat(ctx, ph, qv);                     // [P, T, H]
-    bd = ggml_pad_ext(ctx, bd, /*lp0*/1, /*rp0*/0, 0, 0, 0, 0, 0, 0); // [P+1=2T, T, H]
-    bd = ggml_reshape_3d(ctx, bd, T, 2 * T, H);                       // [T, 2T, H]
-    bd = ggml_view_3d(ctx, bd, T, 2 * T - 1, H,
-                      bd->nb[1], bd->nb[2], bd->nb[1]);              // [T, 2T-1, H]
-    bd = ggml_cont(ctx, bd);
-    bd = ggml_reshape_3d(ctx, bd, 2 * T - 1, T, H);                  // [2T-1, T, H]
-    bd = ggml_view_3d(ctx, bd, T, T, H, bd->nb[1], bd->nb[2], 0);
-    bd = ggml_cont(ctx, bd);                                          // [T_k, T_q, H]
+    bd = ggml_view_3d(ctx, bd, T, T, H, bd->nb[1] - bd->nb[0], bd->nb[2],
+                      (size_t)(T - 1) * bd->nb[0]);                   // [T_k, T_q, H]
 
     // GPU fused path: flash computes softmax(scale*ac + mask), whereas the
     // reference computes softmax((ac + bd)*scale + validity_mask). Therefore
@@ -108,7 +106,7 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
                            !(no_fattn && std::string(no_fattn) == "1");
     const bool mask_is_trivial = (valid_len >= T);
     if (use_flash) {
-        ggml_tensor* mask_flash = ggml_scale(ctx, bd, scale);
+        ggml_tensor* mask_flash = ggml_scale(ctx, ggml_cont(ctx, bd), scale);
         if (lm) {
             mask_flash = ggml_add(ctx, mask_flash, lm->key);
         } else if (!mask_is_trivial) {

@@ -130,7 +130,7 @@ express a quality claim. Also out of scope, as declared gaps:
   `unicode_codepoints` span convention this package reuses for segment
   spans.
 * `docs/models.md` — model cards advertise language counts
-  (ARK-ASR-0.6B "19 languages", Voxtral-Mini "13 languages");
+  (ARK-ASR-0.6B "19 languages");
   parakeet-unified-en is English-only. These are card claims, not decoder
   language control.
 * `apps/desktop-gpui` — no language selector exists in the client today (the

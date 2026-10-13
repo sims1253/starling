@@ -13,11 +13,14 @@
 
 layout(constant_id = 0) const uint D = 128;      // head dim == workgroup size
 layout(constant_id = 1) const uint MAXPOS = 2048;
+layout(constant_id = 2) const uint QK_NORM = 1;   // 0: no q/k RMSNorm (Qwen2.5, Granite)
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
 layout(std430, binding = 1) buffer KC { uint kc[]; };
+layout(std430, binding = 1) readonly buffer KC4 { uvec4 kc4[]; };   // same cache, 8 halves per load
 layout(std430, binding = 2) buffer VC { uint vc[]; };
+layout(std430, binding = 2) readonly buffer VC2 { uvec2 vc2[]; };   // same cache, 4 halves per load
 layout(std430, binding = 3) buffer O { float o[]; };
 layout(std430, binding = 4) readonly buffer QN { float qn_w[]; };
 layout(std430, binding = 5) readonly buffer KN { float kn_w[]; };
@@ -36,6 +39,7 @@ shared float ks[D];
 shared float vs[D];
 shared float red[D];
 shared float sc[MAXPOS];
+shared float vpart[4 * D];
 
 float block_sum(float v) {
     const uint tid = gl_LocalInvocationID.x;
@@ -62,10 +66,13 @@ float block_max(float v) {
     return r;
 }
 
-// RMSNorm(x)·w then NEOX rotation; x is this thread's element, result for d.
+// RMSNorm(x)·w (QK_NORM) then NEOX rotation; x is this thread's element, result for d.
 float norm_rope(float x, const uint d, const bool is_q, uint pos) {
-    const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
-    const float xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    float xn = x;
+    if (QK_NORM != 0u) {
+        const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
+        xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    }
     red[d] = xn;
     barrier();
     const uint half_d = D / 2;
@@ -101,10 +108,15 @@ void main() {
     for (uint j = d; j <= pos; j += D) {
         float s = 0.0;
         if (j < pos) {
-            const uint kb = (base + j * D) / 2;
-            for (uint w = 0; w < D / 2; ++w) {
-                const vec2 kv = unpackHalf2x16(kc[kb + w]);
-                s += qs[2 * w] * kv.x + qs[2 * w + 1] * kv.y;
+            // 16-byte key loads (8 halves): a quarter of the load
+            // instructions of word loads, same accumulation order.
+            const uint kb = (base + j * D) / 8;
+            for (uint u = 0; u < D / 8; ++u) {
+                const uvec4 k4 = kc4[kb + u];
+                [[unroll]] for (uint e = 0; e < 4; ++e) {
+                    const vec2 kv = unpackHalf2x16(k4[e]);
+                    s += qs[8 * u + 2 * e] * kv.x + qs[8 * u + 2 * e + 1] * kv.y;
+                }
             }
         } else {
             for (uint w = 0; w < D; ++w) s += qs[w] * ks[w];
@@ -122,11 +134,23 @@ void main() {
     }
     const float inv = 1.0 / block_sum(sum);   // block_sum's barriers publish sc[]
 
-    // Value mix: thread d owns output dim d (coalesced V reads).
-    float acc = 0.0;
-    const uint vb = base / 2 + d / 2;
-    const uint hi = d & 1u;
-    for (uint j = 0; j < pos; ++j) acc += sc[j] * unpackHalf2x16(vc[vb + j * (D / 2)])[hi];
-    acc += sc[pos] * vs[d];
+    // Value mix in four position groups: thread (grp, lane) owns dims
+    // 4*lane..4*lane+3 (8-byte V loads, one whole row per 32-thread group
+    // of the workgroup) over positions j = grp, grp+4, ...; the four group
+    // partials are summed through shared memory. A quarter of the serial
+    // chain of a one-dim-per-thread loop.
+    const uint lane = d % (D / 4), grp = d / (D / 4);
+    vec4 acc4 = vec4(0.0);
+    const uint vb4 = base / 4 + lane;
+    for (uint j = grp; j < pos; j += 4u) {
+        const uvec2 u = vc2[vb4 + j * (D / 4)];
+        acc4 += sc[j] * vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y));
+    }
+    vpart[grp * D + 4u * lane] = acc4.x;
+    vpart[grp * D + 4u * lane + 1u] = acc4.y;
+    vpart[grp * D + 4u * lane + 2u] = acc4.z;
+    vpart[grp * D + 4u * lane + 3u] = acc4.w;
+    barrier();
+    const float acc = ((vpart[d] + vpart[D + d]) + (vpart[2u * D + d] + vpart[3u * D + d])) + sc[pos] * vs[d];
     o[h * D + d] = acc * inv;
 }

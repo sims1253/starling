@@ -61,6 +61,7 @@ endif()
 
 # ---- shader variants ----------------------------------------------------------
 # name | source | defines (";"-free, comma separated) | binding count
+#      [| texel mask: bit i = binding i is a uniform texel buffer, not an SSBO]
 set(STARLING_FAST_SHADERS
   "gemm_w4|gemm.comp|B_W4|7"
   "gemm_w8|gemm.comp|B_W8|7"
@@ -72,16 +73,27 @@ set(STARLING_FAST_SHADERS
   "gemm_f16t_h|gemm.comp|B_F16T,F16MATH|7"
   "gemm_conv|gemm.comp|B_F16,A_CONV|7"
   "gemm_conv_h|gemm.comp|B_F16,A_CONV,F16MATH|7"
+  "gemm_sg_w4|gemm_sg.comp|B_W4|7"
+  "gemm_sg_w8|gemm_sg.comp|B_W8|7"
+  "gemm_sg_f16|gemm_sg.comp|B_F16|7"
+  "gemm_sg_conv|gemm_sg.comp|B_F16,A_CONV|7"
+  "gemm_sg_w4_t|gemm_sg.comp|B_W4,ATEX|7|1"
+  "gemm_sg_w8_t|gemm_sg.comp|B_W8,ATEX|7|1"
+  "gemm_sg_f16_t|gemm_sg.comp|B_F16,ATEX|7|1"
+  "gemm_sg_conv_t|gemm_sg.comp|B_F16,A_CONV,ATEX|7|1"
   "alu_probe|alu_probe.comp||1"
   "gemv_w4|gemv.comp|W_W4|7"
   "gemv_w4u|gemv.comp|W_W4,W4_UNPACK|7"
   "gemv_w4um|gemv.comp|W_W4,W4_UNPACK,GEMV_M|7"
   "gemv_w8|gemv.comp|W_W8|7"
+  "gemv_w8u|gemv.comp|W_W8,W8_UNPACK|7"
   "gemv_f16|gemv.comp|W_F16|7"
   "attn_decode|attn_decode.comp||8"
   "attn_decode_split|attn_decode_split.comp||8"
   "attn_split_combine|attn_split_combine.comp||3"
   "rope_kv|rope_kv.comp||7"
+  "enc_rope|enc_rope.comp||4"
+  "shaw_bias|shaw_bias.comp||3"
   "embed_rows|embed_rows.comp|W_W4|10"
   "embed_rows_w8|embed_rows.comp|W_W8|10"
   "embed_rows_f16|embed_rows.comp|W_F16|10"
@@ -126,6 +138,11 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
   list(GET _parts 1 _src)
   list(GET _parts 2 _defs)
   list(GET _parts 3 _nb)
+  list(LENGTH _parts _np)
+  set(_tmask 0)
+  if(_np GREATER 4)
+    list(GET _parts 4 _tmask)
+  endif()
   set(_def_args "")
   if(_defs)
     string(REPLACE "," ";" _deflist "${_defs}")
@@ -142,7 +159,7 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
     DEPENDS ${STARLING_FAST_DIR}/shaders/${_src} ${_fast_glsl_includes}
     COMMENT "glslc ${_name}" VERBATIM)
   list(APPEND _spv_files ${_out})
-  list(APPEND _embed_list "${_name}@${_out}@${_nb}")
+  list(APPEND _embed_list "${_name}@${_out}@${_nb}@${_tmask}")
 endforeach()
 
 string(REPLACE ";" "|" _embed_arg "${_embed_list}")
@@ -163,3 +180,22 @@ if(STARLING_FAST_VK_INCLUDE)
   target_include_directories(starling_ggml_core PUBLIC ${STARLING_FAST_VK_INCLUDE})
 endif()
 target_link_libraries(starling_ggml_core PUBLIC ${CMAKE_DL_LIBS})
+
+# ---- Pixel TPU encoder path (cpp/npu) ----------------------------------------
+# Android only. The TPU runtime is the phone's own libedgetpu_litert.so, opened
+# with dlopen at run time, so builds for other phones carry the code but never
+# touch a TPU; the engine then runs the GPU encoder as before.
+if(ANDROID)
+  set(STARLING_NPU_SRC ${STARLING_REPO_ROOT}/cpp/npu)
+  target_sources(starling_ggml_core PRIVATE ${STARLING_NPU_SRC}/tpu_runtime.cpp ${STARLING_NPU_SRC}/npu_status.cpp)
+  target_compile_definitions(starling_ggml_core PUBLIC STARLING_HAVE_NPU=1)
+  target_include_directories(starling_ggml_core PUBLIC ${STARLING_NPU_SRC})
+  target_link_libraries(starling_ggml_core PUBLIC nativewindow log)
+  # adb-shell tool that compiles encoder artifacts on the phone
+  # (scripts/npu/npu_compile.sh).
+  add_executable(starling-npu-tool EXCLUDE_FROM_ALL
+    ${STARLING_NPU_SRC}/npu_tool.cpp ${STARLING_NPU_SRC}/gguf_fingerprint.cpp
+    ${STARLING_NPU_SRC}/tpu_runtime.cpp)
+  target_link_libraries(starling-npu-tool PRIVATE ggml-base nativewindow ${CMAKE_DL_LIBS})
+  set_target_properties(starling-npu-tool PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()

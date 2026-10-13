@@ -15,10 +15,12 @@
 layout(constant_id = 0) const uint D = 128;      // head dim == workgroup size
 layout(constant_id = 1) const uint MAXPOS = 2048;
 layout(constant_id = 2) const uint SC = 512;     // score slots >= MAXPOS/S
+layout(constant_id = 3) const uint QK_NORM = 1;   // 0: no q/k RMSNorm (Qwen2.5, Granite)
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
 layout(std430, binding = 1) buffer KC { uint kc[]; };
+layout(std430, binding = 1) readonly buffer KC4 { uvec4 kc4[]; };   // same cache, 8 halves per load
 layout(std430, binding = 2) buffer VC { uint vc[]; };
 layout(std430, binding = 3) buffer PA { float pa[]; };   // [H][S][2+D]
 layout(std430, binding = 4) readonly buffer QN { float qn_w[]; };
@@ -65,10 +67,13 @@ float block_max(float v) {
     return r;
 }
 
-// RMSNorm(x)·w then NEOX rotation; x is this thread's element, result for d.
+// RMSNorm(x)·w (QK_NORM) then NEOX rotation; x is this thread's element, result for d.
 float norm_rope(float x, const uint d, const bool is_q, uint pos) {
-    const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
-    const float xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    float xn = x;
+    if (QK_NORM != 0u) {
+        const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
+        xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    }
     red[d] = xn;
     barrier();
     const uint half_d = D / 2;
@@ -119,10 +124,15 @@ void main() {
     for (uint j = c0 + d; j < c1; j += D) {
         float s = 0.0;
         if (j < pos) {
-            const uint kb = (base + j * D) / 2;
-            for (uint w = 0; w < D / 2; ++w) {
-                const vec2 kv = unpackHalf2x16(kc[kb + w]);
-                s += qs[2 * w] * kv.x + qs[2 * w + 1] * kv.y;
+            // 16-byte key loads (8 halves): a quarter of the load
+            // instructions of word loads, same accumulation order.
+            const uint kb = (base + j * D) / 8;
+            for (uint u = 0; u < D / 8; ++u) {
+                const uvec4 k4 = kc4[kb + u];
+                [[unroll]] for (uint e = 0; e < 4; ++e) {
+                    const vec2 kv = unpackHalf2x16(k4[e]);
+                    s += qs[8 * u + 2 * e] * kv.x + qs[8 * u + 2 * e + 1] * kv.y;
+                }
             }
         } else {
             for (uint w = 0; w < D; ++w) s += qs[w] * ks[w];

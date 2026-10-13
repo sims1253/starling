@@ -11,7 +11,11 @@ package dev.starling.mobile.engine
  *   boundary advances by the window minus [overlapSeconds];
  * - between windows, the live tail (at least [minSeconds] long, at most one
  *   window) is transcribed at most every [partialIntervalSeconds] for a
- *   responsive partial that is never committed;
+ *   responsive partial that is never committed, and never more than
+ *   [PREVIEW_DUTY] of the time: a model whose previews take longer than the
+ *   interval (the LLM models on a phone CPU) would otherwise re-run them back
+ *   to back for the whole recording, a battery cost for text that is
+ *   replaced a moment later;
  * - [flush] finalizes whatever remains on stop, reusing the last partial's
  *   transcription when it covered exactly the remaining tail (the native
  *   server's exact-tail reuse).
@@ -31,6 +35,8 @@ class ChunkStreamer(
     overlapSeconds: Double = OVERLAP_SECONDS,
     val minSeconds: Double = MIN_SECONDS,
     val partialIntervalSeconds: Double = PARTIAL_INTERVAL_SECONDS,
+    /** Measures how long a preview took (seconds, any monotonic origin). */
+    private val clock: () -> Double = { System.nanoTime() / 1e9 },
 ) {
     /** Why the streamer transcribes audio; named like the server's call ledger kinds. */
     enum class CallKind(val label: String) {
@@ -61,6 +67,10 @@ class ChunkStreamer(
     private val maxOverlapWords: Int
     private var committed: List<String> = emptyList()
     private var lastEmit = Double.NEGATIVE_INFINITY
+
+    // How long the last preview took: the next one waits at least
+    // lastPreviewCost / PREVIEW_DUTY after it started.
+    private var lastPreviewCost = 0.0
 
     // The last successful preview: `samples[start until start + length]`
     // transcribed to [text]. Valid while no window was finalized since.
@@ -106,11 +116,13 @@ class ChunkStreamer(
         val tailLength = size - boundary
         // A full window is still waiting: it failed, and the session stops.
         if (tailLength >= chunk) return committedText
-        val throttled = (now - lastEmit) < partialIntervalSeconds
+        val throttled = (now - lastEmit) < maxOf(partialIntervalSeconds, lastPreviewCost / PREVIEW_DUTY)
         if (!finalized && (throttled || tailLength < min)) return null
 
         if (tailLength > 0 && tailLength >= min) {
+            val started = clock()
             val text = tx.transcribe(samples, boundary, tailLength, CallKind.PREVIEW) ?: return committedText
+            lastPreviewCost = maxOf(0.0, clock() - started)
             // Only a successful tail transcription starts the throttle
             // interval; a step that merely finalized a window must not delay
             // the next partial.
@@ -188,6 +200,9 @@ class ChunkStreamer(
         // trip to amortize, and the first words should appear quickly.
         const val MIN_SECONDS = 1.0
         const val PARTIAL_INTERVAL_SECONDS = 1.0
+
+        /** Largest share of the recording time previews may keep the engine busy. */
+        const val PREVIEW_DUTY = 0.5
 
         private val WHITESPACE = Regex("\\s+")
     }

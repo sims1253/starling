@@ -20,16 +20,22 @@ object ChunkedTranscription {
     const val DEFAULT_SAMPLE_RATE = 16_000
 
     /**
-     * Windows of [CHUNK_SECONDS] + [OVERLAP_SECONDS] of audio, stepped by
-     * [CHUNK_SECONDS], covering [totalSamples] contiguously. Audio that fits
-     * one window yields that single window (byte-exact single-shot path,
+     * Windows of at most [windowSeconds] of audio overlapping by
+     * [OVERLAP_SECONDS] (default: [CHUNK_SECONDS] + [OVERLAP_SECONDS], stepped
+     * by [CHUNK_SECONDS]), covering [totalSamples] contiguously. Audio that
+     * fits one window yields that single window (byte-exact single-shot path,
      * like the server); the final window may be shorter and nothing is padded.
      */
-    fun planWindows(totalSamples: Int, sampleRate: Int = DEFAULT_SAMPLE_RATE): List<Window> {
+    fun planWindows(
+        totalSamples: Int,
+        sampleRate: Int = DEFAULT_SAMPLE_RATE,
+        windowSeconds: Double = CHUNK_SECONDS + OVERLAP_SECONDS,
+    ): List<Window> {
         require(sampleRate > 0) { "sampleRate must be positive" }
+        require(windowSeconds > OVERLAP_SECONDS) { "windowSeconds must exceed the overlap" }
         if (totalSamples <= 0) return emptyList()
-        val window = Math.round((CHUNK_SECONDS + OVERLAP_SECONDS) * sampleRate).toInt()
-        val step = Math.round(CHUNK_SECONDS * sampleRate).toInt()
+        val window = Math.round(windowSeconds * sampleRate).toInt()
+        val step = Math.round((windowSeconds - OVERLAP_SECONDS) * sampleRate).toInt()
         val windows = ArrayList<Window>()
         var start = 0
         while (start < totalSamples) {

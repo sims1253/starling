@@ -85,7 +85,7 @@ flag runs a warmup at startup; omit the square brackets when using it.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, granite, qwen3, qwen3_06, s1, voxtral |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, granite, qwen3, qwen3_06, s1 |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port (`0` = any free port; see [port announcement](#port-announcement-and-parent-watchdog)) |
@@ -155,7 +155,7 @@ contract is [`packages/contracts/openapi.json`](../packages/contracts/openapi.js
   resampled. HTTP uploads require WAV. The WebSocket endpoint accepts PCM16
   and WAV.
 - **Models**: `parakeet`, `moss`, `ark`, `ark06`, `granite`, `qwen3`,
-  `qwen3_06`, `voxtral`, and `s1`. `s1` exposes the additional
+  `qwen3_06`, and `s1`. `s1` exposes the additional
   `POST /normalize` text endpoint.
 - **Request ids**: `X-Request-Id` values starting with `#` are rejected
   with `400`: the prefix is reserved for the server's internal queue
@@ -613,7 +613,6 @@ and input; the filename alone does not guarantee it. See the
 | moss | `scripts/convert_moss_gguf.py` |
 | ark | `scripts/convert_ark_gguf.py` |
 | ark06 | `scripts/convert_ark06_gguf.py` |
-| voxtral | `scripts/convert_voxtral_gguf.py` |
 | granite | `scripts/convert_granite_gguf.py` |
 | qwen3 | `scripts/convert_qwen3_gguf.py` |
 | qwen3_06 | `scripts/convert_qwen3_06_gguf.py` |

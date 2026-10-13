@@ -92,15 +92,14 @@ add_subdirectory("${STARLING_REPO_ROOT}/third_party/ggml" "${CMAKE_BINARY_DIR}/g
 # libstarling_ggml: the Starling-owned engine (runtime + flat C API + the
 # per-model implementations under cpp/<model>/).
 # --------------------------------------------------------------------------- #
-file(GLOB STARLING_GGML_RUNTIME_CPP ${STARLING_REPO_ROOT}/cpp/runtime/*.cpp)
-file(GLOB STARLING_GGML_LIB_CPP ${STARLING_REPO_ROOT}/cpp/lib/*.cpp)
-file(GLOB STARLING_GGML_PARAKEET_CPP ${STARLING_REPO_ROOT}/cpp/parakeet/*.cpp)
-file(GLOB STARLING_GGML_MOSS_CPP ${STARLING_REPO_ROOT}/cpp/moss/*.cpp)
-file(GLOB STARLING_GGML_ARK_CPP ${STARLING_REPO_ROOT}/cpp/ark/*.cpp)
-file(GLOB STARLING_GGML_GRANITE_CPP ${STARLING_REPO_ROOT}/cpp/granite/*.cpp)
-file(GLOB STARLING_GGML_QWEN3_CPP ${STARLING_REPO_ROOT}/cpp/qwen3/*.cpp)
-file(GLOB STARLING_GGML_S1_CPP ${STARLING_REPO_ROOT}/cpp/s1/*.cpp)
-file(GLOB STARLING_GGML_VOXTRAL_CPP ${STARLING_REPO_ROOT}/cpp/voxtral/*.cpp)
+file(GLOB STARLING_GGML_RUNTIME_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/runtime/*.cpp)
+file(GLOB STARLING_GGML_LIB_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/lib/*.cpp)
+file(GLOB STARLING_GGML_PARAKEET_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/parakeet/*.cpp)
+file(GLOB STARLING_GGML_MOSS_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/moss/*.cpp)
+file(GLOB STARLING_GGML_ARK_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/ark/*.cpp)
+file(GLOB STARLING_GGML_GRANITE_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/granite/*.cpp)
+file(GLOB STARLING_GGML_QWEN3_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/qwen3/*.cpp)
+file(GLOB STARLING_GGML_S1_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/s1/*.cpp)
 set(STARLING_GGML_CPP
     ${STARLING_GGML_RUNTIME_CPP}
     ${STARLING_GGML_LIB_CPP}
@@ -110,7 +109,6 @@ set(STARLING_GGML_CPP
     ${STARLING_GGML_GRANITE_CPP}
     ${STARLING_GGML_QWEN3_CPP}
     ${STARLING_GGML_S1_CPP}
-    ${STARLING_GGML_VOXTRAL_CPP}
     ${STARLING_REPO_ROOT}/cpp/capi.cpp)
 
 add_library(starling_ggml_core OBJECT ${STARLING_GGML_CPP})
@@ -153,11 +151,15 @@ target_include_directories(starling_ggml PUBLIC ${STARLING_REPO_ROOT}/cpp/includ
 target_link_libraries(starling_ggml PUBLIC ggml)
 if(STARLING_FAST)
   target_link_libraries(starling_ggml PUBLIC ${CMAKE_DL_LIBS})
+  if(ANDROID)
+    # cpp/npu: AHardwareBuffer I/O for the Pixel TPU encoder path; logcat notes.
+    target_link_libraries(starling_ggml PUBLIC nativewindow log)
+  endif()
 endif()
 
 if(STARLING_GGML_TESTS)
   set(STARLING_GGML_TEST_SUPPORT_CPP ${STARLING_REPO_ROOT}/cpp/tests/golden_io.cpp)
-  file(GLOB STARLING_GGML_TEST_MAIN_CPP ${STARLING_REPO_ROOT}/cpp/tests/*_test.cpp)
+  file(GLOB STARLING_GGML_TEST_MAIN_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/tests/*_test.cpp)
   foreach(test_src IN LISTS STARLING_GGML_TEST_MAIN_CPP)
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src} ${STARLING_GGML_TEST_SUPPORT_CPP} $<TARGET_OBJECTS:starling_ggml_core>)
@@ -169,6 +171,9 @@ if(STARLING_GGML_TESTS)
       target_compile_definitions(${test_name} PRIVATE STARLING_HAVE_FAST=1)
       target_include_directories(${test_name} PRIVATE ${STARLING_REPO_ROOT}/cpp/fast ${STARLING_FAST_VK_INCLUDE})
       target_link_libraries(${test_name} PRIVATE ${CMAKE_DL_LIBS})
+      if(ANDROID)
+        target_link_libraries(${test_name} PRIVATE nativewindow log)
+      endif()
     endif()
 
     # The stream_session_test needs the serve sources (server.cpp,
@@ -197,6 +202,13 @@ if(STARLING_GGML_TESTS)
           ${STARLING_REPO_ROOT}/cpp/serve/audio.cpp)
       target_include_directories(${test_name} PRIVATE
           ${STARLING_REPO_ROOT}/cpp/serve)
+    endif()
+
+    # The npu_fingerprint_test checks the Pixel TPU encoder model hash that
+    # starling-npu-tool computes from a GGUF file (cpp/npu, Android-only in
+    # the library, plain C++ + ggml here).
+    if(test_name STREQUAL "npu_fingerprint_test")
+      target_sources(${test_name} PRIVATE ${STARLING_REPO_ROOT}/cpp/npu/gguf_fingerprint.cpp)
     endif()
 
     # The serve_trace_test drives StarlingServer directly (server.cpp only —

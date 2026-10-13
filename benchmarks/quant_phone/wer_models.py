@@ -33,7 +33,7 @@ from wer import normalize  # noqa: E402
 
 # starling_ggml_model (cpp/include/starling_ggml.h).
 KINDS = {"parakeet": 1, "moss": 2, "ark": 3, "granite": 6, "qwen3": 7,
-         "ark06": 10, "voxtral": 11, "qwen3_06": 12}
+         "ark06": 10, "qwen3_06": 12}
 
 
 def peak_rss_mb() -> float:

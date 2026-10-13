@@ -13,7 +13,13 @@
 #include "runtime/audio_io.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <thread>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -50,18 +56,85 @@ void usage() {
     std::fprintf(stderr,
         "usage: starling-bench --model <parakeet|moss|...> --gguf <file> [--runs N]\n"
         "                      [--cycles N] [--warmup] [--quiet] file.wav [file.wav ...]\n"
-        "  --cycles N  load, run and free the model N times in this process\n");
+        "  --cycles N  load, run and free the model N times in this process\n"
+        "  --cold      drop the GGUF from the page cache before each load\n");
 }
 
 starling_ggml_model model_kind(const std::string& s) {
     // Any registry slug resolves through the model table (model_registry.cpp),
     // so every native model (parakeet, moss, ark, ark06, qwen3, granite,
-    // s1, voxtral, ...) is benchable; the historical
+    // s1, ...) is benchable; the historical
     // hardcoded names are registry slugs and keep working unchanged (#176).
     const starling::ggml::lib::ModelDescriptor* d =
         starling::ggml::lib::find_model_by_slug(s);
     return d ? d->kind : (starling_ggml_model)0;
 }
+
+// Resident memory from /proc/self/status (Linux/Android; -1 elsewhere), in
+// MiB. VmHWM is the peak since process start: printed right after the first
+// load it is that load's peak (the GGUF, repacked weights, and the device
+// memory the driver maps into the process).
+double status_mib(const char* key) {
+    FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f) return -1.0;
+    char line[256];
+    double v = -1.0;
+    const size_t n = std::strlen(key);
+    while (std::fgets(line, sizeof line, f))
+        if (!std::strncmp(line, key, n) && line[n] == ':') { v = std::atof(line + n + 1) / 1024.0; break; }
+    std::fclose(f);
+    return v;
+}
+
+// --cold: drop `path` from the page cache (clean pages only, no root
+// needed) so the next load reads it from storage.
+void evict_file(const std::string& path) {
+#if defined(__linux__)
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+#else
+    (void)path;
+#endif
+}
+
+// System-wide memory drop during a load (MemAvailable sampled every 10 ms):
+// covers what VmHWM misses — device allocations the driver keeps outside
+// the process's mappings, page cache pressure.
+class MemSampler {
+public:
+    MemSampler() : base_(mem_available_mib()), min_(base_) {
+        th_ = std::thread([this] {
+            while (!stop_) {
+                const double v = mem_available_mib();
+                if (v >= 0 && v < min_) min_ = v;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+    }
+    // Peak drop in MiB (-1 when /proc/meminfo is unreadable).
+    double finish() {
+        stop_ = true;
+        th_.join();
+        return base_ < 0 ? -1.0 : base_ - min_;
+    }
+
+private:
+    static double mem_available_mib() {
+        FILE* f = std::fopen("/proc/meminfo", "r");
+        if (!f) return -1.0;
+        char line[256];
+        double v = -1.0;
+        while (std::fgets(line, sizeof line, f))
+            if (!std::strncmp(line, "MemAvailable:", 13)) { v = std::atof(line + 13) / 1024.0; break; }
+        std::fclose(f);
+        return v;
+    }
+    double base_, min_;
+    std::atomic<bool> stop_{false};
+    std::thread th_;
+};
 
 double now_ms() {
     using namespace std::chrono;
@@ -73,7 +146,7 @@ double now_ms() {
 int main(int argc, char** argv) {
     std::string model, gguf;
     int runs = 1, cycles = 1;
-    bool warmup = false, quiet = false;
+    bool warmup = false, quiet = false, cold = false;
     std::vector<std::string> wavs;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -83,6 +156,7 @@ int main(int argc, char** argv) {
         else if (a == "--cycles" && i + 1 < argc) cycles = std::max(1, std::atoi(argv[++i]));
         else if (a == "--warmup") warmup = true;
         else if (a == "--quiet") quiet = true;
+        else if (a == "--cold") cold = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else wavs.push_back(a);
     }
@@ -97,14 +171,21 @@ int main(int argc, char** argv) {
     int rc = 0;
     for (int cycle = 0; cycle < cycles && !stop_now(); ++cycle) {
         if (cycles > 1) std::printf("cycle %d/%d\n", cycle + 1, cycles);
+        if (cold) evict_file(gguf);
+        MemSampler sampler;
         const double t0 = now_ms();
         starling_ggml_ctx* ctx = starling_ggml_load(kind, gguf.c_str());
+        const double sys_drop = sampler.finish();
         if (!ctx) {
             std::fprintf(stderr, "load failed: %s\n", starling_ggml_last_error(nullptr));
             rc = 1;
             break;
         }
-        std::printf("load %.1f ms  backend=%s\n", now_ms() - t0, starling_ggml_backend_name());
+        const double t_load = now_ms() - t0;
+        std::printf("load %.1f ms%s  backend=%s  rss=%.0f MiB (anon %.0f, file %.0f) peak=%.0f MiB "
+                    "sys_drop=%.0f MiB\n",
+                    t_load, cold ? " (cold)" : "", starling_ggml_backend_name(), status_mib("VmRSS"),
+                    status_mib("RssAnon"), status_mib("RssFile"), status_mib("VmHWM"), sys_drop);
 
         for (const std::string& path : wavs) {
             if (stop_now()) break;

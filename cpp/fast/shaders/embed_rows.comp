@@ -1,6 +1,7 @@
 #version 450
 // embed_rows.comp — dequantize embedding rows for a list of token ids into
-// f32 activations (prompt tokens of the LLM prefill). One workgroup per id.
+// f32 activations (prompt tokens of the LLM prefill). One workgroup per id;
+// id 0xffffffff skips the row (an audio slot the host already filled).
 
 #include "common.glsl"
 
@@ -22,6 +23,8 @@ layout(push_constant) uniform PC {
 void main() {
     const uint i = gl_WorkGroupID.x;
     const uint tok = ids[p.ids_off + i];
+    if (tok == 0xffffffffu) return;
+    const uint r = p.out_row0 + i;
     for (uint k = gl_LocalInvocationID.x; k < p.K; k += WG)
-        o[(p.out_row0 + i) * p.K + k] = dequant(tok, k, p.K);
+        o[r * p.K + k] = dequant(tok, k, p.K);
 }

@@ -22,7 +22,6 @@ bool isSpeechModel(jint kind) {
     case STARLING_GGML_ARK:
     case STARLING_GGML_GRANITE:
     case STARLING_GGML_QWEN3:
-    case STARLING_GGML_VOXTRAL:
       return true;
     default:
       return false;

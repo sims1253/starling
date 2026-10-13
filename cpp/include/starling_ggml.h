@@ -34,18 +34,17 @@ extern "C" {
 //       see 10).
 //   7 — added STARLING_GGML_ARK06 (Audio8/ARK-ASR-0.6B; served by the ARK
 //       engine — same architecture, dims come from GGUF metadata).
-//   8 — added STARLING_GGML_VOXTRAL (mistralai/Voxtral-Mini-4B-Realtime-2602;
-//       Phase 1: GGUF load + metadata/tokenizer validation only; decode
-//       returns the Phase-2 error until the encoder/decoder graph lands).
+//   8 — added kind 11 (since removed, see 11).
 //   9 — added STARLING_GGML_QWEN3_06 (Qwen/Qwen3-ASR-0.6B-hf; served by the
 //       QWEN3 engine — same architecture, dims come from GGUF metadata).
 //  10 — removed kinds 4, 5 and 9 (engines dropped). Their values stay
 //       reserved and are never reused; loading them fails as an unknown kind.
+//  11 — removed kind 11 (engine dropped); reserved like 4, 5 and 9.
 // Additions that leave every existing entry point unchanged keep the version
 // (starling_ggml_transcribe_pcm_words, issue #357): a caller loading the
 // library at run time probes for such a symbol (dlsym) instead of checking
 // the version.
-#define STARLING_GGML_ABI_VERSION 10
+#define STARLING_GGML_ABI_VERSION 11
 
 // ABI / build introspection --------------------------------------------------
 
@@ -73,7 +72,7 @@ typedef enum {
     STARLING_GGML_S1           = 8,  // superwhisper/s1-mini (text normalizer)
     // 9 is reserved (removed engine, ABI 10); never reuse it.
     STARLING_GGML_ARK06        = 10, // Audio8/ARK-ASR-0.6B (ARK engine, 0.6B GGUF)
-    STARLING_GGML_VOXTRAL      = 11, // mistralai/Voxtral-Mini-4B-Realtime-2602
+    // 11 is reserved (removed engine, ABI 11); never reuse it.
     STARLING_GGML_QWEN3_06     = 12, // Qwen/Qwen3-ASR-0.6B-hf (QWEN3 engine, 0.6B GGUF)
 } starling_ggml_model;
 

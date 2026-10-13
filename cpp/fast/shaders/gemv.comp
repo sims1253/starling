@@ -60,6 +60,8 @@ const uint RPP = ROWS / RSPLIT;          // rows per (kg, rs) thread
 shared float red[ROWS * LANES];          // row partials: [row][kg]
 shared float red2[ROWS * 32];            // 32 partials per row, then one
 shared float rowv[ROWS];
+shared float segv[8];                    // EPI 3: per-segment argmax
+shared uint segi[8];
 #if defined(GEMV_M)
 shared float redM[ROWS * LANES];         // token-1 row partials
 shared float red2M[ROWS * 32];
@@ -67,7 +69,13 @@ shared float red2M[ROWS * 32];
 
 float row_sum(uint r) {   // staged by the cooperative reduction below
     float s = 0.0;
-    for (uint i = 0; i < 32; ++i) s += red2[r * 32 + i];
+    // LANES == 32: stage 2 would copy red into red2 one element per slot
+    // (0.0 + x == x), so read the lane partials directly — same sum.
+    if (LANES == 32u) {
+        for (uint i = 0; i < 32; ++i) s += red[r * 32 + i];
+    } else {
+        for (uint i = 0; i < 32; ++i) s += red2[r * 32 + i];
+    }
     return s;
 }
 #if defined(GEMV_M)
@@ -109,6 +117,16 @@ void main() {
         xe[w] = vec4(xv[2 * w].x, xv[2 * w].z, xv[2 * w + 1].x, xv[2 * w + 1].z);
         xo[w] = vec4(xv[2 * w].y, xv[2 * w].w, xv[2 * w + 1].y, xv[2 * w + 1].w);
     }
+#endif
+#if defined(W8_UNPACK)
+    // W8 through unpackUnorm4x8: (q ^ 0x80) / 255 = (q + 128) / 255 for the
+    // int8 q, so q = 255 u - 128 and a 16-weight half dots to
+    // 255 * dot(u, x) - 128 * sum(x): one xor + one unpack per 4 weights
+    // instead of four bitfieldExtracts and int-to-float conversions.
+    const float xs0 = (xv[0].x + xv[0].y + xv[0].z + xv[0].w) + (xv[1].x + xv[1].y + xv[1].z + xv[1].w) +
+                      (xv[2].x + xv[2].y + xv[2].z + xv[2].w) + (xv[3].x + xv[3].y + xv[3].z + xv[3].w);
+    const float xs1 = (xv[4].x + xv[4].y + xv[4].z + xv[4].w) + (xv[5].x + xv[5].y + xv[5].z + xv[5].w) +
+                      (xv[6].x + xv[6].y + xv[6].z + xv[6].w) + (xv[7].x + xv[7].y + xv[7].z + xv[7].w);
 #endif
 #if defined(GEMV_M)
     // Token-1 activations: a second x vector; the weight unpacks below are
@@ -170,6 +188,15 @@ void main() {
             a += dot(vec4(float((word >> 16) & 15u), float((word >> 20) & 15u), float((word >> 24) & 15u), float(word >> 28)), xv[2 * w + 1]);
         }
         acc[q] = so.x * a + so.y * xsum;
+#elif defined(W_W8) && defined(W8_UNPACK)
+        const uvec4 q0 = wq4[gi * 2], q1 = wq4[gi * 2 + 1];
+        const vec2 sc = unpackHalf2x16(ws[gi]);
+        float a0 = 0.0, a1 = 0.0;
+        [[unroll]] for (uint w = 0; w < 4; ++w) {
+            a0 += dot(unpackUnorm4x8(q0[w] ^ 0x80808080u), xv[w]);
+            a1 += dot(unpackUnorm4x8(q1[w] ^ 0x80808080u), xv[4 + w]);
+        }
+        acc[q] = sc.x * (255.0 * a0 - 128.0 * xs0) + sc.y * (255.0 * a1 - 128.0 * xs1);
 #elif defined(W_W8)
         const uvec4 q0 = wq4[gi * 2], q1 = wq4[gi * 2 + 1];
         const vec2 sc = unpackHalf2x16(ws[gi]);
@@ -200,6 +227,9 @@ void main() {
     [[unroll]] for (uint q = 0; q < RPP; ++q) redM[(rs + q * RSPLIT) * LANES + kg] = acc2[q];
 #endif
     barrier();
+#if !defined(GEMV_M)
+    if (LANES != 32u) {
+#endif
     for (uint u = t; u < ROWS * 32; u += LANES * RSPLIT) {
         const uint rr = u / 32, part = u % 32;
         float s = 0.0, s2 = 0.0;
@@ -211,6 +241,9 @@ void main() {
         red2[u] = s;
     }
     barrier();
+#if !defined(GEMV_M)
+    }
+#endif
     // One thread per row; strided so ROWS > WGS (small K without RSPLIT)
     // still writes every row. With ROWS <= WGS this is a single pass.
     for (uint r = t; r < ROWS; r += WGS) {
@@ -244,8 +277,36 @@ void main() {
             rowv[r] = v;
         }
     }
+    if (EPI != 3u) return;
     barrier();
-    if (EPI == 3u && t == 0u) {
+    // Argmax over the workgroup's rows (lowest index on ties): eight
+    // segment scans, then one scan of the eight — the same first maximum
+    // as one serial scan, an eighth of its serial length at ROWS = 64
+    // (at 32 rows, MOSS's lm_head, it measured ~1 % slower: the extra
+    // barrier eats the shorter scan).
+    if (ROWS % 8u == 0u && ROWS >= 64u) {
+        const uint SEG = ROWS / 8u;
+        if (t < 8u) {
+            float best = -3.4e38;
+            uint bi = 0xffffffffu;
+            for (uint r = t * SEG; r < t * SEG + SEG; ++r) {
+                const uint n = row_base + r;
+                if (n >= p.N) break;
+                if (rowv[r] > best) { best = rowv[r]; bi = p.row0 + n; }
+            }
+            segv[t] = best;
+            segi[t] = bi;
+        }
+        barrier();
+        if (t == 0u) {
+            float best = -3.4e38;
+            uint bi = 0xffffffffu;
+            for (uint i = 0; i < 8u; ++i)
+                if (segv[i] > best) { best = segv[i]; bi = segi[i]; }
+            yu[p.y_off + 2 * gl_WorkGroupID.x] = floatBitsToUint(best);
+            yu[p.y_off + 2 * gl_WorkGroupID.x + 1] = bi;
+        }
+    } else if (t == 0u) {
         float best = -3.4e38;
         uint bi = 0xffffffffu;
         for (uint r = 0; r < ROWS; ++r) {

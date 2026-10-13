@@ -60,6 +60,34 @@ class ChunkStreamerTest {
     }
 
     @Test
+    fun slowPreviewsAreSpacedToTheDutyCycle() {
+        // Each preview takes 3 s of engine time: with a 50 % duty cap the next
+        // one may start 6 s after the last started, not after the 1 s interval.
+        var clock = 0.0
+        val streamer = ChunkStreamer(
+            sampleRate = rate,
+            minSeconds = 1.0,
+            partialIntervalSeconds = 1.0,
+            clock = { clock },
+        )
+        val tx = object : ChunkStreamer.Transcriber {
+            var calls = 0
+            override fun transcribe(samples: FloatArray, start: Int, length: Int, kind: ChunkStreamer.CallKind): String {
+                calls++
+                clock += 3.0
+                return "w"
+            }
+        }
+        val samples = FloatArray(300)
+
+        assertEquals("w", streamer.step(samples, 20, now = 0.0, tx = tx))
+        assertNull(streamer.step(samples, 30, now = 3.0, tx = tx))
+        assertNull(streamer.step(samples, 40, now = 5.9, tx = tx))
+        assertEquals("w", streamer.step(samples, 60, now = 6.0, tx = tx))
+        assertEquals(2, tx.calls)
+    }
+
+    @Test
     fun fullWindowsAreFinalizedAndStitchedAcrossTheOverlap() {
         val streamer = streamer()
         val tx = ScriptedTranscriber(rate) { "w$it" }

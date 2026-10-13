@@ -86,6 +86,7 @@ void Buffer::release() {
         return;
     }
     const Fns& f = ctx->fn_;
+    if (buf) ctx->drop_views(buf);
     if (host) f.vkUnmapMemory(ctx->dev_, mem);
     if (buf) f.vkDestroyBuffer(ctx->dev_, buf, nullptr);
     if (mem) f.vkFreeMemory(ctx->dev_, mem, nullptr);
@@ -238,10 +239,15 @@ bool Context::init(std::string& err) {
     info_.api_version = props.apiVersion;
     info_.discrete = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
     info_.subgroup_size = sgp.subgroupSize;
+    info_.subgroup_ops = sgp.supportedOperations;
+    info_.subgroup_compute = (sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+    info_.max_texel_elems = props.limits.maxTexelBufferElements;
+    info_.min_texel_align = std::max<uint64_t>(props.limits.minTexelBufferOffsetAlignment, 16);
     info_.max_shared_bytes = props.limits.maxComputeSharedMemorySize;
     info_.max_wg_invocations = props.limits.maxComputeWorkGroupInvocations;
     info_.max_storage_range = props.limits.maxStorageBufferRange;
     info_.min_storage_align = props.limits.minStorageBufferOffsetAlignment;
+    info_.non_coherent_atom = std::max<uint64_t>(props.limits.nonCoherentAtomSize, 1);
     info_.max_alloc = m3.maxMemoryAllocationSize;
 
     uint32_t n_qf = 0;
@@ -432,6 +438,17 @@ bool Context::init(std::string& err) {
             VK_VERSION_MINOR(info_.api_version), info_.subgroup_size,
             info_.max_shared_bytes, (unsigned long long)info_.max_storage_range,
             info_.uma ? 1 : 0, info_.uma_cached ? "(cached)" : "", info_.f16 ? 1 : 0, qfam_);
+    if (env_on("STARLING_FAST_VERBOSE"))
+        for (uint32_t i = 0; i < memprops_.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags f = memprops_.memoryTypes[i].propertyFlags;
+            const uint32_t h = memprops_.memoryTypes[i].heapIndex;
+            std::fprintf(stderr, "[fast] memory type %u: heap %u (%llu MiB)%s%s%s%s\n", i, h,
+                         (unsigned long long)(memprops_.memoryHeaps[h].size >> 20),
+                         (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " device-local" : "",
+                         (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " host-visible" : "",
+                         (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? " coherent" : "",
+                         (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " cached" : "");
+        }
     return true;
 }
 
@@ -469,6 +486,7 @@ Context::~Context() {
         fn_.vkDestroyDescriptorSetLayout(dev_, kv.second.first, nullptr);
     }
     for (auto& kv : modules_) fn_.vkDestroyShaderModule(dev_, kv.second, nullptr);
+    for (auto& kv : views_) fn_.vkDestroyBufferView(dev_, kv.second, nullptr);
     if (pcache_) fn_.vkDestroyPipelineCache(dev_, pcache_, nullptr);
     if (xfer_fence_) fn_.vkDestroyFence(dev_, xfer_fence_, nullptr);
     if (xfer_pool_) fn_.vkDestroyCommandPool(dev_, xfer_pool_, nullptr);
@@ -610,8 +628,10 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
     bytes = (bytes + 15) & ~VkDeviceSize(15);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
+    // Uniform-texel usage lets kernels read activations through the texture
+    // path (gemm_sg's A operand, a view per dispatch window).
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult r = fn_.vkCreateBuffer(dev_, &bci, nullptr, &out.buf);
     if (r != VK_SUCCESS) { err = vk_err("vkCreateBuffer", r); return false; }
@@ -682,17 +702,26 @@ bool Context::ensure_staging(VkDeviceSize bytes, std::string& err) {
     return true;
 }
 
+void Context::flush(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes) {
+    if (!dst.host || dst.coherent || bytes == 0) return;
+    // Whole atoms only; a range reaching the buffer's end runs to the end of
+    // the allocation (which may be larger than the buffer).
+    const VkDeviceSize atom = info_.non_coherent_atom;
+    VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    mr.memory = dst.mem;
+    mr.offset = off / atom * atom;
+    const VkDeviceSize end = (off + bytes + atom - 1) / atom * atom;
+    mr.size = end >= dst.size ? VK_WHOLE_SIZE : end - mr.offset;
+    fn_.vkFlushMappedMemoryRanges(dev_, 1, &mr);
+}
+
 bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t bytes, std::string& err) {
     if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     if (bytes == 0) return true;
     if (off + bytes > dst.size) { err = "upload out of range"; return false; }
     if (dst.host) {
         std::memcpy((char*)dst.host + off, src, bytes);
-        if (!dst.coherent) {
-            VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
-            mr.memory = dst.mem; mr.offset = 0; mr.size = VK_WHOLE_SIZE;
-            fn_.vkFlushMappedMemoryRanges(dev_, 1, &mr);
-        }
+        flush(dst, off, bytes);
         return true;
     }
     std::lock_guard<std::mutex> lk(queue_mu_);
@@ -788,13 +817,14 @@ const Pipeline* Context::pipeline(const char* shader, const std::vector<uint32_t
         if (r != VK_SUCCESS) { err = vk_err("vkCreateShaderModule", r); return nullptr; }
         modules_[shader] = mod;
     }
-    auto& lay = layouts_[blob->n_bindings];
+    auto& lay = layouts_[blob->n_bindings | (blob->texel_mask << 8)];
     if (!lay.first) {
         std::vector<VkDescriptorSetLayoutBinding> b(blob->n_bindings);
         for (uint32_t i = 0; i < blob->n_bindings; ++i) {
             b[i] = {};
             b[i].binding = i;
-            b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorType = (blob->texel_mask >> i) & 1u ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+                                                               : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             b[i].descriptorCount = 1;
             b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
@@ -832,10 +862,48 @@ const Pipeline* Context::pipeline(const char* shader, const std::vector<uint32_t
     p->layout = lay.second;
     p->dsl = lay.first;
     p->n_bindings = blob->n_bindings;
+    p->texel_mask = blob->texel_mask;
     p->label = shader;
     const Pipeline* raw = p.get();
     pipes_[key] = std::move(p);
     return raw;
+}
+
+VkBufferView Context::texel_view(const Buffer& b, VkDeviceSize off, VkDeviceSize range,
+                                 std::string& err) {
+    range &= ~VkDeviceSize(15);
+    if (!b.buf || !range || off % info_.min_texel_align ||
+        range / 16 > info_.max_texel_elems) {
+        err = "texel view out of limits (off " + std::to_string(off) + ", range " +
+              std::to_string(range) + ")";
+        return VK_NULL_HANDLE;
+    }
+    std::lock_guard<std::mutex> lk(view_mu_);
+    const auto key = std::make_tuple(b.buf, off, range);
+    auto it = views_.find(key);
+    if (it != views_.end()) return it->second;
+    VkBufferViewCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+    ci.buffer = b.buf;
+    ci.format = VK_FORMAT_R32G32B32A32_UINT;
+    ci.offset = off;
+    ci.range = range;
+    VkBufferView v = VK_NULL_HANDLE;
+    const VkResult r = fn_.vkCreateBufferView(dev_, &ci, nullptr, &v);
+    if (r != VK_SUCCESS) { err = vk_err("vkCreateBufferView", r); return VK_NULL_HANDLE; }
+    views_[key] = v;
+    return v;
+}
+
+void Context::drop_views(VkBuffer b) {
+    std::lock_guard<std::mutex> lk(view_mu_);
+    for (auto it = views_.begin(); it != views_.end();) {
+        if (std::get<0>(it->first) == b) {
+            fn_.vkDestroyBufferView(dev_, it->second, nullptr);
+            it = views_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -893,7 +961,10 @@ void Recording::begin() {
 }
 
 void Recording::end() {
-    if (cb_) ctx_.fn_.vkEndCommandBuffer(cb_);
+    if (!cb_) return;
+    // A trailing barrier orders this recording against later submissions.
+    if (bar_pending_) emit_barrier(true);
+    ctx_.fn_.vkEndCommandBuffer(cb_);
 }
 
 void Recording::split() {
@@ -919,11 +990,12 @@ VkDescriptorSet Recording::alloc_set(const Pipeline& p) {
     // descriptors before sets when layouts have many bindings).
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (dpools_.empty() || dpool_left_ == 0) {
-            VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 16};
+            const VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 16},
+                                                {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, kSets}};
             VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
             dpci.maxSets = kSets;
-            dpci.poolSizeCount = 1;
-            dpci.pPoolSizes = &ps;
+            dpci.poolSizeCount = 2;
+            dpci.pPoolSizes = ps;
             VkDescriptorPool dp = VK_NULL_HANDLE;
             VkResult r = f.vkCreateDescriptorPool(ctx_.dev_, &dpci, nullptr, &dp);
             if (r != VK_SUCCESS) {
@@ -949,11 +1021,37 @@ VkDescriptorSet Recording::alloc_set(const Pipeline& p) {
     return VK_NULL_HANDLE;
 }
 
+// STARLING_FAST_SKIP=label[,label...] (diagnostic): drop every dispatch
+// recorded under one of these labels (`name*` matches a prefix), so the
+// encoder/prefill classes can be priced by difference. Results are garbage.
+static bool skip_label(const std::string& label) {
+    static const std::vector<std::string> skips = [] {
+        std::vector<std::string> v;
+        if (const char* e = std::getenv("STARLING_FAST_SKIP")) {
+            std::string s(e), cur;
+            for (char c : s + ",") {
+                if (c == ',') { if (!cur.empty()) v.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+        }
+        return v;
+    }();
+    for (const std::string& s : skips) {
+        if (!s.empty() && s.back() == '*') {
+            if (label.compare(0, s.size() - 1, s, 0, s.size() - 1) == 0) return true;
+        } else if (label == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
                          const void* push, size_t push_bytes,
                          uint32_t gx, uint32_t gy, uint32_t gz) {
     const Fns& f = ctx_.fn_;
     if (!cb_) return;
+    if (skip_label(label_.empty() ? std::string(p.label) : label_)) return;
     if (bindings.empty() && p.n_bindings) {
         if (fail_.empty()) fail_ = std::string("dispatch without bindings: ") + p.label;
         return;
@@ -961,13 +1059,38 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
     VkDescriptorSet set = alloc_set(p);
     if (!set) return;   // fail_ is set; submit_and_wait reports it
     std::vector<VkDescriptorBufferInfo> infos(p.n_bindings);
+    std::vector<VkBufferView> views(p.n_bindings);
     std::vector<VkWriteDescriptorSet> writes(p.n_bindings);
     for (uint32_t i = 0; i < p.n_bindings; ++i) {
         const Ref& r = i < bindings.size() ? bindings[i] : bindings.back();
+        if ((p.texel_mask >> i) & 1u) {
+            const VkDeviceSize range = r.range == VK_WHOLE_SIZE ? r.buf->size - r.off : r.range;
+            std::string verr;
+            views[i] = ctx_.texel_view(*r.buf, r.off, range, verr);
+            if (!views[i]) {
+                if (fail_.empty()) fail_ = verr + " (" + p.label + ")";
+                return;
+            }
+            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstSet = set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+            writes[i].pTexelBufferView = &views[i];
+            continue;
+        }
         infos[i].buffer = r.buf->buf;
         infos[i].offset = r.off;
-        VkDeviceSize range = r.range == VK_WHOLE_SIZE ? r.buf->size - r.off : r.range;
-        range = std::min<VkDeviceSize>(range, ctx_.info_.max_storage_range);
+        const VkDeviceSize range = r.range == VK_WHOLE_SIZE ? r.buf->size - r.off : r.range;
+        // Never clamp: the kernels address the whole range, so a shorter view
+        // would read and write outside it. Callers size bindings to fit.
+        if (range > ctx_.info_.max_storage_range) {
+            if (fail_.empty())
+                fail_ = std::string("binding ") + std::to_string(i) + " of " + p.label + ": " +
+                        std::to_string(range) + " bytes exceed maxStorageBufferRange (" +
+                        std::to_string(ctx_.info_.max_storage_range) + ")";
+            return;
+        }
         infos[i].range = range;
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[i].dstSet = set;
@@ -977,6 +1100,7 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
         writes[i].pBufferInfo = &infos[i];
     }
     f.vkUpdateDescriptorSets(ctx_.dev_, p.n_bindings, writes.data(), 0, nullptr);
+    emit_barrier(false);
     f.vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
     f.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
     uint8_t pc[kPushBytes] = {};
@@ -991,27 +1115,38 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
 }
 
 void Recording::barrier() {
-    if (!cb_) return;
+    if (cb_) bar_pending_ = true;
+}
+
+void Recording::emit_barrier(bool dst_xfer) {
+    if (!bar_pending_) return;
+    bar_pending_ = false;
+    const bool src_xfer = bar_xfer_src_;
+    bar_xfer_src_ = false;
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | (src_xfer ? VK_ACCESS_TRANSFER_WRITE_BIT : 0u);
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                       (dst_xfer ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0u);
     ctx_.fn_.vkCmdPipelineBarrier(cb_,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (src_xfer ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u),
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (dst_xfer ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u),
         0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
 void Recording::copy(const Buffer& src, VkDeviceSize soff, const Buffer& dst,
                      VkDeviceSize doff, VkDeviceSize bytes) {
     if (!cb_) return;
+    emit_barrier(true);
     VkBufferCopy c{soff, doff, bytes};
     ctx_.fn_.vkCmdCopyBuffer(cb_, src.buf, dst.buf, 1, &c);
+    bar_xfer_src_ = true;
 }
 
 void Recording::fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, uint32_t value) {
     if (!cb_) return;
+    emit_barrier(true);
     ctx_.fn_.vkCmdFillBuffer(cb_, dst.buf, off, bytes, value);
+    bar_xfer_src_ = true;
 }
 
 bool Recording::submit_and_wait(std::string& err, uint64_t stall_budget_ms) {

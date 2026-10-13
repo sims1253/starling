@@ -12,6 +12,7 @@
 #if defined(STARLING_HAVE_FAST)
 #include "cpu_kernels.hpp"
 #include "layout.hpp"
+#include "kernels.hpp"
 #include "weights.hpp"
 #endif
 
@@ -90,6 +91,48 @@ int check_type(ggml_type type, GpuFmt want_fmt, float rel_tol) {
     const bool ok = max_err <= rel_tol * max_ref;
     std::printf("%s %-5s -> %-3s max|err| %.3g (%.3g of max|w|)\n", ok ? "ok  " : "FAIL",
                 ggml_type_name(type), fmt_name(m.fmt), max_err, max_err / max_ref);
+    return ok ? 0 : 1;
+}
+
+// pack_gpu_matrix_w8 (forced W8 for mixed-type row pairs) and scale_matrix
+// (a multiplier folded into the group scales) against ggml's dequantizer.
+int check_w8_and_scale(ggml_type type, float f) {
+    const uint32_t N = 8, K = 512;
+    std::mt19937 rng(11 + (int)type);
+    std::normal_distribution<float> nd(0.0f, 0.05f);
+    std::vector<float> src((size_t)N * K);
+    for (float& v : src) v = nd(rng);
+    const size_t rb = ggml_row_size(type, K);
+    std::vector<uint8_t> q(rb * N);
+    ggml_quantize_chunk(type, src.data(), q.data(), 0, N, K, nullptr);
+    std::vector<float> ref((size_t)N * K);
+    ggml_get_type_traits(type)->to_float(q.data(), ref.data(), (int64_t)N * K);
+    ggml_init_params ip{ggml_tensor_overhead() * 4, nullptr, true};
+    ggml_context* ctx = ggml_init(ip);
+    ggml_tensor* t = ggml_new_tensor_2d(ctx, type, K, N);
+    t->data = q.data();
+    HostMatrix w8, sc;
+    std::string err;
+    const bool packed = pack_gpu_matrix_w8(t, w8, err) && pack_gpu_matrix_raw(type, q.data(), N, K, sc, err) &&
+                        scale_matrix(sc, f, err);
+    ggml_free(ctx);
+    if (!packed || w8.fmt != GpuFmt::W8) {
+        std::printf("FAIL %s: w8/scale pack: %s\n", ggml_type_name(type), err.c_str());
+        return 1;
+    }
+    double e8 = 0.0, es = 0.0, max_ref = 0.0;
+    for (uint32_t n = 0; n < N; ++n)
+        for (uint32_t k = 0; k < K; ++k) {
+            const float r = ref[(size_t)n * K + k];
+            e8 = std::max(e8, (double)std::fabs(deq(w8, n, k) - r));
+            es = std::max(es, (double)std::fabs(deq(sc, n, k) - f * r));
+            max_ref = std::max(max_ref, (double)std::fabs(r));
+        }
+    // W8 requantization: half an int8 step of a 16-weight absmax; the
+    // scaled scales round once more to f16.
+    const bool ok = e8 <= 1e-2 * max_ref && es <= 3e-3 * f * max_ref;
+    std::printf("%s %-5s -> W8 max|err| %.3g, x%.2f via scales max|err| %.3g (of max|w|)\n", ok ? "ok  " : "FAIL",
+                ggml_type_name(type), e8 / max_ref, f, es / (f * max_ref));
     return ok ? 0 : 1;
 }
 
@@ -406,8 +449,113 @@ int check_layout_legacy_bytes() {
 
 } // namespace
 
+// The load path's row-level plans (MatSpec: what the engines repack straight
+// into device memory) against the whole-matrix HostMatrix pipeline they
+// replace: plain rows, row ranges with a folded scale, q/k/v concatenation,
+// gate/up interleaving across formats (mixed parts all go W8), GLU halves of
+// one tensor, and a row permutation — byte for byte.
+int check_mat_specs() {
+    const uint32_t N = 48, K = 512;
+    struct Src { ggml_type type; std::vector<uint8_t> q; ggml_tensor* t = nullptr; };
+    ggml_init_params ip{ggml_tensor_overhead() * 8, nullptr, true};
+    ggml_context* ctx = ggml_init(ip);
+    std::vector<Src> srcs;
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_F16,
+                           GGML_TYPE_BF16, GGML_TYPE_Q4_0}) {
+        std::mt19937 rng(7 + (int)type);
+        std::normal_distribution<float> nd(0.0f, 0.05f);
+        std::vector<float> src((size_t)N * K);
+        for (float& v : src) v = nd(rng);
+        Src s;
+        s.type = type;
+        s.q.resize(ggml_row_size(type, K) * N);
+        ggml_quantize_chunk(type, src.data(), s.q.data(), 0, N, K, nullptr);
+        s.t = ggml_new_tensor_2d(ctx, type, K, N);
+        s.t->data = s.q.data();
+        srcs.push_back(std::move(s));
+    }
+    int fails = 0;
+    auto same = [&](const char* what, const HostMatrix& a, const HostMatrix& b) {
+        const bool ok = a.fmt == b.fmt && a.N == b.N && a.K == b.K && a.q == b.q && a.s == b.s;
+        if (!ok) {
+            std::printf("FAIL spec %s: fmt %s/%s N %u/%u bytes differ\n", what, fmt_name(a.fmt), fmt_name(b.fmt),
+                        a.N, b.N);
+            ++fails;
+        }
+    };
+    std::string err;
+    auto must = [&](bool ok) {
+        if (!ok) {
+            std::printf("FAIL spec: %s\n", err.c_str());
+            ++fails;
+        }
+        return ok;
+    };
+    for (const Src& a : srcs) {
+        const char* tn = ggml_type_name(a.type);
+        HostMatrix want, got;
+        // Whole matrix.
+        if (must(pack_gpu_matrix_raw(a.type, a.q.data(), N, K, want, err)) &&
+            must(materialize(raw_rows(a.type, a.q.data(), N, K, tn), got, err)))
+            same(tn, want, got);
+        // Rows [8, 40) with a scale (the embedding chunks and Granite's
+        // residual multiplier).
+        {
+            const size_t rb = ggml_row_size(a.type, K);
+            MatSpec m = row_range(raw_rows(a.type, a.q.data(), N, K, tn), 8, 32);
+            m.scale = 0.37f;
+            if (must(pack_gpu_matrix_raw(a.type, a.q.data() + 8 * rb, 32, K, want, err)) &&
+                must(scale_matrix(want, 0.37f, err)) && must(materialize(m, got, err)))
+                same("row_range+scale", want, got);
+        }
+        // GLU halves of one tensor: out 2j = row j, 2j+1 = row N/2 + j.
+        {
+            const MatSpec all = raw_rows(a.type, a.q.data(), N, K, tn);
+            std::vector<uint32_t> order(N);
+            for (uint32_t j = 0; j < N / 2; ++j) { order[2 * j] = j; order[2 * j + 1] = N / 2 + j; }
+            if (must(pack_gpu_matrix_raw(a.type, a.q.data(), N, K, want, err)) &&
+                must(materialize(spec_interleave(row_range(all, 0, N / 2), row_range(all, N / 2, N / 2)), got, err))) {
+                permute_rows(want, order);
+                same("glu interleave", want, got);
+            }
+        }
+        // A permutation (e.g. de-interleaving RoPE head halves).
+        {
+            std::vector<uint32_t> order(N);
+            for (uint32_t r = 0; r < N; ++r) order[r] = (r * 7 + 3) % N;
+            if (must(pack_gpu_matrix_raw(a.type, a.q.data(), N, K, want, err)) &&
+                must(materialize(spec_permute(raw_rows(a.type, a.q.data(), N, K, tn), order), got, err))) {
+                permute_rows(want, order);
+                same("permute", want, got);
+            }
+        }
+        for (const Src& b : srcs) {
+            // Pairs across types: gate/up interleave and q/k concat, with
+            // the old same-format rule (mixed -> both W8).
+            HostMatrix ha, hb;
+            if (!must(pack_gpu_matrix(a.t, ha, err)) || !must(pack_gpu_matrix(b.t, hb, err))) continue;
+            if (ha.fmt != hb.fmt) {
+                if (ha.fmt != GpuFmt::W8 && !must(pack_gpu_matrix_w8(a.t, ha, err))) continue;
+                if (hb.fmt != GpuFmt::W8 && !must(pack_gpu_matrix_w8(b.t, hb, err))) continue;
+            }
+            HostMatrix cat = ha;
+            if (!must(concat_rows(cat, hb, err))) continue;
+            const MatSpec ma = raw_rows(a.type, a.q.data(), N, K, "a"), mb = raw_rows(b.type, b.q.data(), N, K, "b");
+            if (must(materialize(spec_concat(ma, mb), got, err))) same("concat", cat, got);
+            std::vector<uint32_t> order(2 * N);
+            for (uint32_t j = 0; j < N; ++j) { order[2 * j] = j; order[2 * j + 1] = N + j; }
+            permute_rows(cat, order);
+            if (must(materialize(spec_interleave(ma, mb), got, err))) same("interleave", cat, got);
+        }
+    }
+    ggml_free(ctx);
+    if (!fails) std::printf("ok   mat specs (rows, range+scale, glu, permute, concat/interleave x types) == HostMatrix bytes\n");
+    return fails;
+}
+
 int main() {
     int fails = 0;
+    fails += check_mat_specs();
     // Q4_0 / Q4_1 / Q8_0 / F16 are exact; the k-quants round their scale
     // products to f16 once (<= 2^-11 relative); Q5_K takes the W8 fallback.
     fails += check_type(GGML_TYPE_Q4_0, GpuFmt::W4, 1e-6f);
@@ -417,6 +565,9 @@ int main() {
     fails += check_type(GGML_TYPE_Q4_K, GpuFmt::W4, 2e-3f);
     fails += check_type(GGML_TYPE_Q6_K, GpuFmt::W8, 2e-3f);
     fails += check_type(GGML_TYPE_Q5_K, GpuFmt::W8, 1e-2f);
+    fails += check_w8_and_scale(GGML_TYPE_Q4_K, 0.22f);
+    fails += check_w8_and_scale(GGML_TYPE_Q8_0, 12.0f);
+    fails += check_w8_and_scale(GGML_TYPE_F16, 0.22f);
     fails += check_gemv();
     fails += check_gemv_helper();
     // Layout descriptors (#319): every descriptor round-trips through its
