@@ -15,6 +15,7 @@
 #include "qwen3/mel.hpp"
 #if defined(STARLING_HAVE_NPU)
 #include "encoder_contract.hpp"   // cpp/npu: Pixel TPU encoder artifacts
+#include "npu_status.hpp"
 #include "tpu_runtime.hpp"
 #endif
 
@@ -482,9 +483,11 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
     const uint32_t frames = sp.n_window_infer, tokens = 13 * (frames / 100), nm = sp.n_mels;
     const std::string key = npu::qwen3_enc_key(nm, frames, tokens, sp.ED, sp.EL, sp.EH, sp.EFF, sp.DS, sp.EOUT);
     const std::string name = npu::qwen3_enc_artifact_name(h);
-    std::string dirs;
-    if (const char* d = std::getenv("STARLING_NPU_DIR"); d && *d) dirs = d;
-    else if (const char* c = std::getenv("STARLING_FAST_CACHE_DIR"); c && *c) dirs = c;
+    const std::string dirs = npu::npu_dirs();
+    const std::string model = "arch=qwen3 hd=" + std::to_string(sp.HD);
+    auto report = [h, model](npu::PieceState st, const std::string& msg) {
+        npu::report_piece("qwen3-asr-enc", h, model, st, msg);
+    };
     std::string path;
     for (size_t b = 0; b <= dirs.size() && path.empty();) {
         size_t e = dirs.find(':', b);
@@ -493,20 +496,27 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
         if (e > b && access(cand.c_str(), R_OK) == 0) path = cand;
         b = e + 1;
     }
-    if (path.empty()) return note("no artifact " + name + (dirs.empty() ? std::string(" (no STARLING_NPU_DIR)") : " in " + dirs));
+    if (path.empty()) {
+        report(npu::PieceState::Missing, "no " + name);
+        return note("no artifact " + name + (dirs.empty() ? std::string(" (no STARLING_NPU_DIR)") : " in " + dirs));
+    }
     npu::ArtifactInfo info;
     std::string err;
-    if (!npu::read_artifact_info(path, info, err)) return note(err);
+    auto stale = [&](const std::string& why) {
+        report(npu::PieceState::Stale, why);
+        return note("TPU file stale, recompile via adb: " + why);
+    };
+    if (!npu::read_artifact_info(path, info, err)) return stale(err);
     const std::vector<uint64_t> in_bytes = {(uint64_t)nm * frames * 4, (uint64_t)tokens * 4};
     const std::vector<uint64_t> out_bytes = {(uint64_t)tokens * sp.EOUT * 4};
     if (info.key != key || info.model_hash != h || info.in_bytes != in_bytes || info.out_bytes != out_bytes)
-        return note(path + " was built for another model ('" + info.key + "'); ignored");
+        return stale(path + " was built by another exporter version ('" + info.key + "')");
     if (!npu::load_southbound(err)) return note("TPU runtime unavailable: " + err);
     const std::string vendor = npu::vendor_version();
     if (info.vendor != vendor)
-        return note(path + " was compiled for TPU firmware " + info.vendor + ", this phone has " + vendor + "; recompile it");
+        return stale(path + " was compiled for TPU firmware " + info.vendor + ", this phone has " + vendor);
     r.note = "opening " + path;
-    r.fut = std::async(std::launch::async, [path, nm, frames, tokens, tag, verbose]() {
+    r.fut = std::async(std::launch::async, [path, nm, frames, tokens, tag, verbose, report]() {
         std::pair<std::unique_ptr<npu::TpuModel>, std::string> out;
         auto finish = [&](const std::string& s) {
             out.second = s;
@@ -516,15 +526,21 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
         const auto t0 = std::chrono::steady_clock::now();
         auto m = std::make_unique<npu::TpuModel>();
         std::string e;
-        if (!m->open(path, npu::LoadMode::Mmap, e)) return finish("open " + path + ": " + e);
+        if (!m->open(path, npu::LoadMode::Mmap, e)) {
+            report(npu::PieceState::Error, "open " + path + ": " + e);
+            return finish("open " + path + ": " + e);
+        }
         const double t_open = ms_since(t0);
         // One zero window: the first invocation pays the weight transfer.
         std::vector<float> z((size_t)nm * frames, 0.0f);
         if (!m->write_input(0, z.data(), z.size() * 4, e) || !m->write_input(1, z.data(), (size_t)tokens * 4, e) ||
-            !m->run(e))
+            !m->run(e)) {
+            report(npu::PieceState::Error, "warm-up " + path + ": " + e);
             return finish("warm-up: " + e);
+        }
         char b[96];
         std::snprintf(b, sizeof b, ", load %.1f ms, warm-up %.1f ms", t_open, ms_since(t0) - t_open);
+        report(npu::PieceState::Ok, path);
         out.first = std::move(m);
         return finish("audio encoder on the TPU (" + path + b + ")");
     });
@@ -631,6 +647,7 @@ std::string AudioLlmEngine::describe() const {
                   impl_->ctx->info().name.c_str(), impl_->ar.total_bytes() / 1048576.0);
     std::string d = buf;
     if (impl_->npu_ready()) d += " encoder=npu";
+    if (impl_->npu_note.find("stale") != std::string::npos) d += " [" + impl_->npu_note + "]";
     return d;
 }
 
