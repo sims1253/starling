@@ -204,6 +204,13 @@ if(STARLING_GGML_TESTS)
           ${STARLING_REPO_ROOT}/cpp/serve)
     endif()
 
+    # The npu_fingerprint_test checks the Pixel TPU encoder fingerprints that
+    # starling-npu-tool computes from a GGUF file (cpp/npu, Android-only in
+    # the library, plain C++ + ggml here).
+    if(test_name STREQUAL "npu_fingerprint_test")
+      target_sources(${test_name} PRIVATE ${STARLING_REPO_ROOT}/cpp/npu/gguf_fingerprint.cpp)
+    endif()
+
     # The serve_trace_test drives StarlingServer directly (server.cpp only —
     # no WS transport) with the tiny synthesized granite GGUF (issue #180).
     if(test_name STREQUAL "serve_trace_test" OR

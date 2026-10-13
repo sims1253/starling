@@ -28,7 +28,8 @@ inline uint64_t fnv1a_update(uint64_t h, const void* data, size_t size) {
     for (size_t i = 0; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
     return h;
 }
-inline constexpr uint64_t kFnvBasis = 1469598103934665603ull;
+// The standard FNV-1a 64 offset basis, as export_encoder.py uses.
+inline constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ull;
 
 inline std::string qwen3_enc_key(uint32_t n_mels, uint32_t frames, uint32_t tokens, uint32_t d, uint32_t layers,
                                  uint32_t heads, uint32_t ff, uint32_t ds, uint32_t out) {
