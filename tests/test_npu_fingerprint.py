@@ -125,6 +125,40 @@ def test_another_layer_norm_eps_is_another_model(tmp_path):
                     "qwen3.proj.output_dim": ("i", 1024), "qwen3.enc.activation": ("s", "gelu")}
 
 
+@pytest.mark.parametrize("add", ["add_uint32", "add_bool", "add_string"])
+def test_a_mistyped_encoder_setting_is_refused(tmp_path, add):
+    """The engine reads enc.layer_norm_eps only as a float and keeps 1e-5
+    otherwise; the exporter must not build the graph with another value."""
+    ee = _exporter()
+    p = tmp_path / "eps.gguf"
+    w = gguf.GGUFWriter(str(p), "qwen3")
+    for k in ee.CONFIG_INTS:
+        w.add_uint32(f"qwen3.{k}", 4)
+    getattr(w, add)("qwen3.enc.layer_norm_eps", {"add_uint32": 1, "add_bool": True, "add_string": "1"}[add])
+    w.add_tensor("enc.blk.0.attn_q.weight", np.zeros((2, 4), np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    with pytest.raises(SystemExit, match="layer_norm_eps is not a float"):
+        ee.encoder_config(ee.Gguf(str(p)))
+
+
+def test_encoder_config_reads_the_engine_types(tmp_path):
+    ee = _exporter()
+    p = tmp_path / "ok.gguf"
+    w = gguf.GGUFWriter(str(p), "qwen3")
+    for k in ee.CONFIG_INTS:
+        w.add_uint32(f"qwen3.{k}", 4)
+    w.add_tensor("enc.blk.0.attn_q.weight", np.zeros((2, 4), np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    cfg = ee.encoder_config(ee.Gguf(str(p)))
+    assert cfg["enc.layer_norm_eps"] == 1e-5 and cfg["enc.hidden"] == 4
+
+
 def test_model_hash_needs_encoder_tensors(tmp_path):
     ee = _exporter()
     p = tmp_path / "llm-only.gguf"

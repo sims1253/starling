@@ -526,6 +526,32 @@ def embed_provenance(tfl, mh, key):
 
 
 # ---- the graph ----
+CONFIG_INTS = ("enc.n_mel", "enc.hidden", "enc.layers", "enc.heads", "enc.head_dim", "enc.ffn_dim",
+               "enc.downsample_hidden", "enc.n_window", "enc.n_window_infer", "enc.max_pos_emb",
+               "enc.output_dim", "proj.hidden", "proj.output_dim")
+
+
+def encoder_config(r):
+    """The encoder settings the graph is built from, read with the engine's
+    types (cpp/qwen3/loader.cpp): the engine ignores a key of another GGUF
+    type and keeps its default, so such a key would make the graph differ from
+    the engine under the same model hash; it is refused instead."""
+    def typed(key, kinds, what):
+        t = r.kv_type.get(key)
+        if t is not None and t not in kinds:
+            raise SystemExit(f"{r.path}: {key} is not {what} (GGUF type {t}); the engine would ignore it")
+        return r.kv.get(key)
+    cfg = {}
+    for k in CONFIG_INTS:
+        v = typed(f"qwen3.{k}", Gguf.INTS, "an integer")
+        if v is None:
+            raise SystemExit(f"{r.path}: no qwen3.{k}")
+        cfg[k] = int(v)
+    eps = typed("qwen3.enc.layer_norm_eps", Gguf.FLOATS, "a float")
+    cfg["enc.layer_norm_eps"] = 1e-5 if eps is None else float(eps)   # the engine's default
+    return cfg
+
+
 def load_gguf(path, expect=None):
     """(config, {GGUF tensor name: f32 numpy array in torch layout}, model hash).
     The weights and the hash come from the same copy of the tensors' bytes;
@@ -537,11 +563,7 @@ def load_gguf(path, expect=None):
     r = _open(path)
     if not _is_qwen3_asr(r):
         raise SystemExit(f"{path}: not a Qwen3-ASR GGUF (no TPU graph for it)")
-    cfg = {k: int(_field(r, f"qwen3.{k}")) for k in (
-        "enc.n_mel", "enc.hidden", "enc.layers", "enc.heads", "enc.head_dim", "enc.ffn_dim",
-        "enc.downsample_hidden", "enc.n_window", "enc.n_window_infer", "enc.max_pos_emb",
-        "enc.output_dim", "proj.hidden", "proj.output_dim")}
-    cfg["enc.layer_norm_eps"] = float(_field(r, "qwen3.enc.layer_norm_eps", 1e-5))
+    cfg = encoder_config(r)
     ts = [(name, typ, ne, bytes(r.raw(off, nbytes)))
           for name, typ, ne, off, nbytes in r.tensors if is_encoder_tensor(name)]
     mh = _hash_of(r, ts)
