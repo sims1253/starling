@@ -18,7 +18,7 @@ struct ArtifactInfo {
     std::string key;                       // what the graph computes (model family + shapes), checked by the loader
     std::vector<uint64_t> in_bytes, out_bytes;
     std::string vendor;                    // thrGetVendorApiVersion() at compile time
-    uint64_t model_hash = 0;               // fingerprint of the model it belongs to (see gguf_fingerprint)
+    uint64_t model_hash = 0;               // the GGUF it belongs to (encoder_contract.hpp: encoder digest)
     uint64_t tflite_hash = 0;              // FNV-1a of the compiled .tflite (provenance)
     uint64_t bytecode_offset = 0, bytecode_size = 0;
 };

@@ -35,7 +35,6 @@ bool write_artifact(const std::string& path, const ArtifactInfo& info, const std
 // Reads and validates the header (bytecode within the file, see
 // parse_artifact_header).
 bool read_artifact_info(const std::string& path, ArtifactInfo& info, std::string& err);
-uint64_t fnv1a(const void* data, size_t size);
 
 class TpuModel {
 public:

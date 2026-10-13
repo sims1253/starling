@@ -12,9 +12,11 @@
 # first. See docs/fast-engine.md, "Pixel TPU encoder".
 #
 # How it knows what to build: when the app loads a model, the engine writes
-# status-<piece>-<fingerprint>.txt next to the artifacts it looks for (files/npu
-# of the app, and its external files dir), with state missing / stale (an
-# artifact compiled for older TPU firmware or by an older exporter) / ok /
+# status-<piece>-<model hash>.txt next to the artifacts it looks for (files/npu
+# of the app, and its external files dir), with the model's two fingerprints
+# (model hash: a digest of the GGUF's encoder tensors, naming the artifact;
+# identity: the checkpoint it was converted from) and state missing / stale
+# (an artifact compiled for older TPU firmware or by an older exporter) / ok /
 # error. So: load each model in the app once, then run this. It
 #   1. finds the phone: $ANDROID_SERIAL, else the single `adb devices` entry,
 #      else wireless debugging via mDNS (`adb mdns services`, avahi-browse)
@@ -27,7 +29,7 @@
 #      into every package that asked for it.
 # The HF checkpoint is downloaded on first use (Qwen/Qwen3-ASR-0.6B-hf,
 # Qwen/Qwen3-ASR-1.7B-hf; weights and config only) and must be the app's
-# model: npu_compile.sh refuses a model whose fingerprint is not the
+# model: npu_compile.sh refuses a model whose identity is not the
 # checkpoint's (a fine-tune with the same shapes). Nothing is precompiled or
 # shipped: the phone's own compiler builds every artifact for its firmware,
 # and after a firmware update the app reports the files as stale until this
@@ -45,14 +47,14 @@ while [ $# -gt 0 ]; do
     --app) ONLY=$2; shift ;;
     --wait) WAIT=$2; shift ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n 2,35p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,39p "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
   shift
 done
 
 # (piece, arch, LLM hidden size) -> the candidate HF checkpoint; npu_compile.sh
-# then checks its fingerprint against the app's. Nothing else is compiled.
+# then checks its identity against the app's. Nothing else is compiled.
 checkpoint() {
   case "$1:$2:$3" in
     qwen3-asr-enc:qwen3:1024) echo Qwen/Qwen3-ASR-0.6B-hf ;;
@@ -110,7 +112,7 @@ for p in $PKGS; do
   adb shell "cat /sdcard/Android/data/$p/files/npu/status-*.txt 2>/dev/null" </dev/null | tr -d '\r' | sed "s/^piece=/pkg=$p\npiece=/" >>"$STATUS" || true
   echo "app: $p ($how)"
 done
-# One line per encoder and fingerprint: piece hash arch hd state packages
+# One line per encoder and model hash: piece hash identity arch hd state packages
 PLAN=$("$PY" -I - "$STATUS" "$ALL" <<'EOF'
 import sys
 recs, cur = [], None
@@ -129,12 +131,12 @@ for r in recs:
     state = r.get("state", "")
     if state not in ("missing", "stale", "error") and not (sys.argv[2] == "1" and state == "ok"):
         continue
-    key = (r["piece"], r["hash"], m.get("arch", "?"), m.get("hd", "?"))
+    key = (r["piece"], r["hash"], r.get("identity", "?"), m.get("arch", "?"), m.get("hd", "?"))
     want.setdefault(key, [set(), set()])
     want[key][0].add(r["pkg"])
     want[key][1].add(state)
-for (piece, h, arch, hd), (pkgs, states) in sorted(want.items()):
-    print(piece, h, arch, hd, "/".join(sorted(states)), ",".join(sorted(pkgs)))
+for (piece, h, ident, arch, hd), (pkgs, states) in sorted(want.items()):
+    print(piece, h, ident, arch, hd, "/".join(sorted(states)), ",".join(sorted(pkgs)))
 EOF
 )
 if [ -z "$PLAN" ]; then
@@ -146,12 +148,17 @@ echo "to compile:"; echo "$PLAN" | sed 's/^/  /'
 [ $DRY = 1 ] && exit 0
 
 fail=0
-while read -r piece hash arch hd states pkgs; do
+while read -r piece hash ident arch hd states pkgs; do
   ck=$(checkpoint "$piece" "$arch" "$hd")
   if [ -z "$ck" ]; then echo "!! no checkpoint known for $piece ($arch, hd=$hd); skipped" >&2; fail=1; continue; fi
+  if [ "$ident" = "?" ]; then
+    echo "!! $piece $hash: no identity in its status file (written by an older app); reload the model and rerun" >&2
+    fail=1; continue
+  fi
   echo "== $piece $hash ($ck, $states) -> $pkgs"
   "$PY" -I -c "import sys; from huggingface_hub import snapshot_download as d; d(sys.argv[1], allow_patterns=['*.json', '*.safetensors'])" "$ck" >/dev/null
-  PY=$PY "$ROOT/scripts/npu/npu_compile.sh" "$ck" --hash "$hash" --app "$pkgs" </dev/null || { echo "!! $piece $hash failed" >&2; fail=1; }
+  PY=$PY "$ROOT/scripts/npu/npu_compile.sh" "$ck" --hash "$hash" --identity "$ident" --app "$pkgs" </dev/null ||
+    { echo "!! $piece $hash failed" >&2; fail=1; }
 done <<<"$PLAN"
 echo "done. Restart the app (or reload the model) to pick the TPU files up."
 exit $fail

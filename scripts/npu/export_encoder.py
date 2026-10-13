@@ -7,10 +7,10 @@ fp16 either way), and the converter's `keep_stablehlo_constant` metadata key,
 which the phone's on-device compiler rejects, is renamed in place.
 
 python -I export_encoder.py MODEL OUT.tflite      (MODEL: HF id or snapshot dir)
-Prints one JSON line: {"key": ..., "in": [...], "out": [...], "model_hash": "0x...", "tflite": ...}.
+Prints one JSON line: {"key": ..., "in": [...], "out": [...], "identity": "0x...", "tflite": ...}.
 
 python -I export_encoder.py --fingerprint MODEL
-Prints only the checkpoint's model fingerprint (0x...), without exporting.
+Prints only the checkpoint's identity (0x...), without exporting.
 """
 import glob
 import json
@@ -18,10 +18,13 @@ import os
 import sys
 import tempfile
 
-# The model fingerprint of cpp/npu/encoder_contract.hpp: FNV-1a 64 over the
-# f32 bytes of these tensors, in this order (kQwen3EncFingerprintTensors).
-# Starling GGUFs keep them F32, widened exactly from the checkpoint's values,
-# so a checkpoint and the GGUFs converted from it share the fingerprint.
+# The checkpoint identity of cpp/npu/encoder_contract.hpp (qwen3_identity):
+# FNV-1a 64 over the f32 bytes of these tensors, in this order
+# (kQwen3EncFingerprintTensors). Starling GGUFs keep them F32, widened
+# exactly from the checkpoint's values, so a checkpoint and the GGUFs
+# converted from it share the identity. It only covers biases and norms: a
+# fine-tune that changed nothing but weight matrices has its base model's
+# identity (docs/fast-engine.md, Pixel TPU encoder).
 FINGERPRINT_TENSORS = [  # (GGUF name, checkpoint name)
     ("enc.conv1.bias", "model.audio_tower.conv2d1.bias"),
     ("enc.ln_post.weight", "model.audio_tower.ln_post.weight"),
@@ -40,7 +43,7 @@ def fnv1a64(data, h=FNV_BASIS):
 
 
 def checkpoint_identity(f32_bytes):
-    """The fingerprint from f32_bytes(checkpoint name) -> that tensor's little-endian f32 bytes."""
+    """The identity from f32_bytes(checkpoint name) -> that tensor's little-endian f32 bytes."""
     h = FNV_BASIS
     for _, k in FINGERPRINT_TENSORS:
         h = fnv1a64(f32_bytes(k), h)
@@ -176,7 +179,7 @@ def export(snap, out_path, identity):
     ckey = (f"qwen3-asr-enc/1 mels={NM} frames={FR} tokens={TOK} d={D} L={ac.encoder_layers} H={H} "
             f"ff={ac.encoder_ffn_dim} ds={DS} out={ac.output_dim}")
     print(json.dumps({"key": ckey, "in": [NM * FR * 4, TOK * 4], "out": [TOK * ac.output_dim * 4],
-                      "model_hash": identity, "tflite": out_path, "bytes": os.path.getsize(out_path)}))
+                      "identity": identity, "tflite": out_path, "bytes": os.path.getsize(out_path)}))
 
 
 def main(argv):

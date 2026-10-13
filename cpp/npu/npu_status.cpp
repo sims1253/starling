@@ -16,10 +16,7 @@
 
 namespace starling::npu {
 
-namespace {
-// Whether this device has the TPU runtime, without loading it: the firmware
-// lists libedgetpu_litert.so among its public vendor libraries.
-bool tpu_listed() {
+bool tpu_present() {
     static const bool listed = [] {
         FILE* f = std::fopen("/vendor/etc/public.libraries.txt", "r");
         if (!f) return false;
@@ -31,7 +28,6 @@ bool tpu_listed() {
     }();
     return listed;
 }
-}  // namespace
 
 std::string npu_dirs() {
     if (const char* d = std::getenv("STARLING_NPU_DIR"); d && *d) return d;
@@ -39,17 +35,18 @@ std::string npu_dirs() {
     return {};
 }
 
-void report_piece(const std::string& piece, uint64_t model_hash, const std::string& model, PieceState state,
-                  const std::string& message) {
+void report_piece(const std::string& piece, uint64_t model_hash, uint64_t identity, const std::string& model,
+                  PieceState state, const std::string& message) {
     static const char* const kNames[] = {"ok", "missing", "stale", "error"};
     const char* st = kNames[(int)state];
     // "missing" is reported on every load of a supported model: only where a
     // TPU exists, and without loading its runtime (the engine loads it only
     // once an artifact is there).
-    if (state == PieceState::Missing && !tpu_listed()) return;
+    if (state == PieceState::Missing && !tpu_present()) return;
     const std::string firmware = state == PieceState::Missing ? std::string() : vendor_version();
-    char hash[24];
+    char hash[24], ident[24];
     std::snprintf(hash, sizeof hash, "%016llx", (unsigned long long)model_hash);
+    std::snprintf(ident, sizeof ident, "%016llx", (unsigned long long)identity);
     if (state == PieceState::Stale || state == PieceState::Error) {
         static std::mutex mu;
         static std::set<std::string> logged;
@@ -64,8 +61,9 @@ void report_piece(const std::string& piece, uint64_t model_hash, const std::stri
 #endif
         }
     }
-    const std::string body = std::string("piece=") + piece + "\nhash=0x" + hash + "\nmodel=" + model + "\nstate=" + st +
-                             "\nfirmware=" + firmware + "\nmessage=" + message + "\n";
+    const std::string body = std::string("piece=") + piece + "\nhash=0x" + hash + "\nidentity=0x" + ident +
+                             "\nmodel=" + model + "\nstate=" + st + "\nfirmware=" + firmware + "\nmessage=" + message +
+                             "\n";
     const std::string dirs = npu_dirs();
     for (size_t b = 0; b <= dirs.size();) {
         size_t e = dirs.find(':', b);

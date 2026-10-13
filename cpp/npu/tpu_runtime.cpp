@@ -17,8 +17,6 @@
 // limitations under the License.
 #include "tpu_runtime.hpp"
 
-#include "encoder_contract.hpp"
-
 #include "tpu_sb.hpp"
 
 #include <android/hardware_buffer.h>
@@ -139,8 +137,6 @@ std::string vendor_version() {
     const char* v = s->get_vendor_api_version();
     return v ? v : "";
 }
-
-uint64_t fnv1a(const void* data, size_t size) { return fnv1a_update(kFnvBasis, data, size); }
 
 bool compile_tflite(const void* tflite, size_t size, std::vector<uint8_t>& bytecode, std::string& err) {
     const SouthBound* s = load_southbound(err);

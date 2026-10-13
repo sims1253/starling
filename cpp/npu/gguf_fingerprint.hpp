@@ -1,12 +1,14 @@
 // Copyright 2026 The Starling Authors. Apache-2.0.
 #pragma once
 
-#include <cstdint>
+#include "model_fingerprint.hpp"
+
 #include <string>
 
 namespace starling::npu {
 
-// encoder_contract.hpp's model fingerprint of a Qwen3-ASR GGUF file.
-bool gguf_fingerprint(const std::string& path, uint64_t& hash, std::string& err);
+// Both fingerprints (model_fingerprint.hpp) of a Qwen3-ASR GGUF file, read
+// tensor by tensor: what the engine computes from the same GGUF once loaded.
+bool gguf_fingerprint(const std::string& path, ModelFingerprint& fp, std::string& err);
 
 }  // namespace starling::npu

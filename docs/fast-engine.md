@@ -167,32 +167,58 @@ then run `scripts/npu/npu_compile_all.sh`. It finds the phone
 mDNS; `--wait S`), the installed Starling packages (release, `.debug`,
 `.experimental`), reads what each loaded model reported (below), and compiles
 every missing or stale Qwen3-ASR encoder with `npu_compile.sh HF_MODEL
-(--gguf PHONE_GGUF | --hash 0x…) [--app PKG,…]`: export from the HF checkpoint
-(downloaded on first use; refused unless its fingerprint is the app model's,
-so a fine-tune never gets the base model's encoder), compile with the phone's
-compiler (only the Qwen3-ASR 0.6B/1.7B encoder window; the phone-side helper
-checks the graph's key, its inputs and output and its operator signature —
-operator and tensor counts and operators per builtin, as `export_encoder.py`
-builds that window — itself), install into
+(--gguf PHONE_GGUF | --hash 0x… --identity 0x…) [--app PKG,…]`: export from
+the HF checkpoint (downloaded on first use; refused unless its identity is the
+app model's, see below), compile with the phone's compiler (only the
+Qwen3-ASR 0.6B/1.7B encoder window; the phone-side helper checks the graph's
+key, its inputs and output and its operator signature — operator and tensor
+counts and operators per builtin, as `export_encoder.py` builds that window —
+itself), install into
 `files/npu` of a debuggable package (run-as) or the external files dir
 `Android/data/<pkg>/files/npu` of any other. The artifact is one encoder
 attention window (800 mel frames → 104 projector rows, fp16 weights, an
 additive key mask for the partial last window),
-`qwen3-asr-enc-<fingerprint>.stnpu`. The engine loads an artifact only if its
-header matches the GGUF (a hash of a few F32 tensors, the same for every
-quantization of a model), the graph shape and the firmware's API version; it
-opens and warms it up on a worker thread during the GPU weight load, runs the
+`qwen3-asr-enc-<model hash>.stnpu`. The engine loads an artifact only if its
+header matches the GGUF, the graph shape and the firmware's API version; a
+worker thread hashes the GGUF's encoder tensors, then opens and warms the
+artifact up while the GPU weights load; the engine then runs the
 encoder window by window on the TPU, uploads the projector rows into the
 LLM's audio rows and records a prefill without the GPU encoder pass. Short
 clip (7.4 s, Qwen3-ASR-0.6B, after the subgroup-broadcast GEMM): encoder +
 prefill 558 → 396 ms, wall 1576 → 1422 ms (TPU encoder 54 ms); transcripts
 match the GPU's up to a punctuation near-tie.
 
+*Two fingerprints* (`cpp/npu/encoder_contract.hpp`). The **model hash** binds
+an artifact to one GGUF: a digest of every audio-encoder and projector tensor
+(`enc.*`, `proj.*`) exactly as the GGUF stores it — name, type, shape, and an
+XXH64 of the raw bytes, folded with FNV-1a in name order — so a GGUF whose
+encoder differs in any byte, a weights-only fine-tune or another quantization
+included, does not match an artifact compiled for another. The engine
+computes it only where a TPU can be used (a Qwen3-ASR model, an artifact
+directory, firmware that lists the TPU library), on that worker, and the load
+waits for it only if the GPU weights are in place first; elsewhere nothing is
+hashed. On the host it takes 26 ms (0.6B
+q4e8, 112 MB of encoder tensors) and 43 ms (1.7B, 186 MB) with the GGUF in
+the page cache, 97 and 168 ms reading it cold. `starling-npu-tool fingerprint
+GGUF` prints the same value from the file. The **identity** ties the GGUF to
+the HF checkpoint the graph is exported from: FNV-1a 64 over five F32 bias
+and norm tensors, which Starling's converter keeps exact, so
+`export_encoder.py --fingerprint` computes the same value from the checkpoint
+(the Python and C++ sides are pinned to one test vector,
+`tests/test_npu_fingerprint.py`, `cpp/tests/npu_fingerprint_test.cpp`). The
+compile scripts refuse a checkpoint whose identity is not the app model's.
+Its limit: a fine-tune that changed only weight matrices and left those
+biases and norms bit-identical has its base checkpoint's identity, so the
+scripts would export the base model's encoder for it. Export the checkpoint
+your GGUF was converted from; the model hash still keeps such an artifact
+from ever being used with a GGUF other than the one it was compiled for.
+
 *Fallback, said out loud.* Without a matching artifact, with `STARLING_NPU=0`,
 or after any TPU error the engine runs the GPU encoder as before. Each piece's
 state (`ok`, `missing`, `stale` — compiled for older firmware or by an older
-exporter — or `error`) goes to `status-<piece>-<fingerprint>.txt` in every
-existing `STARLING_NPU_DIR` directory (what `npu_compile_all.sh` reads;
+exporter — or `error`), with both fingerprints, goes to
+`status-<piece>-<model hash>.txt` in every existing `STARLING_NPU_DIR`
+directory (what `npu_compile_all.sh` reads;
 `missing` only where the firmware lists the TPU library, and without loading
 it), stale and error states are logged once per process (logcat tag
 `StarlingNpu`: "TPU … not used (stale), the GPU runs it: … — recompile via

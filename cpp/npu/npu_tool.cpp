@@ -4,7 +4,7 @@
 // Compiling must run as the shell user: the firmware compile service refuses
 // apps not on Google's EdgeTPU allowlist (loading and running an artifact
 // works from any app, see tpu_runtime.hpp).
-//   starling-npu-tool fingerprint MODEL.gguf
+//   starling-npu-tool fingerprint MODEL.gguf    prints "model_hash 0x.." and "identity 0x.."
 //   starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. [--fn F] [--key K]
 //                             [--gguf MODEL.gguf | --hash 0x..]
 //   starling-npu-tool info ART
@@ -59,7 +59,7 @@ bool compile(const std::string& tflite, const std::string& artifact, ArtifactInf
     std::printf("on-device compile %.1f ms, %zu-byte model -> %zu-byte bytecode\n", now_ms() - t0, model.size(),
                 bc.size());
     info.vendor = vendor_version();
-    info.tflite_hash = fnv1a(model.data(), model.size());
+    info.tflite_hash = fnv1a_update(kFnvBasis, model.data(), model.size());
     if (!write_artifact(artifact, info, bc, err)) return false;
     std::printf("wrote %s (TPU firmware %s)\n", artifact.c_str(), info.vendor.c_str());
     return true;
@@ -79,12 +79,15 @@ int main(int argc, char** argv) {
     const std::string cmd = argv[1];
     std::string err;
     if (cmd == "fingerprint") {
-        uint64_t h = 0;
-        if (!gguf_fingerprint(argv[2], h, err)) {
+        ModelFingerprint fp;
+        const double t0 = now_ms();
+        if (!gguf_fingerprint(argv[2], fp, err)) {
             std::fprintf(stderr, "%s\n", err.c_str());
             return 1;
         }
-        std::printf("0x%016llx\n", (unsigned long long)h);
+        std::printf("model_hash 0x%016llx\nidentity 0x%016llx\n", (unsigned long long)fp.model_hash,
+                    (unsigned long long)fp.identity);
+        std::fprintf(stderr, "fingerprinted in %.1f ms\n", now_ms() - t0);
         return 0;
     }
     if (cmd == "compile" && argc >= 4) {
@@ -96,9 +99,13 @@ int main(int argc, char** argv) {
             else if (!std::strcmp(argv[i], "--out")) info.out_bytes = sizes(argv[i + 1]);
             else if (!std::strcmp(argv[i], "--key")) info.key = argv[i + 1];
             else if (!std::strcmp(argv[i], "--hash")) info.model_hash = std::strtoull(argv[i + 1], nullptr, 0);
-            else if (!std::strcmp(argv[i], "--gguf") && !gguf_fingerprint(argv[i + 1], info.model_hash, err)) {
-                std::fprintf(stderr, "%s\n", err.c_str());
-                return 1;
+            else if (!std::strcmp(argv[i], "--gguf")) {
+                ModelFingerprint fp;
+                if (!gguf_fingerprint(argv[i + 1], fp, err)) {
+                    std::fprintf(stderr, "%s\n", err.c_str());
+                    return 1;
+                }
+                info.model_hash = fp.model_hash;
             }
         }
         if (!compile(argv[2], argv[3], info, err)) {

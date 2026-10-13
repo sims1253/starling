@@ -3,7 +3,7 @@
 # them where starling-bench and the app look for them. To do this for every
 # model the installed app has loaded, run npu_compile_all.sh instead.
 #
-#   scripts/npu/npu_compile.sh HF_MODEL (--gguf PHONE_GGUF | --hash 0xHASH)
+#   scripts/npu/npu_compile.sh HF_MODEL (--gguf PHONE_GGUF | --hash 0xHASH --identity 0xIDENTITY)
 #                                 [--app PKG[,PKG...]] [--dir DIR]
 # HF_MODEL: a Qwen3-ASR checkpoint. Only its audio encoder is built: it is the
 # one graph known to compile safely.
@@ -18,11 +18,14 @@
 # 1. Host: export the encoder graph from the HF checkpoint (export_encoder.py;
 #    fp16 weights, metadata patched).
 # 2. Phone, adb shell: fingerprint the GGUF the engine will load (or take
-#    --hash, the fingerprint the app wrote to its status-*.txt), check that it
-#    is HF_MODEL's own fingerprint (a fine-tune with the same shapes is
-#    refused: the artifact would carry the base model's weights), compile the
-#    graph with the phone's own on-device compiler (starling-npu-tool) and
-#    write qwen3-asr-enc-<fingerprint>.stnpu.
+#    --hash and --identity, the two fingerprints the app wrote to its
+#    status-*.txt): its identity must be HF_MODEL's (a fine-tune with other
+#    biases or norms is refused: the artifact would carry the base model's
+#    weights; one that changed only weight matrices cannot be told apart, so
+#    export the checkpoint the GGUF was converted from), and its model hash,
+#    a digest of the GGUF's encoder tensors, names the artifact. Then compile
+#    the graph with the phone's own on-device compiler (starling-npu-tool) and
+#    write qwen3-asr-enc-<model hash>.stnpu.
 #    Compiling must run as the adb shell user: the firmware's compile service
 #    only serves apps on Google's EdgeTPU allowlist. Loading and running an
 #    artifact works from any app.
@@ -30,10 +33,10 @@
 #    STARLING_NPU_DIR=that) and, for each --app package, files/npu of a
 #    debuggable app (run-as) or the external files dir of any other
 #    (/sdcard/Android/data/<pkg>/files/npu); NativeSupport points
-#    STARLING_NPU_DIR at both. An artifact is tied to the GGUF's fingerprint,
-#    the graph shape and the TPU firmware version; anything else makes the
-#    engine ignore it, run the GPU, and say so (logcat tag StarlingNpu,
-#    status-*.txt beside the artifacts).
+#    STARLING_NPU_DIR at both. An artifact is tied to the GGUF's encoder
+#    tensors, the graph shape and the TPU firmware version; anything else
+#    makes the engine ignore it, run the GPU, and say so (logcat tag
+#    StarlingNpu, status-*.txt beside the artifacts).
 #
 # Env: ANDROID_SERIAL; NPU_TOOL (default build-android-npu/starling-npu-tool,
 # built with `cmake --build <android build> --target starling-npu-tool`);
@@ -42,20 +45,24 @@
 # caller already holds /tmp/starling-phone.lock.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-[ $# -ge 3 ] || { sed -n 2,40p "$0"; exit 2; }
+[ $# -ge 3 ] || { sed -n 2,45p "$0"; exit 2; }
 MODEL=$1; shift
-SRC=""; APP=""; DIR=/data/local/tmp/starling-npu
+GGUF=""; HASH=""; ID=""; APP=""; DIR=/data/local/tmp/starling-npu
 while [ $# -gt 0 ]; do
   case $1 in
-    --gguf) SRC=$2; shift ;;
-    --hash) SRC=$2; shift ;;
+    --gguf) GGUF=$2; shift ;;
+    --hash) HASH=$2; shift ;;
+    --identity) ID=$2; shift ;;
     --app) APP=$2; shift ;;
     --dir) DIR=$2; shift ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
   shift
 done
-[ -n "$SRC" ] || { echo "need --gguf PHONE_GGUF or --hash 0xHASH" >&2; exit 2; }
+if [ -n "$GGUF" ] && [ -z "$HASH$ID" ]; then SRC=$GGUF
+elif [ -z "$GGUF" ] && [ -n "$HASH" ] && [ -n "$ID" ]; then SRC=$HASH,$ID
+else echo "need --gguf PHONE_GGUF, or --hash 0xHASH and --identity 0xIDENTITY" >&2; exit 2
+fi
 NPU_TOOL=${NPU_TOOL:-$ROOT/build-android-npu/starling-npu-tool}
 PY=${PY:-python3}
 [ -x "$NPU_TOOL" ] || { echo "missing $NPU_TOOL (build target starling-npu-tool)" >&2; exit 1; }
@@ -73,19 +80,17 @@ cfg() {  # cfg PYTHON-EXPR over the checkpoint's config.json (as c)
 TYPE=$(cfg "c['model_type']")
 [ "$TYPE" = qwen3_asr ] ||
   { echo "$MODEL ($TYPE): no TPU graphs for this model (supported: Qwen3-ASR)" >&2; exit 2; }
-# The checkpoint must be the app's model: its fingerprint (the same few F32
-# tensors the GGUF fingerprint hashes) has to match before anything is built.
-CKHASH=$("$PY" -I "$ROOT/scripts/npu/export_encoder.py" --fingerprint "$MODEL" | tail -1)
-case $SRC in
-  0x*|0X*)
-    if [ "$("$PY" -I -c 'import sys; print(int(sys.argv[1], 16) == int(sys.argv[2], 16))' "$SRC" "$CKHASH")" != True ]; then
-      echo "refusing: the app's model ($SRC) is not $MODEL ($CKHASH): a fine-tune or other weights;" >&2
-      echo "  its TPU encoder cannot be built from this checkpoint" >&2
-      exit 1
-    fi ;;
-esac
+# The checkpoint must be the app's model: its identity (the same few F32
+# tensors the GGUF's identity hashes) has to match before anything is built.
+CKID=$("$PY" -I "$ROOT/scripts/npu/export_encoder.py" --fingerprint "$MODEL" | tail -1)
+if [ -n "$ID" ] &&
+   [ "$("$PY" -I -c 'import sys; print(int(sys.argv[1], 16) == int(sys.argv[2], 16))' "$ID" "$CKID")" != True ]; then
+  echo "refusing: the app's model (identity $ID) is not $MODEL ($CKID): a fine-tune or other weights;" >&2
+  echo "  its TPU encoder cannot be built from this checkpoint" >&2
+  exit 1
+fi
 TFL=$WORK/enc.tflite
-echo "== export $MODEL (encoder, fingerprint $CKHASH)"
+echo "== export $MODEL (encoder, identity $CKID)"
 CMD=("$PY" -I "$ROOT/scripts/npu/export_encoder.py" "$MODEL" "$TFL")
 if command -v systemd-run >/dev/null; then
   CMD=(systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 "${CMD[@]}")
@@ -93,8 +98,8 @@ fi
 META=$(flock "$LOCK" "${CMD[@]}" 2>"$WORK/export.log" | tail -1) || { tail -20 "$WORK/export.log" >&2; exit 1; }
 echo "$META"
 KEY=$(field key)
-[ "$(field model_hash)" = "$CKHASH" ] || { echo "export fingerprint changed under us" >&2; exit 1; }
+[ "$(field identity)" = "$CKID" ] || { echo "export identity changed under us" >&2; exit 1; }
 echo "== compile on the phone"
 PHONE_LOCK=(flock /tmp/starling-phone.lock)
 [ -n "${STARLING_PHONE_LOCK_HELD:-}" ] && PHONE_LOCK=()   # the caller holds it
-PY=$PY "${PHONE_LOCK[@]}" "$ROOT/scripts/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$CKHASH" "$KEY" "$DIR" "$APP" "$T"
+PY=$PY "${PHONE_LOCK[@]}" "$ROOT/scripts/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$CKID" "$KEY" "$DIR" "$APP" "$T"

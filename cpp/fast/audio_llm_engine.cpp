@@ -14,7 +14,7 @@
 #include "qwen3/loader.hpp"
 #include "qwen3/mel.hpp"
 #if defined(STARLING_HAVE_NPU)
-#include "encoder_contract.hpp"   // cpp/npu: Pixel TPU encoder artifacts
+#include "model_fingerprint.hpp"   // cpp/npu: Pixel TPU encoder artifacts
 #include "npu_status.hpp"
 #include "tpu_runtime.hpp"
 #endif
@@ -33,6 +33,7 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <system_error>
 #include <thread>
 
 #if defined(__linux__)
@@ -418,8 +419,8 @@ struct AudioLlmEngine::Impl {
     // GPU encoder for good.
 #if defined(STARLING_HAVE_NPU)
     std::unique_ptr<npu::TpuModel> npu;
-    // The artifact's open + warm-up, started before the GPU weight load and
-    // joined on first use (npu_ready).
+    // The artifact's hashing, open and warm-up, started before the GPU weight
+    // load and joined on first use (npu_ready).
     std::future<std::pair<std::unique_ptr<npu::TpuModel>, std::string>> npu_pending;
 #endif
     std::string npu_note;   // why the NPU path is (not) used, for describe()
@@ -461,102 +462,150 @@ AudioLlmEngine::~AudioLlmEngine() {
 
 namespace {
 // ---- Qwen3-ASR encoder artifact on the Pixel TPU (cpp/npu) ----
-// Looks for qwen3-asr-enc-<fingerprint>.stnpu in STARLING_NPU_DIR (else
-// STARLING_FAST_CACHE_DIR), checks it against this model (GGUF fingerprint,
-// encoder shape, firmware version) and opens + warms it up on a worker thread
-// (joined by Impl::npu_ready on first use). Any mismatch or error leaves the
-// GPU encoder in charge; `note` says why.
+// Looks for qwen3-asr-enc-<model hash>.stnpu in STARLING_NPU_DIR (else
+// STARLING_FAST_CACHE_DIR), checks it against this model (the encoder digest
+// of encoder_contract.hpp names it; encoder shape, firmware version) and
+// opens + warms it up. Any mismatch or error leaves the GPU encoder in
+// charge; the note says why.
+//
+// Only where a TPU can be used at all (a supported model, an artifact
+// directory, a device whose firmware lists the TPU runtime) does anything
+// run, and then on a worker that starts before the GPU weight load: it hashes
+// the encoder tensors (`hashed` is ready once it no longer reads them;
+// create() waits for that, since its caller releases the model's tensors),
+// then finds, checks, opens and warms up the artifact; Impl::npu_ready joins
+// it on first use. Elsewhere (hosts, other phones) nothing is hashed and the
+// load is unchanged.
+#if defined(STARLING_HAVE_NPU)
+using NpuResult = std::pair<std::unique_ptr<npu::TpuModel>, std::string>;
+#endif
 struct NpuStart {
     std::string note;
 #if defined(STARLING_HAVE_NPU)
-    std::future<std::pair<std::unique_ptr<npu::TpuModel>, std::string>> fut;
+    std::future<void> hashed;
+    std::future<NpuResult> fut;
 #endif
 };
 
-NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
-    NpuStart r;
 #if defined(STARLING_HAVE_NPU)
-    const bool verbose = env_on("STARLING_FAST_VERBOSE") || env_on("STARLING_FAST_TIMING");
-    const std::string tag = sp.tag;
-    auto note = [&](const std::string& s) {
-        r.note = s;
-        if (verbose) std::fprintf(stderr, "[fast-%s] npu: %s\n", tag.c_str(), s.c_str());
-        return std::move(r);
+struct NpuJob {
+    std::string tag, key, model, dirs;
+    uint32_t nm = 0, frames = 0, tokens = 0, eout = 0;
+    bool verbose = false;
+    uint64_t identity = 0;
+};
+
+// The worker's half after hashing: find, check, open and warm up the artifact.
+NpuResult npu_open(const NpuJob& j, uint64_t h) {
+    NpuResult out;
+    auto finish = [&](const std::string& s) {
+        out.second = s;
+        if (j.verbose) std::fprintf(stderr, "[fast-%s] npu: %s\n", j.tag.c_str(), s.c_str());
+        return std::move(out);
     };
-    if (const char* e = std::getenv("STARLING_NPU"); e && std::strcmp(e, "0") == 0) return note("disabled (STARLING_NPU=0)");
-    // Qwen3-ASR's audio tower only (MOSS shares it but adds the adapter).
-    if (tag != "qwen3" || sp.EOUT != sp.HD || sp.n_window_infer == 0 || sp.n_window_infer % 100 != 0) return r;
-    uint64_t h = npu::kFnvBasis;
-    for (const char* name : npu::kQwen3EncFingerprintTensors) {
-        const ggml_tensor* t = ml.tensor(name);
-        if (!t || t->type != GGML_TYPE_F32 || !t->data)
-            return note(std::string("no model fingerprint (") + name + " missing or not F32)");
-        h = npu::fnv1a_update(h, t->data, ggml_nbytes(t));
-    }
-    const uint32_t frames = sp.n_window_infer, tokens = 13 * (frames / 100), nm = sp.n_mels;
-    const std::string key = npu::qwen3_enc_key(nm, frames, tokens, sp.ED, sp.EL, sp.EH, sp.EFF, sp.DS, sp.EOUT);
     const std::string name = npu::qwen3_enc_artifact_name(h);
-    const std::string dirs = npu::npu_dirs();
-    const std::string model = "arch=qwen3 hd=" + std::to_string(sp.HD);
-    auto report = [h, model](npu::PieceState st, const std::string& msg) {
-        npu::report_piece("qwen3-asr-enc", h, model, st, msg);
+    auto report = [&](npu::PieceState st, const std::string& msg) {
+        npu::report_piece("qwen3-asr-enc", h, j.identity, j.model, st, msg);
     };
     std::string path;
-    for (size_t b = 0; b <= dirs.size() && path.empty();) {
-        size_t e = dirs.find(':', b);
-        if (e == std::string::npos) e = dirs.size();
-        const std::string cand = dirs.substr(b, e - b) + "/" + name;
+    for (size_t b = 0; b <= j.dirs.size() && path.empty();) {
+        size_t e = j.dirs.find(':', b);
+        if (e == std::string::npos) e = j.dirs.size();
+        const std::string cand = j.dirs.substr(b, e - b) + "/" + name;
         if (e > b && access(cand.c_str(), R_OK) == 0) path = cand;
         b = e + 1;
     }
     if (path.empty()) {
         report(npu::PieceState::Missing, "no " + name);
-        return note("no artifact " + name + (dirs.empty() ? std::string(" (no STARLING_NPU_DIR)") : " in " + dirs));
+        return finish("no artifact " + name + " in " + j.dirs);
     }
     npu::ArtifactInfo info;
     std::string err;
     auto stale = [&](const std::string& why) {
         report(npu::PieceState::Stale, why);
-        return note("TPU file stale, recompile via adb: " + why);
+        return finish("TPU file stale, recompile via adb: " + why);
     };
     if (!npu::read_artifact_info(path, info, err)) return stale(err);
-    const std::vector<uint64_t> in_bytes = {(uint64_t)nm * frames * 4, (uint64_t)tokens * 4};
-    const std::vector<uint64_t> out_bytes = {(uint64_t)tokens * sp.EOUT * 4};
-    if (info.key != key || info.model_hash != h || info.in_bytes != in_bytes || info.out_bytes != out_bytes)
+    const std::vector<uint64_t> in_bytes = {(uint64_t)j.nm * j.frames * 4, (uint64_t)j.tokens * 4};
+    const std::vector<uint64_t> out_bytes = {(uint64_t)j.tokens * j.eout * 4};
+    if (info.key != j.key || info.model_hash != h || info.in_bytes != in_bytes || info.out_bytes != out_bytes)
         return stale(path + " was built by another exporter version ('" + info.key + "')");
-    if (!npu::load_southbound(err)) return note("TPU runtime unavailable: " + err);
+    if (!npu::load_southbound(err)) return finish("TPU runtime unavailable: " + err);
     const std::string vendor = npu::vendor_version();
     if (info.vendor != vendor)
         return stale(path + " was compiled for TPU firmware " + info.vendor + ", this phone has " + vendor);
-    r.note = "opening " + path;
-    r.fut = std::async(std::launch::async, [path, nm, frames, tokens, tag, verbose, report]() {
-        std::pair<std::unique_ptr<npu::TpuModel>, std::string> out;
-        auto finish = [&](const std::string& s) {
-            out.second = s;
-            if (verbose) std::fprintf(stderr, "[fast-%s] npu: %s\n", tag.c_str(), s.c_str());
-            return std::move(out);
-        };
+    const auto t0 = std::chrono::steady_clock::now();
+    auto m = std::make_unique<npu::TpuModel>();
+    if (!m->open(path, err)) {
+        report(npu::PieceState::Error, "open " + path + ": " + err);
+        return finish("open " + path + ": " + err);
+    }
+    const double t_open = ms_since(t0);
+    // One zero window: the first invocation pays the weight transfer.
+    std::vector<float> z((size_t)j.nm * j.frames, 0.0f);
+    if (!m->write_input(0, z.data(), z.size() * 4, err) || !m->write_input(1, z.data(), (size_t)j.tokens * 4, err) ||
+        !m->run(err)) {
+        report(npu::PieceState::Error, "warm-up " + path + ": " + err);
+        return finish("warm-up: " + err);
+    }
+    char b[96];
+    std::snprintf(b, sizeof b, ", load %.1f ms, warm-up %.1f ms", t_open, ms_since(t0) - t_open);
+    report(npu::PieceState::Ok, path);
+    out.first = std::move(m);
+    return finish("audio encoder on the TPU (" + path + b + ")");
+}
+#endif
+
+NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
+    NpuStart r;
+#if defined(STARLING_HAVE_NPU)
+    NpuJob j;
+    j.verbose = env_on("STARLING_FAST_VERBOSE") || env_on("STARLING_FAST_TIMING");
+    j.tag = sp.tag;
+    auto note = [&](const std::string& s) {
+        r.note = s;
+        if (j.verbose) std::fprintf(stderr, "[fast-%s] npu: %s\n", j.tag.c_str(), s.c_str());
+        return std::move(r);
+    };
+    if (const char* e = std::getenv("STARLING_NPU"); e && std::strcmp(e, "0") == 0) return note("disabled (STARLING_NPU=0)");
+    // Qwen3-ASR's audio tower only (MOSS shares it but adds the adapter).
+    if (j.tag != "qwen3" || sp.EOUT != sp.HD || sp.n_window_infer == 0 || sp.n_window_infer % 100 != 0) return r;
+    j.dirs = npu::npu_dirs();
+    if (j.dirs.empty()) return note("no STARLING_NPU_DIR");
+    if (!npu::tpu_present()) return note("no TPU runtime on this device");
+    const npu::TensorLookup tensor = [&ml](const std::string& n) -> const ggml_tensor* { return ml.tensor(n.c_str()); };
+    std::string err;
+    if (!npu::qwen3_identity(tensor, j.identity, err)) return note(err);
+    j.frames = sp.n_window_infer;
+    j.tokens = 13 * (j.frames / 100);
+    j.nm = sp.n_mels;
+    j.eout = sp.EOUT;
+    j.key = npu::qwen3_enc_key(j.nm, j.frames, j.tokens, sp.ED, sp.EL, sp.EH, sp.EFF, sp.DS, sp.EOUT);
+    j.model = "arch=qwen3 hd=" + std::to_string(sp.HD);
+    std::promise<void> hashed;
+    r.hashed = hashed.get_future();
+    r.note = "checking the TPU artifact";
+    auto work = [j, tensor, &ml, hashed = std::move(hashed)]() mutable {
         const auto t0 = std::chrono::steady_clock::now();
-        auto m = std::make_unique<npu::TpuModel>();
+        uint64_t h = 0;
         std::string e;
-        if (!m->open(path, e)) {
-            report(npu::PieceState::Error, "open " + path + ": " + e);
-            return finish("open " + path + ": " + e);
+        bool ok = false;
+        try {
+            ok = npu::qwen3_model_hash(ml.tensor_names(), tensor, h, e);
+        } catch (const std::exception& x) {
+            e = x.what();
         }
-        const double t_open = ms_since(t0);
-        // One zero window: the first invocation pays the weight transfer.
-        std::vector<float> z((size_t)nm * frames, 0.0f);
-        if (!m->write_input(0, z.data(), z.size() * 4, e) || !m->write_input(1, z.data(), (size_t)tokens * 4, e) ||
-            !m->run(e)) {
-            report(npu::PieceState::Error, "warm-up " + path + ": " + e);
-            return finish("warm-up: " + e);
-        }
-        char b[96];
-        std::snprintf(b, sizeof b, ", load %.1f ms, warm-up %.1f ms", t_open, ms_since(t0) - t_open);
-        report(npu::PieceState::Ok, path);
-        out.first = std::move(m);
-        return finish("audio encoder on the TPU (" + path + b + ")");
-    });
+        hashed.set_value();   // the model's tensors are not read after this
+        if (!ok) return NpuResult{nullptr, "no model fingerprint: " + e};
+        if (j.verbose) std::fprintf(stderr, "[fast-%s] npu: encoder digest %.1f ms\n", j.tag.c_str(), ms_since(t0));
+        return npu_open(j, h);
+    };
+    try {
+        r.fut = std::async(std::launch::async, std::move(work));
+    } catch (const std::system_error& e) {   // no thread: the GPU encoder stays in charge
+        r.hashed = {};
+        return note(std::string("no worker thread: ") + e.what());
+    }
 #else
     (void)sp;
     (void)ml;
@@ -593,8 +642,11 @@ std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const ms::MossModel& m, s
 
 std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const q3::Qwen3Model& m, std::string& err) {
     Spec sp = qwen3_spec(m.config);
-    NpuStart ns = npu_start(sp, m.loader);   // TPU artifact open overlaps the GPU load
+    NpuStart ns = npu_start(sp, m.loader);   // TPU artifact hashing + open overlap the GPU load
     auto I = make_impl(std::move(sp), m.loader, err);
+#if defined(STARLING_HAVE_NPU)
+    if (ns.hashed.valid()) ns.hashed.wait();   // the caller releases m's tensors after this
+#endif
     if (!I) return nullptr;
     I->npu_note = std::move(ns.note);
 #if defined(STARLING_HAVE_NPU)

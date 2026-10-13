@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phone half of npu_compile.sh (run under the phone lock):
-#   npu_compile_phone.sh NPU_TOOL TFLITE GGUF|0xHASH EXPECT_HASH KEY DIR APPS WORKDIR
+#   npu_compile_phone.sh NPU_TOOL TFLITE SRC EXPECT_IDENTITY KEY DIR APPS WORKDIR
 # compiles TFLITE, a Qwen3-ASR audio encoder window from export_encoder.py,
 # into an artifact. The phone's compiler can exhaust the phone's memory and
 # panic its kernel (graphs below the size cap did), so this entry point checks
@@ -10,9 +10,11 @@
 #    that window's inputs and output and the operator signature (operator and
 #    tensor counts, operators per builtin) export_encoder.py produces for it;
 #    the artifact's I/O sizes follow from KEY;
-#  * the model fingerprint, from the phone-side GGUF or given (0x..., from the
-#    app's status-*.txt), equals EXPECT_HASH, the fingerprint of the checkpoint
-#    TFLITE was exported from (export_encoder.py --fingerprint);
+#  * SRC is the GGUF the app loads (a path on the phone; starling-npu-tool
+#    fingerprints it there) or its two fingerprints HASH,IDENTITY (0x..., from
+#    the app's status-*.txt). HASH, the digest of the GGUF's encoder tensors,
+#    names the artifact; IDENTITY must equal EXPECT_IDENTITY, the identity of
+#    the checkpoint TFLITE was exported from (export_encoder.py --fingerprint);
 #  * the phone has at least NPU_MIN_MEM_MB (default 4096) available and TFLITE
 #    is no larger than its window's graph has been (0.6B: 640 MB; 1.7B, which
 #    exports with f32 weights: 1300 MB; both compiled cleanly).
@@ -21,7 +23,7 @@
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 8 ] || { sed -n 2,22p "$0" >&2; exit 2; }
+[ $# -eq 8 ] || { sed -n 2,24p "$0" >&2; exit 2; }
 NPU_TOOL=$1; TFL=$2; SRC=$3; EXPECT=$4; KEY=$5; DIR=$6; APPS=$7; T=$8
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
@@ -181,23 +183,29 @@ EOF
 
 # ---- the model it belongs to ----
 EXP=$(canon "$EXPECT")
-[ -n "$EXP" ] || { echo "bad expected fingerprint '$EXPECT'" >&2; exit 2; }
+[ -n "$EXP" ] || { echo "bad expected identity '$EXPECT'" >&2; exit 2; }
 adb shell "mkdir -p $(q "$T") $(q "$DIR")" </dev/null
 adb push -q "$NPU_TOOL" "$T/starling-npu-tool" </dev/null >/dev/null
 TOOL=$(q "$T/starling-npu-tool")
 case $SRC in
-  0x*|0X*) HASH=$SRC ;;
-  *) HASH=$(adb shell "$TOOL fingerprint $(q "$SRC")" </dev/null | tr -d "\r" || true) ;;
+  0x*|0X*)
+    HASH=${SRC%%,*}
+    ID=${SRC#*,}
+    [ "$ID" != "$SRC" ] || { echo "SRC '$SRC': expected HASH,IDENTITY" >&2; exit 2; } ;;
+  *)
+    FP=$(adb shell "$TOOL fingerprint $(q "$SRC")" </dev/null | tr -d "\r" || true)
+    HASH=$(printf '%s\n' "$FP" | sed -n 's/^model_hash //p')
+    ID=$(printf '%s\n' "$FP" | sed -n 's/^identity //p') ;;
 esac
-HC=$(canon "$HASH")
-[ -n "$HC" ] || { echo "fingerprint failed: $HASH" >&2; exit 1; }
-if [ "$HC" != "$EXP" ]; then
-  echo "refusing: the app's model ($HC) is not the checkpoint the graph was exported from ($EXP)." >&2
+HC=$(canon "$HASH"); IC=$(canon "$ID")
+[ -n "$HC" ] && [ -n "$IC" ] || { echo "fingerprint failed: '$HASH' '$ID'" >&2; exit 1; }
+if [ "$IC" != "$EXP" ]; then
+  echo "refusing: the app's model (identity $IC) is not the checkpoint the graph was exported from ($EXP)." >&2
   echo "  A fine-tune or other weights with the same shapes would get the wrong encoder." >&2
   exit 1
 fi
 NAME="qwen3-asr-enc-${HC#0x}.stnpu"
-echo "fingerprint $HC -> $NAME"
+echo "model hash $HC (identity $IC) -> $NAME"
 
 # ---- compile ----
 AVAIL=$(adb shell "grep MemAvailable /proc/meminfo" </dev/null | tr -dc '0-9')
