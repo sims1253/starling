@@ -216,7 +216,11 @@ the `xxhash` package) and the artifact is named by it, so an artifact
 carries the hash of the encoder it was built from; the engine computes the
 same digest from the GGUF it loads (the Python and C++ sides are pinned to
 the same test vectors, `tests/test_npu_fingerprint.py`,
-`cpp/tests/npu_fingerprint_test.cpp`). The contract key's
+`cpp/tests/npu_fingerprint_test.cpp`). The export also stamps the hash and
+the contract key into the `.tflite` (a `starling_npu_provenance` metadata
+entry), and both `npu_compile_phone.sh` and `starling-npu-tool compile`
+refuse a graph stamped for another model than the hash they build, so one
+model's graph cannot be compiled under another's name. The contract key's
 version (`qwen3-asr-enc/2`) moves whenever what an artifact computes for a
 GGUF can change, so artifacts from an older exporter report `stale`. The
 engine computes it only where a TPU can be used (a Qwen3-ASR model, an

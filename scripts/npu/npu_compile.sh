@@ -18,8 +18,8 @@
 # 1. Host: export the encoder graph from MODEL.gguf (export_encoder.py: the
 #    GGUF's own encoder weights, dequantized, stored as fp16; metadata
 #    patched). The export also computes the GGUF's model hash, the digest of
-#    its encoder tensors and metadata the engine computes at load: the
-#    artifact is named
+#    its encoder tensors and metadata the engine computes at load, and
+#    stamps it into the graph: the artifact is named
 #    qwen3-asr-enc-<model hash>.stnpu, so it is only ever used beside the
 #    encoder it was built from. --hash (the hash an app's status-*.txt asked
 #    for) makes the export refuse a GGUF with another one.

@@ -8,8 +8,10 @@
 //   starling-npu-tool compile MODEL.tflite ART --in B,.. --out B,.. --hash 0x.. [--fn F] [--key K]
 //   starling-npu-tool info ART
 // The artifact's model hash (--hash) is the one export_encoder.py printed for
-// the GGUF the graph's weights came from.
+// the GGUF the graph's weights came from; compile refuses a .tflite whose
+// provenance stamp (tflite_provenance.hpp) names another model hash or key.
 #include "gguf_fingerprint.hpp"
+#include "tflite_provenance.hpp"
 #include "tpu_runtime.hpp"
 
 #include <chrono>
@@ -52,6 +54,17 @@ bool compile(const std::string& tflite, const std::string& artifact, ArtifactInf
     std::vector<uint8_t> model;
     if (!read_file(tflite, model)) {
         err = "cannot read " + tflite;
+        return false;
+    }
+    TfliteProvenance prov;
+    if (!read_tflite_provenance(model.data(), model.size(), prov, err)) {
+        err = tflite + ": " + err;
+        return false;
+    }
+    if (prov.model_hash != info.model_hash || (!info.key.empty() && prov.key != info.key)) {
+        char b[64];
+        std::snprintf(b, sizeof b, "0x%016llx", (unsigned long long)prov.model_hash);
+        err = tflite + " was exported for model hash " + b + " ('" + prov.key + "'), not the one to build";
         return false;
     }
     std::vector<uint8_t> bc;

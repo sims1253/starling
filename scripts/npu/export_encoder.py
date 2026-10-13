@@ -13,7 +13,9 @@ are stored as fp16 (the TPU computes in fp16 either way); the converter's
 rejects, is renamed in place. The export also computes the GGUF's model hash
 (the digest cpp/npu computes, below, of the encoder tensors and the encoder
 metadata the graph is built from): the artifact is named by the hash of the
-file its weights and shapes came from.
+file its weights and shapes came from, and the .tflite carries that hash and
+the contract key as a `starling_npu_provenance` metadata entry, which the
+phone-side compile checks.
 
 python -I export_encoder.py MODEL.gguf OUT.tflite [--expect-hash 0xHASH]
     Prints one JSON line: {"key", "in", "out", "model_hash", "gguf", "tflite",
@@ -349,8 +351,178 @@ def find(want, roots, hd=None):
     return None
 
 
-# ---- the contract key (cpp/npu/encoder_contract.hpp) ----
+# ---- provenance stamped into the .tflite (cpp/npu/encoder_contract.hpp) ----
+PROVENANCE_NAME = "starling_npu_provenance"
 CONTRACT = "qwen3-asr-enc/2"   # cpp/npu/encoder_contract.hpp kQwen3EncContract
+
+
+def provenance_text(mh, key):
+    return f"model_hash=0x{int(mh, 16):016x}\nkey={key}\n".encode()
+
+
+class _Fb:
+    """Bounds-checked reads of a .tflite flatbuffer (TFLite schema field
+    numbers: Model.{version 0, operator_codes 1, subgraphs 2, description 3,
+    buffers 4, metadata_buffer 5, metadata 6, signature_defs 7},
+    Metadata.{name 0, buffer 1}, Buffer.{data 0, offset 1, size 2})."""
+
+    def __init__(self, b):
+        self.b = b
+        if len(b) < 8 or bytes(b[4:8]) != b"TFL3":
+            raise ValueError("not a .tflite")
+        self.root = self.u32(0)
+
+    def get(self, fmt, o):
+        if o < 0 or o + struct.calcsize(fmt) > len(self.b):
+            raise ValueError("malformed .tflite")
+        return struct.unpack_from(fmt, self.b, o)[0]
+
+    def u32(self, o):
+        return self.get("<I", o)
+
+    def field(self, t, i):   # position of field i of the table at t, or None
+        vt = t - self.get("<i", t)
+        if 4 + 2 * i >= self.get("<H", vt):
+            return None
+        o = self.get("<H", vt + 4 + 2 * i)
+        return t + o if o else None
+
+    def deref(self, p):
+        return p + self.u32(p)
+
+    def tables(self, p):   # positions of the tables of the vector the field at p points to
+        if p is None:
+            return []
+        v = self.deref(p)
+        n = self.u32(v)
+        if v + 4 + 4 * n > len(self.b):
+            raise ValueError("malformed .tflite")
+        return [self.deref(v + 4 + 4 * k) for k in range(n)]
+
+    def bytes_at(self, p):   # the bytes of the string or [ubyte] the field at p points to
+        v = self.deref(p)
+        n = self.u32(v)
+        if v + 4 + n > len(self.b):
+            raise ValueError("malformed .tflite")
+        return bytes(self.b[v + 4:v + 4 + n])
+
+
+def read_provenance(tfl):
+    """(model hash "0x...", contract key) a .tflite is stamped with; None
+    without a stamp; ValueError for a malformed or repeated one."""
+    import re
+
+    fb = _Fb(tfl)
+    bufs = fb.tables(fb.field(fb.root, 4))
+    found = []
+    for m in fb.tables(fb.field(fb.root, 6)):
+        nm = fb.field(m, 0)
+        if nm is None or fb.bytes_at(nm) != PROVENANCE_NAME.encode():
+            continue
+        bi = fb.field(m, 1)
+        idx = fb.u32(bi) if bi is not None else 0
+        if idx >= len(bufs):
+            raise ValueError("the provenance stamp names a missing buffer")
+        d = fb.field(bufs[idx], 0)
+        found.append(fb.bytes_at(d) if d is not None else b"")
+    if not found:
+        return None
+    if len(found) > 1:
+        raise ValueError("more than one provenance stamp")
+    m = re.fullmatch(rb"model_hash=(0x[0-9a-f]{16})\nkey=([^\n]*)\n", found[0])
+    if not m:
+        raise ValueError("malformed provenance stamp")
+    return m.group(1).decode(), m.group(2).decode()
+
+
+def embed_provenance(tfl, mh, key):
+    """tfl (a .tflite's bytes) with one more metadata entry, PROVENANCE_NAME,
+    whose buffer is provenance_text(mh, key). The original flatbuffer is kept
+    byte for byte, moved back by a multiple of 64 bytes (so every alignment in
+    it holds); in front of it go a new root table with the original's fields
+    (offsets re-pointed) and buffers / metadata vectors extended by the new
+    entry. Flatbuffer offsets are relative, so nothing inside the flatbuffer
+    changes but the file offsets of buffers stored after it (Buffer.offset,
+    as ai-edge-quantizer writes them), which move by the same amount (then a
+    multiple of 4096, keeping their alignment)."""
+    fb = _Fb(tfl)
+    if read_provenance(tfl) is not None:
+        raise ValueError("already stamped")
+    root = fb.root
+    vt = root - fb.get("<i", root)
+    if any(fb.field(root, i) for i in range(8, (fb.get("<H", vt) - 4) // 2)):
+        raise ValueError("the .tflite has Model fields this stamp does not know")
+    pos = {i: fb.field(root, i) for i in range(8)}
+    bufs = fb.tables(pos[4])
+    mds = fb.tables(pos[6])
+    external = []   # positions of Buffer.offset values that are file offsets
+    for t in bufs:
+        off = fb.field(t, 1)
+        if off is not None and fb.get("<Q", off) > 1:
+            if fb.get("<Q", off) >= len(tfl):
+                raise ValueError("malformed .tflite")
+            external.append(off)
+    name = PROVENANCE_NAME.encode()
+    data = provenance_text(mh, key)
+
+    def al(x, a):
+        return (x + a - 1) // a * a
+
+    # Absolute positions of what goes in front; the original's bytes 8.. move to 8 + n.
+    a_vt = 8                                     # root vtable: 8 fields
+    a_rt = a_vt + 20                             # root table: soffset + 8 four-byte slots
+    a_bv = a_rt + 36                             # buffers vector
+    a_mv = a_bv + 4 + 4 * (len(bufs) + 1)        # metadata vector
+    a_mvt = a_mv + 4 + 4 * (len(mds) + 1)        # Metadata vtable (2 fields)
+    a_mt = a_mvt + 8                             # Metadata table: soffset, name, buffer
+    a_bvt = a_mt + 12                            # Buffer vtable (1 field, padded)
+    a_bt = a_bvt + 8                             # Buffer table: soffset, data
+    a_ns = a_bt + 8                              # the name string
+    a_dv = al(a_ns + 4 + len(name) + 1 + 4, 16) - 4   # the data vector, its bytes 16-aligned
+    end = a_dv + 4 + len(data)
+    n = al(end - 8, 4096 if external else 64)
+    out = bytearray(8 + n)
+
+    def put(fmt, o, *v):
+        struct.pack_into(fmt, out, o, *v)
+
+    put("<I", 0, a_rt)
+    out[4:8] = b"TFL3"
+    put("<HH", a_vt, 20, 36)
+    put("<i", a_rt, a_rt - a_vt)
+    for i in range(8):
+        slot = a_rt + 4 + 4 * i
+        if i == 4:
+            put("<I", slot, a_bv - slot)
+        elif i == 6:
+            put("<I", slot, a_mv - slot)
+        elif pos[i] is None:
+            continue
+        elif i == 0:
+            put("<I", slot, fb.u32(pos[0]))       # version, a scalar
+        else:
+            put("<I", slot, fb.deref(pos[i]) + n - slot)
+        put("<H", a_vt + 4 + 2 * i, 4 + 4 * i)
+    for vec_at, targets, new in ((a_bv, bufs, a_bt), (a_mv, mds, a_mt)):
+        put("<I", vec_at, len(targets) + 1)
+        for k, t in enumerate([t + n for t in targets] + [new]):
+            e = vec_at + 4 + 4 * k
+            put("<I", e, t - e)
+    put("<HHHH", a_mvt, 8, 12, 4, 8)
+    put("<i", a_mt, a_mt - a_mvt)
+    put("<I", a_mt + 4, a_ns - (a_mt + 4))
+    put("<I", a_mt + 8, len(bufs))
+    put("<HHH", a_bvt, 6, 8, 4)
+    put("<i", a_bt, a_bt - a_bvt)
+    put("<I", a_bt + 4, a_dv - (a_bt + 4))
+    put("<I", a_ns, len(name))
+    out[a_ns + 4:a_ns + 4 + len(name)] = name
+    put("<I", a_dv, len(data))
+    out[a_dv + 4:end] = data
+    out += tfl[8:]
+    for off in external:
+        put("<Q", off + n, fb.get("<Q", off) + n)
+    return bytes(out)
 
 
 # ---- the graph ----
@@ -536,6 +708,8 @@ def export(path, out_path, expect=None):
         key = b"keep_stablehlo_constant"
         assert b.count(key) <= 1, b.count(key)
         b = b.replace(key, b"x" * len(key))
+        b = embed_provenance(b, mh, ckey)
+        assert read_provenance(b) == (f"0x{int(mh, 16):016x}", ckey)
         open(out_path, "wb").write(b)
 
     print(json.dumps({"key": ckey, "in": [s["NM"] * s["FR"] * 4, s["TOK"] * 4], "out": [s["TOK"] * s["OUT"] * 4],

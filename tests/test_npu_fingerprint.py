@@ -207,3 +207,107 @@ def test_encoder_digest_layout():
             + struct.pack("<q", -1) + b"qwen3.enc.s\0s" + struct.pack("<Q", 2) + b"ab")
     assert ee.encoder_digest([("enc.x", 8, [32, 2], 68, 0x1234)], meta) == ee.fnv1a64(body + tail)
 
+
+# ---- the provenance stamp (cpp/tests/npu_provenance_test.cpp pins the same bytes) ----
+def _minimal_tflite() -> bytes:
+    """A minimal TFLite flatbuffer: Model.version 3, buffers [empty, "1.14.0"],
+    metadata [min_runtime_version -> buffer 1] (the bytes of kBaseTflite in
+    npu_provenance_test.cpp)."""
+    b = bytearray(152)
+
+    def put(fmt, o, *v):
+        struct.pack_into(fmt, b, o, *v)
+
+    put("<I", 0, 28)
+    b[4:8] = b"TFL3"
+    put("<9H", 8, 18, 16, 4, 0, 0, 0, 8, 0, 12)     # Model vtable: version, buffers, metadata
+    put("<i", 28, 20)
+    put("<I", 32, 3)
+    put("<I", 36, 44 - 36)
+    put("<I", 40, 56 - 40)
+    put("<I", 44, 2)
+    put("<I", 48, 68 - 48)
+    put("<I", 52, 80 - 52)
+    put("<I", 56, 1)
+    put("<I", 60, 96 - 60)
+    put("<HH", 64, 4, 4)                            # empty Buffer
+    put("<i", 68, 68 - 64)
+    put("<HHH", 72, 6, 8, 4)                        # Buffer with data
+    put("<i", 80, 80 - 72)
+    put("<I", 84, 140 - 84)
+    put("<HHHH", 88, 8, 12, 4, 8)                   # Metadata
+    put("<i", 96, 96 - 88)
+    put("<I", 100, 108 - 100)
+    put("<I", 104, 1)
+    put("<I", 108, 19)
+    b[112:131] = b"min_runtime_version"
+    put("<I", 140, 6)
+    b[144:150] = b"1.14.0"
+    return bytes(b)
+
+
+PROVENANCE_KEY = "qwen3-asr-enc/2 test"
+PROVENANCE_HASH = "0x0123456789abcdef"
+# embed_provenance(_minimal_tflite(), PROVENANCE_HASH, PROVENANCE_KEY): kStampedTflite in npu_provenance_test.cpp.
+STAMPED_SHA = "2a328bdd6196a8ad4b4d82d95c858000eda497db5489d72ffaa0fef383474740"
+
+
+def test_provenance_round_trips_and_keeps_the_original():
+    import hashlib
+
+    ee = _exporter()
+    base = _minimal_tflite()
+    assert ee.read_provenance(base) is None
+    stamped = ee.embed_provenance(base, PROVENANCE_HASH, PROVENANCE_KEY)
+    assert hashlib.sha256(stamped).hexdigest() == STAMPED_SHA
+    assert ee.read_provenance(stamped) == (PROVENANCE_HASH, PROVENANCE_KEY)
+    # The original flatbuffer follows, byte for byte, moved by a multiple of 64.
+    shift = len(stamped) - len(base)
+    assert shift % 64 == 0 and stamped[8 + shift:] == base[8:]
+    # Every original field is still there: version 3, its buffers and its metadata entry.
+    fb = ee._Fb(stamped)
+    assert fb.u32(fb.field(fb.root, 0)) == 3
+    bufs = fb.tables(fb.field(fb.root, 4))
+    mds = fb.tables(fb.field(fb.root, 6))
+    assert len(bufs) == 3 and len(mds) == 2
+    assert fb.bytes_at(fb.field(mds[0], 0)) == b"min_runtime_version"
+    assert fb.bytes_at(fb.field(bufs[fb.u32(fb.field(mds[0], 1))], 0)) == b"1.14.0"
+    assert fb.field(bufs[0], 0) is None
+    # The stamp's bytes are 16-aligned, like every TFLite buffer.
+    d = fb.field(bufs[2], 0)
+    assert (fb.deref(d) + 4) % 16 == 0
+    with pytest.raises(ValueError, match="already stamped"):
+        ee.embed_provenance(stamped, PROVENANCE_HASH, PROVENANCE_KEY)
+
+
+def test_provenance_moves_buffers_stored_after_the_flatbuffer():
+    """ai-edge-quantizer writes weights after the flatbuffer (Buffer.offset /
+    size are file offsets): the stamp moves them with the file."""
+    ee = _exporter()
+    b = bytearray(4096 + 16)
+
+    def put(fmt, o, *v):
+        struct.pack_into(fmt, b, o, *v)
+
+    put("<I", 0, 24)
+    b[4:8] = b"TFL3"
+    put("<7H", 8, 14, 12, 4, 0, 0, 0, 8)            # Model vtable: version, buffers
+    put("<i", 24, 24 - 8)
+    put("<I", 28, 3)
+    put("<I", 32, 36 - 32)
+    put("<I", 36, 1)
+    put("<I", 40, 56 - 40)
+    put("<5H", 44, 10, 24, 0, 8, 16)                # Buffer vtable: offset, size
+    put("<i", 56, 56 - 44)
+    put("<QQ", 64, 4096, 8)
+    b[4096:4104] = b"EXTERNAL"
+    stamped = ee.embed_provenance(bytes(b), PROVENANCE_HASH, PROVENANCE_KEY)
+    assert ee.read_provenance(stamped) == (PROVENANCE_HASH, PROVENANCE_KEY)
+    fb = ee._Fb(stamped)
+    buf = fb.tables(fb.field(fb.root, 4))[0]
+    off, size = fb.get("<Q", fb.field(buf, 1)), fb.get("<Q", fb.field(buf, 2))
+    assert off % 4096 == 0 and stamped[off:off + size] == b"EXTERNAL"
+    with pytest.raises(ValueError, match="already stamped"):
+        ee.embed_provenance(stamped, PROVENANCE_HASH, PROVENANCE_KEY)
+    with pytest.raises(ValueError, match="not a .tflite"):
+        ee.read_provenance(b"GGUF" * 4)

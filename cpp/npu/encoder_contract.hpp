@@ -19,7 +19,9 @@
 //    GGUF's own encoder tensors (scripts/npu/export_encoder.py exports from
 //    the file and computes the same digest), so an artifact never runs beside
 //    encoder weights or hyperparameters other than the ones it was built
-//    from, a weights-only fine-tune included;
+//    from, a weights-only fine-tune included. The export also stamps the
+//    hash and the key into the .tflite (kProvenanceName metadata), so the
+//    compile step can refuse a graph exported for another model;
 //  * vendor: the firmware's thrGetVendorApiVersion() it was compiled with.
 #pragma once
 
@@ -167,6 +169,13 @@ inline std::string qwen3_enc_key(uint32_t n_mels, uint32_t frames, uint32_t toke
     return b;
 }
 
+// ---- provenance stamped into the exported .tflite ----
+// export_encoder.py adds one TFLite metadata entry of this name whose buffer
+// holds "model_hash=0x<16 hex digits>\nkey=<contract key>\n": the GGUF the
+// graph's weights and shapes came from. npu_compile_phone.sh and
+// starling-npu-tool compile refuse a graph whose stamp names another model
+// (tflite_provenance.hpp).
+inline constexpr const char* kProvenanceName = "starling_npu_provenance";
 
 inline std::string qwen3_enc_artifact_name(uint64_t model_hash) {
     char b[64];

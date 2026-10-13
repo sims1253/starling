@@ -13,7 +13,9 @@
 #  * HASH (0x...) is the model hash export_encoder.py printed for the GGUF
 #    TFLITE's weights came from (the digest of its encoder tensors and
 #    metadata, which the engine computes from the GGUF it loads); it names
-#    the artifact;
+#    the artifact, and TFLITE must carry it: export_encoder.py stamps the
+#    model hash and KEY into the graph's metadata (starling_npu_provenance),
+#    so another model's graph cannot be compiled under this one's hash;
 #  * the phone has at least NPU_MIN_MEM_MB (default 4096) available and TFLITE
 #    is no larger than its window's graph has been (0.6B: 640 MB; 1.7B, which
 #    exports with f32 weights: 1300 MB; both compiled cleanly).
@@ -22,7 +24,7 @@
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 7 ] || { sed -n 2,23p "$0" >&2; exit 2; }
+[ $# -eq 7 ] || { sed -n 2,25p "$0" >&2; exit 2; }
 NPU_TOOL=$1; TFL=$2; HASH=$3; KEY=$4; DIR=$5; APPS=$6; T=$7
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
@@ -41,6 +43,10 @@ canon() {
   h=${h#0x}
   printf '0x%s%s' "$(printf '%*s' $((16 - ${#h})) '' | tr ' ' 0)" "$h"
 }
+
+# ---- the model it belongs to ----
+HC=$(canon "$HASH")
+[ -n "$HC" ] && [ "$HC" != 0x0000000000000000 ] || { echo "bad model hash '$HASH'" >&2; exit 2; }
 
 # ---- the graph: a supported encoder window, and nothing else ----
 # GRAPH: what export_encoder.py produces for the window — tensor count,
@@ -75,14 +81,14 @@ SIZE=$(stat -c %s "$TFL")
 # operators} -> Tensor.{shape, type}, Operator.opcode_index,
 # OperatorCode.{deprecated_builtin_code, custom_code, builtin_code}).
 # shellcheck disable=SC2086
-"$PY" -I - "$TFL" "$MELS" "$FRAMES" "$TOKENS" "$OUTD" $GRAPH <<'EOF' || exit 2
+"$PY" -I - "$TFL" "$HC" "$KEY" "$MELS" "$FRAMES" "$TOKENS" "$OUTD" $GRAPH <<'EOF' || exit 2
 import mmap
 import struct
 import sys
 
-path = sys.argv[1]
-mels, frames, tokens, outd, want_tensors, want_ops = map(int, sys.argv[2:8])
-want_hist = {int(c): int(n) for c, n in (a.split(":") for a in sys.argv[8:])}
+path, want_hash, want_key = sys.argv[1:4]
+mels, frames, tokens, outd, want_tensors, want_ops = map(int, sys.argv[4:10])
+want_hist = {int(c): int(n) for c, n in (a.split(":") for a in sys.argv[10:])}
 NAMES = {0: "ADD", 3: "CONV_2D", 4: "DEPTHWISE_CONV_2D", 6: "DEQUANTIZE", 9: "FULLY_CONNECTED",
          18: "MUL", 22: "RESHAPE", 25: "SOFTMAX", 34: "PAD", 39: "TRANSPOSE", 40: "MEAN", 41: "SUB",
          76: "RSQRT", 99: "SQUARED_DIFFERENCE", 126: "BATCH_MATMUL", 150: "GELU"}
@@ -181,11 +187,39 @@ if (len(tensors), n_ops, hist) != (want_tensors, want_ops, want_hist):
         return ", ".join(f"{NAMES.get(c, c)} {h[c]}" for c in order)
     fail(f"not the encoder window export_encoder.py builds: {len(tensors)} tensors, {n_ops} operators "
          f"({show(hist)}); expected {want_tensors} tensors, {want_ops} operators ({show(want_hist)})")
+
+
+# The provenance export_encoder.py stamps (Model.metadata -> Metadata.{name,
+# buffer} -> Model.buffers[buffer].data): exactly one, naming this model hash
+# and key.
+def blob(p):
+    v = p + u("<I", p)
+    n = u("<I", v)
+    if v + 4 + n > len(m):
+        fail("malformed flatbuffer")
+    return bytes(m[v + 4:v + 4 + n])
+
+
+md, bf = field(root, 6), field(root, 4)
+buffers = tables(bf) if bf else []
+stamps = []
+for t in tables(md) if md else []:
+    nm = field(t, 0)
+    if nm and blob(nm) == b"starling_npu_provenance":
+        bi = field(t, 1)
+        k = u("<I", bi) if bi else 0
+        if k >= len(buffers):
+            fail("buffer index out of range")
+        d = field(buffers[k], 0)
+        stamps.append(blob(d) if d else b"")
+if len(stamps) != 1:
+    fail(f"{len(stamps)} provenance stamps, expected 1 (export the graph with this export_encoder.py)")
+want = f"model_hash={want_hash}\nkey={want_key}\n".encode()
+if stamps[0] != want:
+    fail(f"the graph was exported for {stamps[0]!r}, not {want!r}: another model's graph cannot be "
+         f"compiled under this model hash")
 EOF
 
-# ---- the model it belongs to ----
-HC=$(canon "$HASH")
-[ -n "$HC" ] && [ "$HC" != 0x0000000000000000 ] || { echo "bad model hash '$HASH'" >&2; exit 2; }
 NAME="qwen3-asr-enc-${HC#0x}.stnpu"
 echo "model hash $HC -> $NAME"
 
