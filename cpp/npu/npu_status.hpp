@@ -16,7 +16,7 @@ namespace starling::npu {
 
 enum class PieceState { Ok, Missing, Stale, Error };
 
-// piece: "qwen3-asr-enc", "qwen3-llm-prefill".
+// piece: "qwen3-asr-enc".
 // model: what the compile script needs to pick the checkpoint, as
 // space-separated key=value pairs (e.g. "arch=qwen3 hd=1024").
 void report_piece(const std::string& piece, uint64_t model_hash, const std::string& model, PieceState state,

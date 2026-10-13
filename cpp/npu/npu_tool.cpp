@@ -9,7 +9,6 @@
 //   npu_tool run ART [--mode mmap|fdoff|fd] [--runs N] [--out PREFIX] [IN0 IN1 ...]
 //   npu_tool repack ART OUT [--pad N]
 //   npu_tool info ART
-#include "encoder_contract.hpp"
 #include "gguf_fingerprint.hpp"
 #include "npu_probe.hpp"
 #include "tpu_runtime.hpp"
@@ -32,7 +31,7 @@ static std::vector<uint64_t> sizes(const char* s) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: npu_tool fingerprint MODEL.gguf [enc|llm]\n"
+                     "usage: npu_tool fingerprint MODEL.gguf\n"
                      "       npu_tool compile MODEL.tflite ART --in B,.. --out B,.. [--fn F] [--key K]\n"
                      "                        [--gguf MODEL.gguf | --hash 0x..] [--pad N]\n"
                      "       npu_tool run ART [--mode mmap|fdoff|fd] [--runs N] [--out PREFIX] [IN...]\n"
@@ -44,14 +43,8 @@ int main(int argc, char** argv) {
     bool ok = false;
     std::string rep, err;
     if (cmd == "fingerprint") {
-        // npu_tool fingerprint MODEL.gguf [enc|llm]
         uint64_t h = 0;
-        const std::string set = argc >= 4 ? argv[3] : "enc";
-        if (set == "llm")
-            ok = gguf_fingerprint(argv[2], kQwen3LlmFingerprintTensors,
-                                  sizeof kQwen3LlmFingerprintTensors / sizeof kQwen3LlmFingerprintTensors[0], h, err);
-        else
-            ok = gguf_fingerprint(argv[2], h, err);
+        ok = gguf_fingerprint(argv[2], h, err);
         char b[64];
         std::snprintf(b, sizeof b, "0x%016llx\n", (unsigned long long)h);
         rep = ok ? std::string(b) : err + "\n";
@@ -67,12 +60,6 @@ int main(int argc, char** argv) {
             else if (!std::strcmp(argv[i], "--key")) key = argv[i + 1];
             else if (!std::strcmp(argv[i], "--hash")) hash = std::strtoull(argv[i + 1], nullptr, 0);
             else if (!std::strcmp(argv[i], "--gguf") && !gguf_fingerprint(argv[i + 1], hash, err)) {
-                std::fprintf(stderr, "%s\n", err.c_str());
-                return 1;
-            } else if (!std::strcmp(argv[i], "--gguf-llm") &&
-                       !gguf_fingerprint(argv[i + 1], kQwen3LlmFingerprintTensors,
-                                         sizeof kQwen3LlmFingerprintTensors / sizeof kQwen3LlmFingerprintTensors[0],
-                                         hash, err)) {
                 std::fprintf(stderr, "%s\n", err.c_str());
                 return 1;
             }

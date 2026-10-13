@@ -23,12 +23,6 @@ inline constexpr const char* kQwen3EncFingerprintTensors[] = {
     "enc.conv1.bias", "enc.ln_post.weight", "enc.ln_post.bias", "proj.linear_2.bias", "enc.blk.0.attn_norm.weight",
 };
 
-// The Qwen3 LLM trunk (prefill artifacts): its norms, F32 in every GGUF.
-inline constexpr const char* kQwen3LlmFingerprintTensors[] = {
-    "llm.final_norm.weight", "llm.blk.0.attn_norm.weight", "llm.blk.0.attn.q_norm.weight",
-    "llm.blk.0.attn.k_norm.weight", "llm.blk.1.attn_norm.weight",
-};
-
 inline uint64_t fnv1a_update(uint64_t h, const void* data, size_t size) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
@@ -41,25 +35,6 @@ inline std::string qwen3_enc_key(uint32_t n_mels, uint32_t frames, uint32_t toke
     char b[200];
     std::snprintf(b, sizeof b, "qwen3-asr-enc/1 mels=%u frames=%u tokens=%u d=%u L=%u H=%u ff=%u ds=%u out=%u", n_mels,
                   frames, tokens, d, layers, heads, ff, ds, out);
-    return b;
-}
-
-// One LLM prefill segment of one token bucket: layers [l0, l1), input
-// [1, sb, hd] residual rows, outputs the residual rows after layer l1 - 1 and
-// the K/V cache rows of its layers. A bucket is the chain of segments
-// covering every layer (the phone's compiler takes ~1 GB of weights at most).
-inline std::string qwen3_prefill_key(uint32_t sb, uint32_t l0, uint32_t l1, uint32_t hd, uint32_t nh, uint32_t kv,
-                                     uint32_t hdim, uint32_t ff) {
-    char b[200];
-    std::snprintf(b, sizeof b, "qwen3-llm-prefill/1 sb=%u layers=%u-%u hd=%u nh=%u kv=%u hdim=%u ff=%u", sb, l0, l1,
-                  hd, nh, kv, hdim, ff);
-    return b;
-}
-
-inline std::string qwen3_prefill_artifact_name(uint64_t model_hash, uint32_t sb, uint32_t l0, uint32_t l1) {
-    char b[96];
-    std::snprintf(b, sizeof b, "qwen3-llm-prefill-%016llx-sb%u-l%u-%u.stnpu", (unsigned long long)model_hash, sb, l0,
-                  l1);
     return b;
 }
 

@@ -66,12 +66,6 @@ bool skip_value(Reader& r, uint32_t t, uint32_t* u32_out) {
 }  // namespace
 
 bool gguf_fingerprint(const std::string& path, uint64_t& hash, std::string& err) {
-    return gguf_fingerprint(path, kQwen3EncFingerprintTensors,
-                            sizeof kQwen3EncFingerprintTensors / sizeof kQwen3EncFingerprintTensors[0], hash, err);
-}
-
-bool gguf_fingerprint(const std::string& path, const char* const* names, size_t n_names, uint64_t& hash,
-                      std::string& err) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open " + path; return false; }
     Reader r{f};
@@ -103,8 +97,7 @@ bool gguf_fingerprint(const std::string& path, const char* const* names, size_t 
     long pos = std::ftell(f);
     const uint64_t data0 = ((uint64_t)pos + alignment - 1) / alignment * alignment;
     hash = kFnvBasis;
-    for (size_t ni = 0; ni < n_names; ++ni) {
-        const char* name = names[ni];
+    for (const char* name : kQwen3EncFingerprintTensors) {
         auto it = infos.find(name);
         if (it == infos.end()) { std::fclose(f); err = std::string("GGUF lacks ") + name; return false; }
         if (it->second.type != 0) { std::fclose(f); err = std::string(name) + " is not F32"; return false; }

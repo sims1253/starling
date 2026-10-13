@@ -29,8 +29,7 @@
 # Qwen/Qwen3-ASR-1.7B-hf; weights and config only). Nothing is precompiled or
 # shipped: the phone's own compiler builds every artifact for its firmware,
 # and after a firmware update the app reports the files as stale until this
-# is rerun. The opt-in LLM prefill (Qwen3-ASR-0.6B) is npu_compile.sh
-# --prefill 128.
+# is rerun.
 #
 # Env: PY (python with litert-torch, ai-edge-quantizer, transformers, torch,
 # huggingface_hub), NPU_TOOL (see npu_compile.sh).
@@ -44,7 +43,7 @@ while [ $# -gt 0 ]; do
     --app) ONLY=$2; shift ;;
     --wait) WAIT=$2; shift ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n 2,36p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,35p "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
   shift

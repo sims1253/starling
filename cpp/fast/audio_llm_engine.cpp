@@ -28,11 +28,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
 #include <functional>
 #include <future>
 #include <map>
-#include <tuple>
 #include <mutex>
 #include <thread>
 
@@ -430,48 +428,6 @@ struct AudioLlmEngine::Impl {
         return false;
 #endif
     }
-    // ---- Qwen3 LLM prefill on the TPU (with the TPU encoder) ----
-    // Opt-in artifacts qwen3-llm-prefill-<llm fingerprint>-sb<SB>-l<a>-<b>.stnpu,
-    // segments of layers [a, b) chained per token bucket SB: the prompt rows
-    // (padded to SB) in, every layer's K/V cache rows and the final residual
-    // rows out. The K/V rows go straight
-    // into kcache/vcache, the last prompt row into lx, and a short GPU
-    // recording takes the first token (lm_head + dec_next). Prompts longer
-    // than the largest bucket, STARLING_NPU_PREFILL=0 or any error: the GPU
-    // prefill.
-#if defined(STARLING_HAVE_NPU)
-    struct NpuPrefill {
-        struct Seg {
-            uint32_t l0 = 0, l1 = 0;   // layers [l0, l1)
-            std::unique_ptr<npu::TpuModel> m;
-            int out_h = 0, out_kv = 1;
-        };
-        uint32_t sb = 0;
-        std::vector<Seg> segs;   // consecutive, covering every layer
-    };
-    std::vector<NpuPrefill> npu_pf;   // ascending sb
-    std::future<std::pair<std::vector<NpuPrefill>, std::string>> npu_pf_pending;
-#endif
-    std::vector<float> npu_prompt_rows;   // LLM input rows of the prefix, then the suffix [n][HD]
-    double npu_pf_ms[3] = {};             // last TPU prefill: input write, TPU run, K/V hand-off
-    bool npu_prefill_ready() {
-#if defined(STARLING_HAVE_NPU)
-        if (npu_pf_pending.valid()) {
-            auto r = npu_pf_pending.get();
-            npu_pf = std::move(r.first);
-            if (!r.second.empty()) npu_note += "; " + r.second;
-        }
-        return !npu_pf.empty();
-#else
-        return false;
-#endif
-    }
-    // TPU prefill of the S-row prompt with the TPU encoder's audio rows: the
-    // K/V cache rows [0, S) of every layer and lx row S-1. `sb` reports the
-    // bucket; false with an empty err when no bucket holds S rows.
-    bool npu_prefill(const std::vector<float>& audio, uint32_t A, uint32_t S, uint32_t& sb, std::string& err);
-    // First token from lx row S-1 (after npu_prefill).
-    bool record_first_token(uint32_t S, Rec& r, std::string& err);
     // Encoder rows [A][EOUT] for mel frames [0, T) on the TPU.
     bool npu_encode(const MelView& mel, int64_t T, uint32_t A, std::vector<float>& rows, int& windows,
                     std::string& err);
@@ -595,165 +551,6 @@ NpuStart npu_start(const Spec& sp, const ggml::ModelLoader& ml) {
     return r;
 }
 
-// Prefill buckets for the Qwen3 trunk (see Impl::npu_pf): validated
-// synchronously, opened + warmed up on a worker thread.
-struct NpuPrefillStart {
-    std::string note;
-    std::vector<float> prompt_rows;
-#if defined(STARLING_HAVE_NPU)
-    std::future<std::pair<std::vector<AudioLlmEngine::Impl::NpuPrefill>, std::string>> fut;
-#endif
-};
-
-// open = false (no TPU encoder to pair with): only report the files' state.
-NpuPrefillStart npu_prefill_start(const Spec& sp, const ggml::ModelLoader& ml, bool open) {
-    NpuPrefillStart r;
-#if defined(STARLING_HAVE_NPU)
-    if (const char* e = std::getenv("STARLING_NPU"); e && std::strcmp(e, "0") == 0) return r;
-    if (const char* e = std::getenv("STARLING_NPU_PREFILL"); e && std::strcmp(e, "0") == 0) {
-        r.note = "TPU prefill disabled (STARLING_NPU_PREFILL=0)";
-        return r;
-    }
-    if (std::strcmp(sp.tag, "qwen3") != 0 || !sp.qk_norm) return r;
-    const bool verbose = env_on("STARLING_FAST_VERBOSE") || env_on("STARLING_FAST_TIMING");
-    const std::string tag = sp.tag;
-    uint64_t h = npu::kFnvBasis;
-    for (const char* name : npu::kQwen3LlmFingerprintTensors) {
-        const ggml_tensor* t = ml.tensor(name);
-        if (!t || t->type != GGML_TYPE_F32 || !t->data) return r;
-        h = npu::fnv1a_update(h, t->data, ggml_nbytes(t));
-    }
-    const std::string dirs = npu::npu_dirs();
-    const std::string model = "arch=qwen3 hd=" + std::to_string(sp.HD);
-    auto report = [h, model](npu::PieceState st, const std::string& msg) {
-        npu::report_piece("qwen3-llm-prefill", h, model, st, msg);
-    };
-    char pfx[64];
-    std::snprintf(pfx, sizeof pfx, "qwen3-llm-prefill-%016llx-sb", (unsigned long long)h);
-    std::string mismatch;   // files of this model that do not fit (older exporter)
-    // sb -> (l0 -> {l1, path}): segment files of each bucket.
-    std::map<uint32_t, std::map<uint32_t, std::pair<uint32_t, std::string>>> found;
-    std::string err;
-    for (size_t b = 0; b <= dirs.size();) {
-        size_t e = dirs.find(':', b);
-        if (e == std::string::npos) e = dirs.size();
-        const std::string dir = dirs.substr(b, e - b);
-        b = e + 1;
-        DIR* dp = dir.empty() ? nullptr : opendir(dir.c_str());
-        if (!dp) continue;
-        while (const dirent* de = readdir(dp)) {
-            const std::string n = de->d_name;
-            unsigned sb = 0, l0 = 0, l1 = 0;
-            char tail[16] = {};
-            if (n.rfind(pfx, 0) != 0 ||
-                std::sscanf(n.c_str() + std::strlen(pfx), "%u-l%u-%u%15s", &sb, &l0, &l1, tail) != 4 ||
-                std::strcmp(tail, ".stnpu") != 0 || sb == 0 || l1 <= l0 || l1 > sp.NL || found[sb].count(l0))
-                continue;
-            const std::string path = dir + "/" + n;
-            npu::ArtifactInfo info;
-            if (!npu::read_artifact_info(path, info, err)) continue;
-            const uint64_t hb = (uint64_t)sb * sp.HD * 4, kb = 2ull * (l1 - l0) * sp.NKV * sb * sp.HDIM * 4;
-            const bool sizes = info.in_bytes == std::vector<uint64_t>{hb} && info.out_bytes.size() == 2 &&
-                               std::min(info.out_bytes[0], info.out_bytes[1]) == hb &&
-                               std::max(info.out_bytes[0], info.out_bytes[1]) == kb;
-            if (info.model_hash != h || !sizes ||
-                info.key != npu::qwen3_prefill_key(sb, l0, l1, sp.HD, sp.NH, sp.NKV, sp.HDIM, sp.FF)) {
-                mismatch = path + " was built by another exporter version";
-                continue;
-            }
-            found[sb][l0] = {l1, path};
-        }
-        closedir(dp);
-    }
-    // Buckets whose segments chain over every layer.
-    std::map<uint32_t, std::vector<std::tuple<uint32_t, uint32_t, std::string>>> chains;   // sb -> [(l0, l1, path)]
-    for (auto& [sb, segs] : found) {
-        std::vector<std::tuple<uint32_t, uint32_t, std::string>> c;
-        uint32_t l = 0;
-        while (l < sp.NL && segs.count(l)) {
-            c.emplace_back(l, segs[l].first, segs[l].second);
-            l = segs[l].first;
-        }
-        if (l == sp.NL) chains[sb] = std::move(c);
-    }
-    if (chains.empty()) {
-        if (!mismatch.empty()) {
-            report(npu::PieceState::Stale, mismatch);
-            r.note = "TPU prefill file stale, recompile via adb: " + mismatch;
-        } else {
-            report(npu::PieceState::Missing, std::string("no ") + pfx + "* chain (optional: --prefill)");
-        }
-        return r;
-    }
-    if (!open || !npu::load_southbound(err)) return r;
-    const std::string vendor = npu::vendor_version();
-    // Prompt text rows from the GGUF's input table (host copy; scaled like the device table).
-    const ggml_tensor* et = ml.tensor("llm.embed.weight");
-    const ggml_type_traits* tt = et ? ggml_get_type_traits(et->type) : nullptr;
-    if (!et || !et->data || !tt || !tt->to_float) return r;
-    const size_t row = ggml_row_size(et->type, sp.HD);
-    std::vector<int32_t> ids = sp.prefix;
-    ids.insert(ids.end(), sp.suffix.begin(), sp.suffix.end());
-    r.prompt_rows.resize(ids.size() * sp.HD);
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] < 0 || ids[i] >= et->ne[1]) return NpuPrefillStart{};
-        tt->to_float((const char*)et->data + (size_t)ids[i] * row, r.prompt_rows.data() + i * sp.HD, sp.HD);
-        for (uint32_t d = 0; d < sp.HD; ++d) r.prompt_rows[i * sp.HD + d] *= sp.emb_mult;
-    }
-    const uint32_t HD = sp.HD;
-    r.fut = std::async(std::launch::async, [chains, vendor, HD, tag, verbose, report]() {
-        std::pair<std::vector<AudioLlmEngine::Impl::NpuPrefill>, std::string> out;
-        std::string notes;
-        bool stale = false;
-        for (const auto& [sb, chain] : chains) {
-            const auto t0 = std::chrono::steady_clock::now();
-            AudioLlmEngine::Impl::NpuPrefill p;
-            p.sb = sb;
-            std::vector<float> z((size_t)sb * HD, 0.0f);
-            bool ok = true;
-            for (const auto& [l0, l1, path] : chain) {
-                npu::ArtifactInfo info;
-                std::string e;
-                if (!npu::read_artifact_info(path, info, e) || info.vendor != vendor) {
-                    notes += "TPU file stale, recompile via adb: " + path + " was compiled for TPU firmware " +
-                             info.vendor + ", this phone has " + vendor + "; ";
-                    ok = false;
-                    stale = true;
-                    break;
-                }
-                AudioLlmEngine::Impl::NpuPrefill::Seg s;
-                s.l0 = l0;
-                s.l1 = l1;
-                s.out_h = info.out_bytes[0] == (uint64_t)sb * HD * 4 ? 0 : 1;
-                s.out_kv = 1 - s.out_h;
-                s.m = std::make_unique<npu::TpuModel>();
-                if (!s.m->open(path, npu::LoadMode::Mmap, e) || !s.m->write_input(0, z.data(), z.size() * 4, e) ||
-                    !s.m->run(e)) {
-                    notes += path + ": " + e + "; ";
-                    ok = false;
-                    break;
-                }
-                p.segs.push_back(std::move(s));
-            }
-            if (!ok) continue;
-            char b[160];
-            std::snprintf(b, sizeof b, "LLM prefill bucket %u on the TPU (%zu segments, load+warm-up %.1f ms)", sb,
-                          p.segs.size(), ms_since(t0));
-            if (verbose) std::fprintf(stderr, "[fast-%s] npu: %s\n", tag.c_str(), b);
-            out.first.push_back(std::move(p));
-        }
-        if (!out.first.empty()) report(npu::PieceState::Ok, std::to_string(out.first.size()) + " bucket(s)");
-        else if (!notes.empty()) report(stale ? npu::PieceState::Stale : npu::PieceState::Error, notes);
-        out.second = notes;
-        return out;
-    });
-#else
-    (void)sp;
-    (void)ml;
-#endif
-    return r;
-}
-
 std::unique_ptr<AudioLlmEngine::Impl> make_impl(Spec sp, const ggml::ModelLoader& ml, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
     std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
@@ -788,15 +585,11 @@ std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const ms::MossModel& m, s
 std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const q3::Qwen3Model& m, std::string& err) {
     Spec sp = qwen3_spec(m.config);
     NpuStart ns = npu_start(sp, m.loader);   // TPU artifact open overlaps the GPU load
-    NpuPrefillStart ps = npu_prefill_start(sp, m.loader, ns.note.rfind("opening ", 0) == 0);
     auto I = make_impl(std::move(sp), m.loader, err);
     if (!I) return nullptr;
     I->npu_note = std::move(ns.note);
-    if (!ps.note.empty()) I->npu_note += (I->npu_note.empty() ? "" : "; ") + ps.note;
-    I->npu_prompt_rows = std::move(ps.prompt_rows);
 #if defined(STARLING_HAVE_NPU)
     I->npu_pending = std::move(ns.fut);
-    I->npu_pf_pending = std::move(ps.fut);
 #endif
     std::unique_ptr<AudioLlmEngine> e(new AudioLlmEngine());
     e->impl_ = std::move(I);
@@ -854,7 +647,6 @@ std::string AudioLlmEngine::describe() const {
                   impl_->ctx->info().name.c_str(), impl_->ar.total_bytes() / 1048576.0);
     std::string d = buf;
     if (impl_->npu_ready()) d += " encoder=npu";
-    if (impl_->npu_prefill_ready()) d += " prefill=npu";
     if (impl_->npu_note.find("stale") != std::string::npos) d += " [" + impl_->npu_note + "]";
     return d;
 }
@@ -1660,104 +1452,6 @@ bool AudioLlmEngine::Impl::record_prefill_rows(int S, Rec& r, std::string& err) 
     return true;
 }
 
-bool AudioLlmEngine::Impl::record_first_token(uint32_t S, Rec& r, std::string& err) {
-    r.A = 0;
-    r.S = (int)S;
-    r.rec = std::make_unique<vk::Recording>(*ctx);
-    vk::Recording& rc = *r.rec;
-    rc.begin();
-    if (!lm_head(rc, vk::Ref(lx), (S - 1) * HD, err)) return false;
-    rc.barrier();
-    if (!dec_next(rc, err)) return false;
-    rc.end();
-    return true;
-}
-
-bool AudioLlmEngine::Impl::npu_prefill(const std::vector<float>& audio, uint32_t A, uint32_t S, uint32_t& sb,
-                                       std::string& err) {
-#if defined(STARLING_HAVE_NPU)
-    err.clear();
-    NpuPrefill* p = nullptr;
-    for (NpuPrefill& c : npu_pf)
-        if (c.sb >= S) { p = &c; break; }
-    if (!p) return false;   // no bucket: GPU prefill
-    sb = p->sb;
-    const uint32_t npre = (uint32_t)sp.prefix.size(), nsuf = (uint32_t)sp.suffix.size();
-    if (npu_prompt_rows.size() != (size_t)(npre + nsuf) * HD || audio.size() != (size_t)A * HD) {
-        err = "prompt rows do not match the prompt";
-        return false;
-    }
-    npu_pf_ms[0] = npu_pf_ms[1] = npu_pf_ms[2] = 0;
-    auto t = std::chrono::steady_clock::now();
-    auto lap = [&](double& acc) {
-        const auto n = std::chrono::steady_clock::now();
-        acc += std::chrono::duration<double, std::milli>(n - t).count();
-        t = n;
-    };
-    std::vector<float> x((size_t)p->sb * HD, 0.0f);
-    std::copy(npu_prompt_rows.begin(), npu_prompt_rows.begin() + (size_t)npre * HD, x.begin());
-    std::copy(audio.begin(), audio.end(), x.begin() + (size_t)npre * HD);
-    std::copy(npu_prompt_rows.begin() + (size_t)npre * HD, npu_prompt_rows.end(),
-              x.begin() + (size_t)(npre + A) * HD);
-    std::vector<ggml_fp16_t> tmp;
-    for (size_t si = 0; si < p->segs.size(); ++si) {
-        NpuPrefill::Seg& s = p->segs[si];
-        if (si == 0) {
-            if (!s.m->write_input(0, x.data(), x.size() * 4, err)) return false;
-        } else {   // the previous segment's residual rows
-            NpuPrefill::Seg& prev = p->segs[si - 1];
-            const void* hp = nullptr;
-            if (!prev.m->map_output(prev.out_h, &hp, err)) return false;
-            const bool ok = s.m->write_input(0, hp, x.size() * 4, err);
-            prev.m->unmap_output(prev.out_h);
-            if (!ok) return false;
-        }
-        lap(npu_pf_ms[0]);
-        if (!s.m->run(err)) return false;
-        lap(npu_pf_ms[1]);
-        // K/V rows [0, S) of each (layer, kv head) into the f16 caches
-        // ([layer][kv head][MAXPOS][HDIM]); TPU rows: [2*(layer-l0) + {K,V}][kv head][sb][HDIM].
-        const void* kvp = nullptr;
-        if (!s.m->map_output(s.out_kv, &kvp, err)) return false;
-        const float* kv = static_cast<const float*>(kvp);
-        bool ok = true;
-        for (uint32_t l = s.l0; l < s.l1 && ok; ++l)
-            for (uint32_t c = 0; c < 2 && ok; ++c) {
-                vk::Buffer& cache = c == 0 ? kcache : vcache;
-                for (uint32_t g = 0; g < NKV && ok; ++g) {
-                    const float* src = kv + ((size_t)(2 * (l - s.l0) + c) * NKV + g) * p->sb * HDIM;
-                    const size_t dst = ((size_t)l * NKV * MAXPOS + (size_t)g * MAXPOS) * HDIM;
-                    const size_t n = (size_t)S * HDIM;
-                    if (cache.host) {
-                        ggml_fp32_to_fp16_row(src, (ggml_fp16_t*)cache.host + dst, (int64_t)n);
-                    } else {
-                        tmp.resize(n);
-                        ggml_fp32_to_fp16_row(src, tmp.data(), (int64_t)n);
-                        ok = ctx->upload(cache, dst * 2, tmp.data(), n * 2, err);
-                    }
-                }
-            }
-        s.m->unmap_output(s.out_kv);
-        if (!ok) return false;
-        lap(npu_pf_ms[2]);
-    }
-    if (kcache.host) ctx->flush(kcache, 0, kcache.size);
-    if (vcache.host) ctx->flush(vcache, 0, vcache.size);
-    NpuPrefill::Seg& last = p->segs.back();
-    const void* hp = nullptr;
-    if (!last.m->map_output(last.out_h, &hp, err)) return false;
-    const bool ok =
-        ctx->upload(lx, (size_t)(S - 1) * HD * 4, static_cast<const float*>(hp) + (size_t)(S - 1) * HD, HD * 4, err);
-    last.m->unmap_output(last.out_h);
-    lap(npu_pf_ms[2]);
-    return ok;
-#else
-    (void)audio; (void)A; (void)S; (void)sb;
-    err.clear();
-    return false;
-#endif
-}
-
 bool AudioLlmEngine::Impl::record_prefill_npu(uint32_t A, Rec& r, std::string& err) {
     const uint32_t npre = (uint32_t)sp.prefix.size();
     const uint32_t S = npre + A + (uint32_t)sp.suffix.size();
@@ -2454,35 +2148,6 @@ bool AudioLlmEngine::generate(const float* pcm, size_t n, uint32_t budget, std::
         std::string nerr;
         if (I.npu_encode(mel, T, (uint32_t)A, rows, windows, nerr)) {
             const double t_enc = ms_since(t0);
-            if (I.npu_prefill_ready()) {
-                uint32_t sb = 0;
-                std::string perr;
-                if (!I.ensure(0, 0, S, err)) return false;
-                if (I.npu_prefill(rows, (uint32_t)A, (uint32_t)S, sb, perr)) {
-                    const double t_pf = ms_since(t0);
-                    Impl::Rec* rec1 =
-                        I.prefill_rec({-2, S}, [&](Impl::Rec& r) { return I.record_first_token((uint32_t)S, r, err); });
-                    if (!rec1) return false;
-                    int rounds = 0;
-                    double t_pre = 0;
-                    if (!I.run(*rec1->rec, (uint32_t)S, max_new, t0, out_ids, eos, rounds, t_pre, err)) return false;
-                    if (timing)
-                        std::fprintf(stderr,
-                                     "[fast-%s] audio=%.2fs mel=%.1fms enc+prefill=%.1fms (npu enc=%.1fms in %d windows, "
-                                     "npu prefill=%.1fms in bucket %u [in %.1f, tpu %.1f, kv %.1f], first token=%.1fms) "
-                                     "decode=%.1fms (%zu tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",
-                                     tag, n / 16000.0, t_mel, t_pre - t_mel, t_enc - t_mel, windows, t_pf - t_enc, sb,
-                                     I.npu_pf_ms[0], I.npu_pf_ms[1], I.npu_pf_ms[2], t_pre - t_pf, ms_since(t0) - t_pre,
-                                     out_ids.size(), rounds, ms_since(t0), (long long)T, A, S);
-                    return true;
-                }
-                if (!perr.empty()) {
-                    std::fprintf(stderr, "[fast-%s] npu prefill: %s; the GPU prefill takes over\n", tag, perr.c_str());
-#if defined(STARLING_HAVE_NPU)
-                    I.npu_pf.clear();
-#endif
-                }
-            }
             if (!I.ensure(0, 0, S, err)) return false;
             Impl::Rec* rec =
                 I.prefill_rec({-1, A}, [&](Impl::Rec& r) { return I.record_prefill_npu((uint32_t)A, r, err); });

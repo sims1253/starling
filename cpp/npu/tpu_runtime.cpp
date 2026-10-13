@@ -471,21 +471,6 @@ bool TpuModel::read_output(size_t i, void* data, size_t bytes, std::string& err)
     return true;
 }
 
-bool TpuModel::map_output(size_t i, const void** data, std::string& err) {
-    void* p = nullptr;
-    if (i >= out_.size() ||
-        AHardwareBuffer_lock(out_[i].ahwb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &p) != 0) {
-        err = "map_output: lock failed";
-        return false;
-    }
-    *data = p;
-    return true;
-}
-
-void TpuModel::unmap_output(size_t i) {
-    if (i < out_.size()) AHardwareBuffer_unlock(out_[i].ahwb, nullptr);
-}
-
 bool TpuModel::run(std::string& err) {
     auto* ic = static_cast<ThrInvocationContext*>(ictx_);
     if (!ic) {
