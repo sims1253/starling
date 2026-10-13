@@ -38,7 +38,7 @@
 #    makes the engine ignore it, run the GPU, and say so (logcat tag
 #    StarlingNpu, status-*.txt beside the artifacts).
 #
-# Env: ANDROID_SERIAL; NPU_TOOL (default build-android-npu/starling-npu-tool,
+# Env: ANDROID_SERIAL; NPU_TOOL (default build-android/starling-npu-tool,
 # built with `cmake --build <android build> --target starling-npu-tool`);
 # PY (python with litert-torch, ai-edge-quantizer, transformers, torch);
 # NPU_MIN_MEM_MB (npu_compile_phone.sh); STARLING_PHONE_LOCK_HELD=1 when the
@@ -63,7 +63,7 @@ if [ -n "$GGUF" ] && [ -z "$HASH$ID" ]; then SRC=$GGUF
 elif [ -z "$GGUF" ] && [ -n "$HASH" ] && [ -n "$ID" ]; then SRC=$HASH,$ID
 else echo "need --gguf PHONE_GGUF, or --hash 0xHASH and --identity 0xIDENTITY" >&2; exit 2
 fi
-NPU_TOOL=${NPU_TOOL:-$ROOT/build-android-npu/starling-npu-tool}
+NPU_TOOL=${NPU_TOOL:-$ROOT/build-android/starling-npu-tool}
 PY=${PY:-python3}
 [ -x "$NPU_TOOL" ] || { echo "missing $NPU_TOOL (build target starling-npu-tool)" >&2; exit 1; }
 WORK=$(mktemp -d /tmp/npu-compile.XXXXXX)
