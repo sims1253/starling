@@ -182,6 +182,8 @@ class Gguf:
             ne = [self._get("<Q") for _ in range(self._get("<I"))]
             infos.append((name, ne, self._get("<I"), self._get("<Q")))
         align = int(self.kv.get("general.alignment", 32))
+        if align <= 0:
+            raise ValueError(f"{path}: bad general.alignment {align}")
         data0 = (self.pos + align - 1) // align * align
         for name, ne, typ, off in infos:
             try:

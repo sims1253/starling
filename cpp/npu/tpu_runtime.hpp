@@ -48,7 +48,7 @@ public:
     // into Vulkan as external memory).
     bool write_input(size_t i, const void* data, size_t bytes, std::string& err);
     bool read_output(size_t i, void* data, size_t bytes, std::string& err);
-    AHardwareBuffer* output_ahwb(size_t i) const { return out_[i].ahwb; }
+    AHardwareBuffer* output_ahwb(size_t i) const { return i < out_.size() ? out_[i].ahwb : nullptr; }
     bool run(std::string& err);   // synchronous: prepare, invoke, wait
     const ArtifactInfo& info() const { return info_; }
 

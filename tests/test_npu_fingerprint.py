@@ -111,6 +111,20 @@ def test_model_hash_matches_the_cpp_vectors(tmp_path, monkeypatch):
         ee.model_hash(str(paths[5]))
 
 
+def test_a_zero_alignment_is_a_malformed_gguf(tmp_path):
+    ee = _exporter()
+    path = tmp_path / "zero-align.gguf"
+    w = gguf.GGUFWriter(str(path), "qwen3")
+    w.add_uint32("general.alignment", 0)
+    w.add_tensor("enc.conv1.bias", np.zeros(4, np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    with pytest.raises(ValueError, match="bad general.alignment 0"):
+        ee.model_hash(str(path))
+
+
 def test_another_layer_norm_eps_is_another_model(tmp_path):
     """Two GGUFs with identical encoder tensors but another epsilon build
     different graphs, so they must not share an artifact."""
@@ -210,8 +224,12 @@ def test_find_picks_the_gguf_with_the_hash_and_caches_it(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ee, "model_hash", no_hashing)
     assert ee.find(hb, [str(models)]) == str(models / "sub" / "b.gguf")
-    # ... until the file changes (size or mtime).
-    _write_qwen3_asr(models / "sub" / "b.gguf", 2048, byte=2)
+    # ... until the file changes (size or mtime). The rewrite has the same
+    # size and may land in the same mtime tick, so its mtime moves on.
+    b = models / "sub" / "b.gguf"
+    mtime = os.stat(b).st_mtime_ns
+    _write_qwen3_asr(b, 2048, byte=2)
+    os.utime(b, ns=(mtime + 10**9, mtime + 10**9))
     with pytest.raises(AssertionError, match="rehashed"):
         ee.find(hb, [str(models)])
 

@@ -60,11 +60,17 @@ void report_piece(const std::string& piece, uint64_t model_hash, const std::stri
 #endif
         }
     }
-    // One line per key: a path with a line break in it is not written.
+    // One line per key: a path with a line break in it is not written, and
+    // line breaks in free text become spaces.
     const std::string path_line = gguf.find_first_of("\r\n") == std::string::npos ? gguf : std::string();
+    auto one_line = [](std::string s) {
+        for (char& c : s)
+            if (c == '\n' || c == '\r') c = ' ';
+        return s;
+    };
     const std::string body = std::string("piece=") + piece + "\nhash=0x" + hash + "\ngguf=" + path_line +
-                             "\nmodel=" + model + "\nstate=" + st + "\nfirmware=" + firmware + "\nmessage=" + message +
-                             "\n";
+                             "\nmodel=" + one_line(model) + "\nstate=" + st + "\nfirmware=" + one_line(firmware) +
+                             "\nmessage=" + one_line(message) + "\n";
     const std::string dirs = npu_dirs();
     for (size_t b = 0; b <= dirs.size();) {
         size_t e = dirs.find(':', b);

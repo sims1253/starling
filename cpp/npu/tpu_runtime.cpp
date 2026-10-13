@@ -174,9 +174,19 @@ bool compile_tflite(const void* tflite, size_t size, std::vector<uint8_t>& bytec
 
 bool write_artifact(const std::string& path, const ArtifactInfo& info, const std::vector<uint8_t>& bytecode,
                     std::string& err) {
-    if (info.in_bytes.size() > 64 || info.out_bytes.size() > 64 || info.function.size() >= 64 ||
-        info.key.size() >= 256 || bytecode.empty()) {
+    if (info.in_bytes.size() > kArtifactMaxIo || info.out_bytes.size() > kArtifactMaxIo ||
+        info.function.size() >= 64 || info.key.size() >= 256 || bytecode.empty()) {
         err = "artifact: too many I/Os, function name or key too long, or no bytecode";
+        return false;
+    }
+    // What parse_artifact_header accepts, so a bad size fails here, not at load.
+    auto sizes_ok = [](const std::vector<uint64_t>& v) {
+        for (uint64_t b : v)
+            if (b == 0 || b > kArtifactMaxIoBytes) return false;
+        return !v.empty();
+    };
+    if (!sizes_ok(info.in_bytes) || !sizes_ok(info.out_bytes)) {
+        err = "artifact: every input and output needs a size of 1.." + std::to_string(kArtifactMaxIoBytes) + " bytes";
         return false;
     }
     ArtifactHeader h{};
