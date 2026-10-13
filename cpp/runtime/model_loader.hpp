@@ -81,8 +81,8 @@ public:
     // The host memory holding the GGUF weight data: a private mapping of the
     // file (Linux/Android/macOS; pages load on first touch and can be
     // dropped again with madvise — the file still backs them), or the ggml
-    // context's own allocation when the file was read (STARLING_GGUF_MMAP=0,
-    // other platforms).
+    // context's own allocation when the file was read (other platforms, or a
+    // GGUF aligned to less than 32 bytes).
     void* weight_data() const { return data_; }
     size_t weight_bytes() const { return data_size_; }
     bool weights_mapped() const { return map_addr_ != nullptr; }

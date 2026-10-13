@@ -130,10 +130,6 @@ std::unique_ptr<ParakeetEngine> ParakeetEngine::create(const pk::ParakeetModel& 
     if (!e->impl_->K.init(*ctx, err)) return nullptr;
     const double t_kinit = ms_since(t0);
     if (!e->impl_->load(m, err)) return nullptr;
-    if (env_on("STARLING_FAST_FORCE_FAIL")) {   // tests: the ggml fallback after a full fast load
-        err = "fast parakeet: forced failure (STARLING_FAST_FORCE_FAIL)";
-        return nullptr;
-    }
     if (env_on("STARLING_FAST_TIMING"))
         std::fprintf(stderr, "[fast-parakeet] create: device %.1f ms, kernels %.1f ms, weights %.1f ms\n",
                      t_ctx, t_kinit - t_ctx, ms_since(t0) - t_kinit);

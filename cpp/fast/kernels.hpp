@@ -229,7 +229,7 @@ public:
     uint32_t gemv_tgt_wgs = 384;   // grow rows while N/rows stays above this
     uint32_t gemv_rows(uint32_t N, uint32_t K);    // rows per workgroup for an N x K GEMV
     uint32_t gemv_rsplit_target(uint32_t lanes) const;   // row slots padding lanes to a subgroup
-    uint32_t gemv_rpp_min = 0;   // min rows per row slot (0: off); STARLING_FAST_GEMV_RPP
+    uint32_t gemv_rpp_min = 0;   // min rows per row slot (0: off)
 
     const vk::Buffer& dummy() const { return dummy_; }
     vk::Ref or_dummy(const vk::Ref& r) const { return r.buf ? r : vk::Ref(dummy_); }
@@ -245,7 +245,7 @@ public:
     // operand through the texture path where the view limits allow.
     bool sg_gemm_ = false;
     bool sg_tex_ = true;
-    uint32_t sg_texel_max_ = 0;   // texels per A view (maxTexelBufferElements; tests may lower it)
+    uint32_t sg_texel_max_ = 0;   // texels per A view (maxTexelBufferElements)
 
 private:
     bool gemm_sg(vk::Recording& rec, const GemmCall& c, std::string& err);

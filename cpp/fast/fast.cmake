@@ -82,7 +82,6 @@ set(STARLING_FAST_SHADERS
   "gemm_sg_f16_t|gemm_sg.comp|B_F16,ATEX|7|1"
   "gemm_sg_conv_t|gemm_sg.comp|B_F16,A_CONV,ATEX|7|1"
   "alu_probe|alu_probe.comp||1"
-  "alu2_probe|alu2_probe.comp||1"
   "gemv_w4|gemv.comp|W_W4|7"
   "gemv_w4u|gemv.comp|W_W4,W4_UNPACK|7"
   "gemv_w4um|gemv.comp|W_W4,W4_UNPACK,GEMV_M|7"

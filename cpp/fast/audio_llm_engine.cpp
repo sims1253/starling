@@ -399,7 +399,6 @@ struct AudioLlmEngine::Impl {
         return (uint32_t)std::max<size_t>(1, std::min<size_t>(EH, (64ull << 20) / (T * T * 4)));
     }
     bool record_decode(uint32_t steps, std::string& err);
-    bool dec_ablate = false;   // STARLING_FAST_DECODE_SKIP (diagnostic)
 
     // ---- Qwen3-ASR audio encoder on the Pixel TPU (cpp/npu) ----
     // When an artifact compiled for this model, encoder shape and firmware
@@ -563,10 +562,6 @@ std::unique_ptr<AudioLlmEngine::Impl> make_impl(Spec sp, const ggml::ModelLoader
     if (!I->K.init(*I->ctx, err)) return nullptr;
     const double t_kinit = ms_since(t0);
     if (!I->load(ml, err)) return nullptr;   // weights and the static buffers
-    if (env_on("STARLING_FAST_FORCE_FAIL")) {   // tests: the ggml fallback after a full fast load
-        err = "fast " + std::string(I->sp.tag) + ": forced failure (STARLING_FAST_FORCE_FAIL)";
-        return nullptr;
-    }
     if (env_on("STARLING_FAST_TIMING"))
         std::fprintf(stderr, "[fast-%s] create: device %.1f ms, kernels %.1f ms, weights+buffers %.1f ms\n",
                      I->sp.tag, t_ctx, t_kinit - t_ctx, ms_since(t0) - t_kinit);
@@ -1247,7 +1242,7 @@ bool AudioLlmEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
     }
     b[9] = vk::Ref(xd);
     b[10] = vk::Ref(state);
-    struct { uint32_t n_part, K, eos, max_steps; } pc{n_part, HD, dec_ablate ? 0xffffffffu : (uint32_t)sp.eos, sp.max_new_tokens};
+    struct { uint32_t n_part, K, eos, max_steps; } pc{n_part, HD, (uint32_t)sp.eos, sp.max_new_tokens};
     rc.label("dec_next");
     rc.dispatch(*p, b, &pc, sizeof(pc), 1);
     return true;
@@ -2031,22 +2026,6 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
                                     : ctx->pipeline("attn_decode", {HDIM, MAXPOS, qk_norm}, err);
     const vk::Pipeline* ac = asplit ? ctx->pipeline("attn_split_combine", {HDIM}, err) : nullptr;
     if (!ap || (asplit && !ac)) return false;
-    // Diagnostic ablation (STARLING_FAST_DECODE_SKIP=qkv,attn,o,up,down,lm[,empty][,bar]):
-    // drop those dispatches from the recording to price them by difference
-    // ("empty" replaces each with a one-workgroup no-op dispatch, "bar" drops
-    // the barriers). The output is garbage; EOS is disabled so every round
-    // runs its K steps. Time it with STARLING_FAST_TIMING's round line.
-    const char* skip_e = std::getenv("STARLING_FAST_DECODE_SKIP");
-    const std::string skip_env = skip_e && *skip_e ? std::string(",") + skip_e + "," : "";
-    auto skip = [&](const char* k) { return skip_env.find(std::string(",") + k + ",") != std::string::npos; };
-    dec_ablate = !skip_env.empty();
-    const vk::Pipeline* noop = skip("empty") ? ctx->pipeline("alu_probe", {}, err) : nullptr;
-    if (skip("empty") && !noop) return false;
-    auto stub = [&] {
-        const uint32_t zero = 0;
-        if (noop) rc.dispatch(*noop, {vk::Ref(hd)}, &zero, sizeof(zero), 1);
-    };
-    auto bar = [&] { if (!skip("bar")) rc.barrier(); };
     // RMSNorm(xd) * g into xn as its own one-workgroup dispatch, read by the
     // next GEMV. Fusing the norm into the GEMV (every workgroup recomputing
     // the statistic from its x slices, plus the norm-weight loads) cost more
@@ -2055,7 +2034,7 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     auto prenorm = [&](Arena::Id g) {
         rc.label("dec_norm");
         if (!K.norm(rc, 4, 1, HD, vk::Ref(xd), HD, R(g), {}, {}, {}, vk::Ref(xn), HD, leps, leps, err)) return false;
-        bar();
+        rc.barrier();
         return true;
     };
     for (uint32_t s = 0; s < steps; ++s) {
@@ -2074,47 +2053,40 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
             a.eps = leps;
             if (!prenorm(Y.attn_norm)) return false;
             rc.label("dec_qkv");
-            if (skip("qkv")) stub();
-            else if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xn), vk::Ref(qkvd), {}, vk::Ref(state),
-                             sp.qkv_bias ? R(Y.qkv_b) : vk::Ref(), 0, a, err))
+            if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xn), vk::Ref(qkvd), {}, vk::Ref(state),
+                        sp.qkv_bias ? R(Y.qkv_b) : vk::Ref(), 0, a, err))
                 return false;
-            bar();
+            rc.barrier();
             rc.label("dec_attn");
             // attn_decode ignores the trailing S (push constants are one fixed block).
             struct { uint32_t H, KVH, cache_off; float eps, scale; uint32_t S; } pa{
                 NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale, asplit};
-            if (skip("attn")) stub();
-            else
-                rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(asplit ? apart : attd),
-                                  qk_norm ? R(Y.q_norm) : vk::Ref(K.dummy()), qk_norm ? R(Y.k_norm) : vk::Ref(K.dummy()),
-                                  R(rope_tab), vk::Ref(state)},
-                            &pa, sizeof(pa), NH, std::max(asplit, 1u));
-            if (asplit && !skip("attn")) {
-                bar();
+            rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(asplit ? apart : attd),
+                              qk_norm ? R(Y.q_norm) : vk::Ref(K.dummy()), qk_norm ? R(Y.k_norm) : vk::Ref(K.dummy()),
+                              R(rope_tab), vk::Ref(state)},
+                        &pa, sizeof(pa), NH, std::max(asplit, 1u));
+            if (asplit) {
+                rc.barrier();
                 rc.label("dec_attn_combine");
                 rc.dispatch(*ac, {vk::Ref(apart), vk::Ref(attd), vk::Ref(state)}, &asplit, sizeof(asplit), NH);
             }
-            bar();
+            rc.barrier();
             rc.label("dec_o");
-            if (skip("o")) stub();
-            else if (!K.gemv(rc, ar, Y.o, vk::Ref(attd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
-            bar();
+            if (!K.gemv(rc, ar, Y.o, vk::Ref(attd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
+            rc.barrier();
             if (!prenorm(Y.ffn_norm)) return false;
             rc.label("dec_ff_up");
-            if (skip("up")) stub();
-            else if (!K.gemv(rc, ar, Y.gateup, vk::Ref(xn), vk::Ref(hd), {}, vk::Ref(state), {}, 2, a, err))
+            if (!K.gemv(rc, ar, Y.gateup, vk::Ref(xn), vk::Ref(hd), {}, vk::Ref(state), {}, 2, a, err))
                 return false;
-            bar();
+            rc.barrier();
             rc.label("dec_ff_down");
-            if (skip("down")) stub();
-            else if (!K.gemv(rc, ar, Y.down, vk::Ref(hd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
-            bar();
+            if (!K.gemv(rc, ar, Y.down, vk::Ref(hd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
+            rc.barrier();
         }
-        if (skip("lm")) stub();
-        else if (!prenorm(final_norm) || !lm_head(rc, vk::Ref(xn), 0, err, true)) return false;
-        bar();
-        if (!dec_next(rc, err)) return false;   // drives the state; never skipped
-        bar();
+        if (!prenorm(final_norm) || !lm_head(rc, vk::Ref(xn), 0, err, true)) return false;
+        rc.barrier();
+        if (!dec_next(rc, err)) return false;
+        rc.barrier();
     }
     rc.end();
     dec_steps = steps;

@@ -1,6 +1,6 @@
 #version 450
 // gemm_sg.comp — C = A · Bᵀ without shared memory: the subgroup-broadcast GEMM
-// (the structure of LiteRT/ML Drift's PowerVR matmul, benchmarks/litert_gpu).
+// (the structure of LiteRT/ML Drift's PowerVR matmul).
 //
 // Operands, push constants and epilogues are gemm.comp's (B_W4 / B_W8 / B_F16
 // weights or activations, A_CONV implicit 3x3/s2 im2col, batching over z,

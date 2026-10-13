@@ -1113,12 +1113,7 @@ void Recording::barrier() {
 void Recording::emit_barrier(bool dst_xfer) {
     if (!bar_pending_) return;
     bar_pending_ = false;
-    static const bool full = [] {
-        const char* e = std::getenv("STARLING_FAST_FULL_BARRIER");
-        return e && e[0] == '1';
-    }();
-    const bool src_xfer = bar_xfer_src_ || full;
-    dst_xfer = dst_xfer || full;
+    const bool src_xfer = bar_xfer_src_;
     bar_xfer_src_ = false;
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | (src_xfer ? VK_ACCESS_TRANSFER_WRITE_BIT : 0u);

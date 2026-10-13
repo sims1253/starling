@@ -4,8 +4,8 @@
 // privately: every tensor points into the mapping, so the weight region is
 // one contiguous host range (zero-copy on CPU) whose pages load on first
 // touch. The fast engines repack straight from it and drop the pages they
-// consumed; nothing holds a second copy. Platforms without mmap, and
-// STARLING_GGUF_MMAP=0, read the file into the ggml context instead.
+// consumed; nothing holds a second copy. Platforms without mmap read the
+// file into the ggml context instead.
 // Reads KV metadata + maps tensor name -> ggml_tensor*. realize_weights() gives
 // each weight a backend buffer (zero-copy borrow on CPU, mirrored upload on
 // GPU) so clone_weight() can hand them to graphs as already-allocated leaves.
@@ -30,7 +30,6 @@
 #endif
 
 #include <chrono>
-#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,19 +85,6 @@ ModelLoader::~ModelLoader() {
 #endif
 }
 
-namespace {
-// STARLING_GGUF_MMAP=0 reads the weights into anonymous memory instead of
-// mapping the file (A/B measurements; platforms without mmap always read).
-bool want_mmap() {
-#if STARLING_LOADER_MMAP
-    const char* e = std::getenv("STARLING_GGUF_MMAP");
-    return !(e && e[0] == '0');
-#else
-    return false;
-#endif
-}
-} // namespace
-
 bool ModelLoader::map_weights(const char* path) {
 #if STARLING_LOADER_MMAP
     // Metadata only: the tensors get no data until pointed into the map.
@@ -139,29 +125,6 @@ bool ModelLoader::map_weights(const char* path) {
     // and the kernel can drop untouched pages under pressure instead of
     // swapping them.
     void* p = file_size ? mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) : nullptr;
-#if defined(__linux__)
-    // STARLING_GGUF_READAHEAD=1: stream the weight region from storage in
-    // the background (posix_fadvise WILLNEED on a descriptor of its own).
-    // Off by default: on the Pixel it never beat the repack's own page
-    // faults on a cold load and often delayed the header parse behind it
-    // (Qwen3 cold 0.94-1.0 s without, 1.0-1.7 s with; Granite 1.95-2.16 s
-    // vs 2.26-2.86 s), and over a cached file walking the pages contends
-    // with the faults (host, warm Qwen3: +0.3 s).
-    const char* ra = std::getenv("STARLING_GGUF_READAHEAD");
-    if (p != MAP_FAILED && file_size > data_off && ra && ra[0] == '1') {
-        const int rfd = dup(fd);
-        if (rfd >= 0) {
-            try {
-                std::thread([rfd, data_off, file_size] {
-                    posix_fadvise(rfd, (off_t)data_off, (off_t)(file_size - data_off), POSIX_FADV_WILLNEED);
-                    close(rfd);
-                }).detach();
-            } catch (...) {
-                close(rfd);
-            }
-        }
-    }
-#endif
     close(fd);
     if (file_size && p == MAP_FAILED) {
         error_ = std::string("failed to map GGUF: ") + path;
@@ -195,7 +158,7 @@ bool ModelLoader::load(const char* path) {
     if (ctx_ || gguf_ctx_) { error_ = "model loader is already loaded"; return false; }
     if (!path || !*path) { error_ = "empty GGUF path"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
-    if (want_mmap() && !map_weights(path) && !error_.empty()) return false;
+    if (STARLING_LOADER_MMAP && !map_weights(path) && !error_.empty()) return false;
     if (!gguf_ctx_) {
         // gguf_init_params { no_alloc, ctx } — ctx!=NULL means allocate the
         // weight tensors into a freshly-created ggml_context (host memory).

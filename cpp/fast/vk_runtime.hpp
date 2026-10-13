@@ -234,7 +234,7 @@ public:
     // orders: compute -> compute unless a copy/fill precedes it (source
     // gains the transfer stage) or follows it (destination is transfer).
     // PowerVR prices the wide compute|transfer form measurably higher
-    // (decode -4..6 %). STARLING_FAST_FULL_BARRIER=1 keeps the wide form.
+    // (decode -4..6 %).
     void barrier();
     void copy(const Buffer& src, VkDeviceSize soff, const Buffer& dst,
               VkDeviceSize doff, VkDeviceSize bytes);
