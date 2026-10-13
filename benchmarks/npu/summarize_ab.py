@@ -11,7 +11,7 @@ import sys
 d = sys.argv[1]
 rows = {}
 for f in sorted(glob.glob(os.path.join(d, "*_*_*.txt"))):
-    m = re.match(r"(.+)_(gpu|npu)_(\d+)\.txt$", os.path.basename(f))
+    m = re.match(r"(.+)_(gpu|npuenc|npu)_(\d+)\.txt$", os.path.basename(f))
     if not m:
         continue
     clip, mode = m.group(1), m.group(2)

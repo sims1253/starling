@@ -29,11 +29,12 @@ adb shell "dumpsys battery | grep -E '^  status|AC powered'" | tr -d '\r' | tee 
 wait_benches || true
 for rep in $(seq 1 "$REPS"); do
   for w in "${WAVS[@]}"; do
-    for mode in gpu npu; do
-      env="STARLING_NPU_DIR=$NPU_DIR"; [ $mode = gpu ] && env="$env STARLING_NPU=0"
+    for mode in ${MODES:-gpu npu}; do
+      env="STARLING_NPU_DIR=$NPU_DIR"
+      case $mode in gpu) env="$env STARLING_NPU=0" ;; npuenc) env="$env STARLING_NPU_PREFILL=0" ;; esac
       f="$OUT/${w%.wav}_${mode}_$rep.txt"
       timeout 1200 adb shell "cd $D && LD_LIBRARY_PATH=$D $env STARLING_ENGINE=fast STARLING_FAST_TIMING=1 \
-        STARLING_FAST_CACHE_DIR=$D ./starling-bench --model qwen3 --gguf $GGUF --warmup --runs $RUNS \
+        STARLING_FAST_CACHE_DIR=$D ./starling-bench --model ${SLUG:-qwen3} --gguf $GGUF --warmup --runs $RUNS \
         /data/local/tmp/starling/$w" > "$f" 2>&1
       echo "--- $w $mode rep $rep: $(grep -oE 'load [0-9.]+ ms' "$f" | head -1) $(grep -oE 'time=[0-9.]+ms' "$f" | tr '\n' ' ')"
       grep -m1 -E "npu:" "$f" || true

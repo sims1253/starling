@@ -27,10 +27,11 @@ find "$BUILD/ggml" -name 'libggml*.so' -exec adb push -q {} $D/ \; >/dev/null
 [ "$(adb shell "ls $F | grep -c wav" | tr -d '\r')" -ge 100 ] || adb push -q "$CLIPS"/*.wav $F/ >/dev/null
 LIST=$(cd "$CLIPS" && ls *.wav | sed "s|^|$F/|" | tr '\n' ' ')
 wait_benches || true
-for mode in gpu npu; do
-  env="STARLING_NPU_DIR=$NPU_DIR"; [ $mode = gpu ] && env="$env STARLING_NPU=0"
+for mode in ${MODES:-gpu npu}; do
+  env="STARLING_NPU_DIR=$NPU_DIR"
+  case $mode in gpu) env="$env STARLING_NPU=0" ;; npuenc) env="$env STARLING_NPU_PREFILL=0" ;; esac
   timeout 3600 adb shell "cd $D && LD_LIBRARY_PATH=$D $env STARLING_ENGINE=fast STARLING_FAST_TIMING=1 \
-    STARLING_FAST_CACHE_DIR=$D ./starling-bench --model qwen3 --gguf $GGUF --runs 1 $LIST" > "$OUT/fleurs_$mode.txt" 2>&1
+    STARLING_FAST_CACHE_DIR=$D ./starling-bench --model ${SLUG:-qwen3} --gguf $GGUF --runs 1 $LIST" > "$OUT/fleurs_$mode.txt" 2>&1
   echo "$mode: $(grep -c ' run=0 ' "$OUT/fleurs_$mode.txt") clips"
   wait_benches || true
 done
