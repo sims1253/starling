@@ -85,7 +85,21 @@ ModelLoader::~ModelLoader() {
 #endif
 }
 
-bool ModelLoader::map_weights(const char* path) {
+void ModelLoader::drop_mapping() {
+#if STARLING_LOADER_MMAP
+    if (map_addr_) munmap(map_addr_, map_len_);
+#endif
+    map_addr_ = nullptr;
+    map_len_ = 0;
+    data_ = nullptr;
+    data_size_ = 0;
+    if (gguf_ctx_) gguf_free(gguf_ctx_);
+    gguf_ctx_ = nullptr;
+    if (ctx_) ggml_free(ctx_);
+    ctx_ = nullptr;
+}
+
+ModelLoader::MapResult ModelLoader::map_weights(const char* path) {
 #if STARLING_LOADER_MMAP
     // Metadata only: the tensors get no data until pointed into the map.
     gguf_init_params params = {
@@ -94,31 +108,30 @@ bool ModelLoader::map_weights(const char* path) {
     };
     gguf_ctx_ = gguf_init_from_file(path, params);
     if (!gguf_ctx_) {
+        drop_mapping();
         error_ = std::string("failed to open GGUF: ") + path;
-        return false;
+        return MapResult::Failed;
     }
     // ggml's CPU buffers need 32-byte aligned tensor data: a file aligned
-    // more loosely is read instead (empty error_ = fall back).
+    // more loosely is read instead.
     if (gguf_get_alignment(gguf_ctx_) % 32 != 0) {
-        gguf_free(gguf_ctx_);
-        gguf_ctx_ = nullptr;
-        if (ctx_) ggml_free(ctx_);
-        ctx_ = nullptr;
-        return false;
+        drop_mapping();
+        return MapResult::ReadInstead;
     }
     const int fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0) {
         if (fd >= 0) close(fd);
-        error_ = std::string("failed to open GGUF: ") + path;
-        return false;
+        drop_mapping();
+        return MapResult::ReadInstead;
     }
     const size_t file_size = (size_t)st.st_size;
     const size_t data_off = gguf_get_data_offset(gguf_ctx_);
     if (data_off > file_size) {
         close(fd);
+        drop_mapping();
         error_ = std::string("GGUF data offset past the end of ") + path;
-        return false;
+        return MapResult::Failed;
     }
     // Private and writable: pages stay shared with the page cache until
     // written (ggml's CPU repack rewrites weights in place: copy-on-write),
@@ -126,9 +139,9 @@ bool ModelLoader::map_weights(const char* path) {
     // swapping them.
     void* p = file_size ? mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) : nullptr;
     close(fd);
-    if (file_size && p == MAP_FAILED) {
-        error_ = std::string("failed to map GGUF: ") + path;
-        return false;
+    if (file_size && p == MAP_FAILED) {   // e.g. no address space left: read it instead
+        drop_mapping();
+        return MapResult::ReadInstead;
     }
     map_addr_ = p;
     map_len_ = file_size;
@@ -142,15 +155,15 @@ bool ModelLoader::map_weights(const char* path) {
         const size_t off = gguf_get_tensor_offset(gguf_ctx_, i);
         if (off > data_size_ || ggml_nbytes(t) > data_size_ - off) {
             error_ = std::string("GGUF tensor ") + name + " extends past the end of " + path;
-            return false;
+            drop_mapping();
+            return MapResult::Failed;
         }
         t->data = data_ + off;
     }
-    return true;
+    return MapResult::Mapped;
 #else
     (void)path;
-    error_ = "GGUF mapping is not supported on this platform";
-    return false;
+    return MapResult::ReadInstead;
 #endif
 }
 
@@ -158,8 +171,9 @@ bool ModelLoader::load(const char* path) {
     if (ctx_ || gguf_ctx_) { error_ = "model loader is already loaded"; return false; }
     if (!path || !*path) { error_ = "empty GGUF path"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
-    if (STARLING_LOADER_MMAP && !map_weights(path) && !error_.empty()) return false;
-    if (!gguf_ctx_) {
+    const MapResult mapped = map_weights(path);
+    if (mapped == MapResult::Failed) return false;
+    if (mapped == MapResult::ReadInstead) {
         // gguf_init_params { no_alloc, ctx } — ctx!=NULL means allocate the
         // weight tensors into a freshly-created ggml_context (host memory).
         gguf_init_params params = {

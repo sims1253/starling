@@ -3,6 +3,7 @@
 #include "runtime/backend.hpp"
 #include "runtime/lru_cache.hpp"
 #include "runtime/graph.hpp"
+#include "lib/embed_scatter.hpp"
 #include "lib/qwen_decode.hpp"
 #include "include/starling_ggml.h"
 #include "ggml.h"
@@ -110,6 +111,26 @@ int main() {
             } catch (const std::runtime_error&) { threw = true; }
             check(threw, "graph build error did not propagate");
             add_graph_root(nullptr); // no active scope: must be a no-op
+        }
+        // A truncated GGUF is refused without leaving a half-loaded loader
+        // behind: the same loader then loads an intact file.
+        {
+            const std::filesystem::path cut = a.path.string() + ".cut";
+            std::filesystem::copy_file(a.path, cut, std::filesystem::copy_options::overwrite_existing);
+            std::filesystem::resize_file(cut, std::filesystem::file_size(cut) - 64);
+            ModelLoader loader;
+            const bool loaded = loader.load(cut.string().c_str());
+            std::error_code ignored;
+            std::filesystem::remove(cut, ignored);
+            check(!loaded && loader.last_error().find("extends past the end") != std::string::npos,
+                  "truncated GGUF loaded");
+            check(loader.load(a.path.string().c_str()), "loader unusable after a failed load");
+            prefill(loader, 3);
+            // Token ids outside the embedding table are refused, not read.
+            std::vector<float> rows;
+            check(lib::embed_rows(loader, {0, 31}, rows) && rows.size() == 64, "embed rows");
+            check(!lib::embed_rows(loader, {32}, rows) && !lib::embed_rows(loader, {-1}, rows),
+                  "out-of-range token id embedded");
         }
         LruCache<int, int> retry_cache(2);
         try { retry_cache.get_or_init(1, [](int&) { throw std::runtime_error("init"); }); }

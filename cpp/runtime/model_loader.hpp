@@ -84,8 +84,11 @@ public:
     // The host memory holding the GGUF weight data: a private mapping of the
     // file (Linux/Android/macOS; pages load on first touch and can be
     // dropped again with madvise — the file still backs them), or the ggml
-    // context's own allocation when the file was read (other platforms, or a
-    // GGUF aligned to less than 32 bytes).
+    // context's own allocation when the file was read (other platforms, a
+    // GGUF aligned to less than 32 bytes, or a file that cannot be mapped).
+    // Pages ggml's CPU repack rewrote are private copies that dropping would
+    // revert to the file's bytes, so only weights no ggml graph runs (those a
+    // fast engine took over) are ever dropped.
     void* weight_data() const { return data_; }
     size_t weight_bytes() const { return data_size_; }
     bool weights_mapped() const { return map_addr_ != nullptr; }
@@ -142,7 +145,12 @@ private:
     template<class T> struct Cache : CacheBase { std::unique_ptr<T> value; };
     mutable std::vector<std::pair<std::type_index, std::unique_ptr<CacheBase>>> caches_;
     void release_runtime_resources();
-    bool map_weights(const char* path);
+    // Mapped: weights point into the mapping. ReadInstead: nothing is kept
+    // (loosely aligned GGUF, or the file cannot be mapped); load() reads it.
+    // Failed: a malformed GGUF, error_ says why; nothing is kept either.
+    enum class MapResult { Mapped, ReadInstead, Failed };
+    MapResult map_weights(const char* path);
+    void drop_mapping();
     void* map_addr_ = nullptr;              // the GGUF file mapping (mmap loads)
     size_t map_len_ = 0;
     uint8_t* data_ = nullptr;               // weight data region (see weight_data)

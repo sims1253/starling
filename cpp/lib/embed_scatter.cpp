@@ -1,5 +1,6 @@
 // embed_scatter.cpp — prompt embedding + audio scatter (see embed_scatter.hpp).
 #include "embed_scatter.hpp"
+#include "runtime/model_loader.hpp"
 #include <algorithm>
 #include <cstdio>
 
@@ -7,12 +8,17 @@ namespace starling::ggml::lib {
 
 bool embed_rows(const ModelLoader& ml, const std::vector<int32_t>& ids,
                 std::vector<float>& out) {
+    // An id past the table (corrupt GGUF prompt ids) would be read out of
+    // bounds by get_rows.
+    const ggml_tensor* table = ml.tensor("llm.embed.weight");
+    if (!table) return false;
+    for (int32_t id : ids)
+        if (id < 0 || id >= table->ne[1]) return false;
     ensure_weights_realized(ml);
-    std::vector<int32_t> idv = ids;
     return run_graph([&](ggml_context* c) {
-        int64_t ne[1] = {(int64_t) idv.size()};
-        auto* it = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, idv.data(),
-                                      idv.size() * sizeof(idv[0]));
+        int64_t ne[1] = {(int64_t) ids.size()};
+        auto* it = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, ids.data(),
+                                      ids.size() * sizeof(ids[0]));
         return ggml_cast(c, ggml_get_rows(c, clone_weight(c, ml, "llm.embed.weight"), it),
                          GGML_TYPE_F32);
     }, out);

@@ -253,13 +253,22 @@ struct Backend::Impl {
     void attach_threadpool(int n) {
         if (!backend || !ggml_backend_is_cpu(backend)) return;
         ggml_threadpool_params tpp = ggml_threadpool_params_default(n);
-        if (const char* v = std::getenv("STARLING_GGML_POLL"); v && *v)
-            tpp.poll = (uint32_t)std::clamp(std::atoi(v), 0, 100);
+        if (const char* v = std::getenv("STARLING_GGML_POLL"); v && *v) {
+            char* end = nullptr;
+            const long poll = std::strtol(v, &end, 10);
+            if (*end == '\0' && poll >= 0 && poll <= 100) tpp.poll = (uint32_t)poll;
+            else std::fprintf(stderr, "[backend] ignoring STARLING_GGML_POLL='%s' (want 0..100)\n", v);
+        }
         if (const char* v = std::getenv("STARLING_GGML_CPUMASK"); v && *v) {
-            const unsigned long long mask = std::strtoull(v, nullptr, 16);
-            for (int i = 0; i < 64 && i < GGML_MAX_N_THREADS; ++i)
-                tpp.cpumask[i] = (mask >> i) & 1u;
-            tpp.strict_cpu = false;  // every thread may use the whole mask
+            char* end = nullptr;
+            const unsigned long long mask = std::strtoull(v, &end, 16);
+            if (*end == '\0' && mask != 0) {
+                for (int i = 0; i < 64 && i < GGML_MAX_N_THREADS; ++i)
+                    tpp.cpumask[i] = (mask >> i) & 1u;
+                tpp.strict_cpu = false;  // every thread may use the whole mask
+            } else {
+                std::fprintf(stderr, "[backend] ignoring STARLING_GGML_CPUMASK='%s' (want a nonzero hex mask)\n", v);
+            }
         }
         ggml_threadpool_t fresh = ggml_threadpool_new(&tpp);
         if (!fresh) return;  // keep ggml's per-graph pool
@@ -572,7 +581,10 @@ bool Backend::reserve_steps(StepAlloc& sa, int64_t key,
     for (ggml_tensor* r : roots) ggml_build_forward_expand(gf, r);
     if (!sa.galloc_)
         sa.galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
-    if (!sa.galloc_ || !ggml_gallocr_reserve(sa.galloc_, gf)) return false;
+    if (!sa.galloc_ || !ggml_gallocr_reserve(sa.galloc_, gf)) {
+        sa.reserved = -1;   // the old plan may be gone
+        return false;
+    }
     sa.reserved = key;
     return true;
 }
