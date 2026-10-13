@@ -60,6 +60,9 @@ public:
     // into Vulkan as external memory).
     bool write_input(size_t i, const void* data, size_t bytes, std::string& err);
     bool read_output(size_t i, void* data, size_t bytes, std::string& err);
+    // Zero-copy host view of output i (CPU read lock until unmap_output).
+    bool map_output(size_t i, const void** data, std::string& err);
+    void unmap_output(size_t i);
     AHardwareBuffer* output_ahwb(size_t i) const { return out_[i].ahwb; }
     bool run(std::string& err);   // synchronous: prepare, invoke, wait
     const ArtifactInfo& info() const { return info_; }
