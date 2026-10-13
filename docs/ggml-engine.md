@@ -4,7 +4,7 @@
 > [fast engines](fast-engine.md).
 
 The native engines load GGUF models through the shared `libstarling_ggml` C API.
-They support Parakeet, MOSS, ARK, Granite, Qwen3, S1, and Voxtral.
+They support Parakeet, MOSS, ARK, Granite, Qwen3, and S1.
 Backend availability depends on the build; see the [benchmarks](benchmarks.md) for measured
 performance and the model-specific parity notes below. To run an HTTP server,
 use the [native serving guide](native-serving.md). To embed the C API, start
@@ -123,7 +123,6 @@ the `convert` dependency group (`uv run --group convert python scripts/goldens/<
 | `parakeet_unified_*` | `parakeet_unified_golden.py` (target for the native port, issue #358) |
 | `s1/greedy_text_*` | `s1_golden.py` |
 | `ark_reference.json`, `ark06_reference.json` | `ark_golden.py --model ark` / `--model ark06` |
-| `voxtral_reference.json` | `voxtral_golden.py` |
 | `granite_reference.json`, `qwen3_reference.json`, `qwen3_06_reference.json` | frozen: they came from the removed Python pipeline's stock-numerics path with the serve chunk policy. Regenerate from `git checkout python-research-final` with `scripts/make_granite_golden.py`, `scripts/make_qwen3_golden.py`, `scripts/make_qwen3_06_golden.py` (and the `*_golden_components.py` scripts for staged tensors). |
 
 A new capture of a pinned reference is a reviewed manifest change (new

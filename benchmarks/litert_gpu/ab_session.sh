@@ -27,7 +27,7 @@ D=${DEV:-/data/local/tmp/litert-gpu/sg}
 S=/data/local/tmp/starling
 BIN=${BIN:-/tmp/litert-gpu/bin/sg1}
 RUNS=${RUNS:-3}
-MODELS=${MODELS:-"qwen3:qwen3-asr-0.6b-q4e8.gguf qwen3:qwen3-asr-1.7b-q4e8-imx.gguf moss:moss-transcribe-preview-2b-q4e8-fullimx.gguf ark06:ark-asr-0.6b-q4k.gguf granite:granite-2b-dynq4.imx.gguf voxtral:voxtral-mini-4b-realtime-q4k.gguf parakeet:parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf"}
+MODELS=${MODELS:-"qwen3:qwen3-asr-0.6b-q4e8.gguf qwen3:qwen3-asr-1.7b-q4e8-imx.gguf moss:moss-transcribe-preview-2b-q4e8-fullimx.gguf ark06:ark-asr-0.6b-q4k.gguf granite:granite-2b-dynq4.imx.gguf parakeet:parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf"}
 
 state=$(wakefulness); echo "display: $state"
 if [ "$state" = "mWakefulness=Awake" ]; then

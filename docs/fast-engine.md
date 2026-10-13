@@ -6,8 +6,7 @@ Starling ships two kinds of engines behind the same C API:
   ([engine notes](ggml-engine.md));
 * the **fast engines** in `cpp/fast/` — hand-written Vulkan compute kernels
   for two model families, **Parakeet-TDT** and the audio-LLMs
-  (**MOSS-Transcribe**, **Qwen3-ASR**, **ARK-ASR**, **Granite-speech** and
-  **Voxtral-Mini-4B-Realtime**),
+  (**MOSS-Transcribe**, **Qwen3-ASR**, **ARK-ASR** and **Granite-speech**),
   built around their shapes the way
   [Splash](https://inco.ai/blog/splash/) builds an engine around one model.
   MOSS and Qwen3-ASR share one engine (`audio_llm_engine.cpp`): the same
@@ -47,7 +46,7 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_BK=8/16/32` | GEMM k-tile depth only (default 16 on PowerVR, 32 elsewhere) |
 | `STARLING_FAST_GEMV_RPP=n` | minimum GEMV rows per row slot, kept at ≥ 64 workgroups (default 16 on PowerVR, off elsewhere; `0` = off) |
 | `STARLING_FAST_KSTEP=n` | audio-LLM decode tokens per submission (default 16) |
-| `STARLING_FAST_{ARK,GRANITE,VOXTRAL}_HOST_ENCODER=1` | keep that model's audio encoder on ggml; the fast engine takes its rows (decoder only) |
+| `STARLING_FAST_{ARK,GRANITE}_HOST_ENCODER=1` | keep that model's audio encoder on ggml; the fast engine takes its rows (decoder only) |
 | `STARLING_FAST_ATTN_SPLIT=S` | audio-LLM decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
 | `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times (load: GGUF map, engine create, plan, arena allocate/fill) plus the audio-LLM decode round times (ms per step) / per-kernel GPU times |
@@ -82,8 +81,8 @@ maps the GGUF privately instead of reading it (`ModelLoader::weight_data`),
 so nothing is copied before the engine starts and pages load on first
 touch, from all fill threads at once. The engines then *plan* every weight: a matrix is a
 `MatSpec` — source rows plus a destination row mapping (gate/up and GLU
-interleaves, q/k/v concatenation, Voxtral's RoPE permutation, embedding
-chunks) and a scale folded into the group scales (Granite's multipliers).
+interleaves, q/k/v concatenation, embedding chunks) and a scale folded
+into the group scales (Granite's multipliers).
 Its format and size follow from the source types alone, so
 `Arena::finalize` places and allocates every device buffer first and then
 repacks ~1 MiB row units on all cores straight into the mapped device
@@ -154,39 +153,6 @@ ARK 0.6B's suppressed ids (`bad_words_ids`) are a −3e38 lm_head bias. The
 host pages of the loader tensors the engine now owns (`llm.*`, and ARK's
 `enc.*`/`adapter.*`) are returned to the OS (`release_host_weights`).
 
-**Voxtral.** Voxtral-Mini-4B-Realtime runs whole on the device from the
-host log-mel through `generate_additive_from_mel()`. Its encoder is causal:
-the two k3 Conv1d layers are the same time-major GEMMs as ARK's, but the
-mel sits behind two zero rows and the conv1 output behind one (left pads
-2 and 1, conv2's stride 2 as `lda = 2·cin`). The 32 layers are pre-RMSNorm
-with a SwiGLU MLP; their rotate-half RoPE becomes `enc_rope.comp`'s
-adjacent pairs because the halves of every q/k head are interleaved at
-load (q·k is unchanged when both permute alike). The 750-frame sliding
-window runs over 128-query blocks whose keys start 749 rows earlier in
-front-padded k/v buffers; `softmax.comp` masks keys before position 0 and
-outside the window (audio no longer than the window is one causal block).
-The merge-by-4 GELU projector writes an f32 audio-row buffer, and those
-rows are *added* to the token embedding at every position rather than
-filling prompt slots: `embed_rows.comp` adds rows 0..P−1 to the prompt
-(BOS plus 38 streaming pads) and `dec_next.comp` adds the row of the
-position each new token is fed at, read on the device, so the greedy loop
-still waits on one fence per K tokens. Decoding runs in lockstep with the
-audio: the stock offline cap (sequence length = audio rows) is the
-per-call budget, and the KV cache spans the GGUF's 4096 positions
-(≈ 5.4 min of audio, 436 MiB) where one storage-buffer binding can hold
-each cache; PowerVR's 128 MiB range allows 2304 positions (≈ 3 min of
-audio; longer audio is refused). The AdaRMSNorm delay conditioning,
-`1 + fc2(gelu(fc0(t_cond)))`, is a constant per layer and is folded into
-the MLP-norm weights at load. `STARLING_FAST_VOXTRAL_HOST_ENCODER=1` keeps
-the encoder on ggml and hands its rows to `generate_additive()`. On the
-host the fast token ids match ggml's exactly on short and medium; on long,
-3 of 940 ids differ in where the word-boundary token lands, with identical
-text. On the Pixel the transcripts match ggml on all three clips. Decode
-there is bandwidth-bound at ~183 ms/token: the q4k file's Q5_K attention
-and down projections repack to W8, so a token reads ~3.0 GB (W8 layers
-1.75 GB, W4 gate/up 0.83 GB, W8 tied lm_head 0.45 GB). A file with
-4-bit attention/down weights would cut that by about a third.
-
 **Parakeet's transducer decoder stays on the CPU** — sequential, a few small
 matrix-vector products per step — with int8 dot-product kernels (ARMv8.2
 SDOT / x86 AVX2, chosen at run time). The prediction network runs only after
@@ -230,11 +196,11 @@ dir `Android/data/<pkg>/files/npu` (any build: `adb push`). Measured in
 | `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup; 16-byte key loads, value mix in four position groups) |
 | `attn_decode_split.comp`, `attn_split_combine.comp` | the same, split over KV chunks (one workgroup per head and chunk), then a per-head merge of the partial softmaxes |
 | `rope_kv.comp` | prefill q/k norm + RoPE + KV-cache write |
-| `enc_rope.comp` | encoder RoPE (GPT-J pairs over the first rope_dim of each head; ARK, and Voxtral with its heads interleaved at load), in place on q and k |
-| `softmax.comp` | attention softmax with Parakeet's relative-position skew folded into the read index, causal, key-length and sliding-window (Voxtral query blocks) masks |
+| `enc_rope.comp` | encoder RoPE (GPT-J pairs over the first rope_dim of each head; ARK), in place on q and k |
+| `softmax.comp` | attention softmax with Parakeet's relative-position skew folded into the read index, causal and key-length masks |
 | `norm.comp` | LayerNorm / RMSNorm, including the fused layer-boundary pair |
 | `pk_conv.comp` | subsampling convolutions, Conformer depthwise conv + batch-norm + SiLU, MOSS stage-1 conv |
-| `embed_rows.comp`, `dec_next.comp` | embedding lookup; on-device greedy step (argmax, EOS, next embedding), both optionally adding the position's audio row (Voxtral) |
+| `embed_rows.comp`, `dec_next.comp` | embedding lookup; on-device greedy step (argmax, EOS, next embedding) |
 
 Shaders use only Vulkan 1.1 core features (16-bit values are packed in 32-bit
 words); the packed-f16 variants additionally need `shaderFloat16`, and
@@ -280,11 +246,6 @@ model files.
 | Parakeet, 74.4 s | — | 2 331 ms | 1 743 ms |
 | MOSS q4e8, 7.4 s | 3 129 ms | — | 1 820 ms |
 | MOSS, 22.3 s | 9 596 ms | — | 5 150 ms |
-| Voxtral q4k, 7.4 s | 16.2 s¹ | — | 9.3 s (enc+prefill 1.4 s, 77 ms/tok) |
-| Voxtral, 22.3 s | 42.1 s¹ | — | 26.3 s (enc+prefill 3.0 s, 79 ms/tok) |
-| Voxtral, 74.4 s | 144.7 s¹ | — | 84.8 s¹ (enc+prefill 8.3 s, 81 ms/tok) |
-
-¹ first run, no warm-up.
 
 Encoder-only (Parakeet, 22.3 s): 345 ms fast vs 535 ms ggml Vulkan. MOSS
 decode runs at ~33 ms/token, close to this iGPU's memory-bandwidth floor
@@ -349,19 +310,6 @@ median in a 12-run window; Parakeet medium 2.27–2.34 s (in band).
 | Parakeet, 74.4 s | — | 9.0 s | **7.6 s** |
 | MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **5.6 s** (mel 0.13 s, enc+prefill 2.95 s, decode 76 ms/tok) |
 
-Voxtral q4k (first port, untuned; ggml warm numbers from the serving
-sweep, fast after one warm-up, screen off with the wake hold):
-
-| Voxtral / audio | ggml CPU | fast |
-| --- | --- | --- |
-| 7.4 s | 30.5 s | **28.1 s** (enc+prefill 9.3 s, 183 ms/tok × 103) |
-| 22.3 s | 84.6 s | **71.3 s** (enc+prefill 18.3 s, 182–186 ms/tok × 289) |
-| 74.4 s | 356.5 s | **234.4 s** (first run; enc+prefill 47.5 s, 198 ms/tok × 940) |
-
-The encoder and the 39-row prefill are f32-product GEMMs (~130–200
-GFLOPS here). Its decode, mostly W8 GEMVs, turned out not to be
-bandwidth-bound on this GPU: the W8 unpack below took it to ~126 ms/token.
-
 **Audio-LLM decode (2026-10-12, RESEARCH_LOG P4).** Where a step went,
 priced by `STARLING_FAST_DECODE_SKIP` ablation on Qwen3-ASR-0.6B (39.8
 ms/step): GEMVs ~33 ms (the K = 1024 ones with the fused RMSNorm at only
@@ -372,7 +320,7 @@ the attention; a rows-per-row-slot floor for the GEMVs; bit-exact trims of
 the GEMV reduction tail; barriers scoped to compute → compute (the wide
 compute+transfer form was most of the ~30 µs; now ~10 µs per pair);
 RMSNorm as its own dispatch instead of fused into every GEMV workgroup;
-the W8 unpack (Granite and Voxtral, whose Q5_K linears are W8). Measured
+the W8 unpack (Granite, whose Q5_K linears are W8). Measured
 not to pay: int8 activations with `OpSDot` (+17 % on 0.6B, +5 % on MOSS
 despite neutral FLEURS WER — on this GPU the packed dot costs the issue
 slots of the f32 dot it replaces), the flash-decode split, 2–4× threads
@@ -385,11 +333,10 @@ per attention head, 128-row lm_head workgroups, KSTEP 32.
 | MOSS q4e8 | 71.1 / 81.0 | **60.6 / 64.1** | 5.11 / 13.14 s (was 5.45 / 14.66) |
 | ARK-0.6B q4k | 45.1 / 49.4 | **32.2 / 33.8** | 4.56 / 13.56 s (was 4.99 / 15.10) |
 | Granite dynq4 | 92.2 / 101.5 | **74.6 / 78.8** | 6.24 / 15.13 s (was 6.80 / 16.63) |
-| Voxtral q4k | 173.2 / 177.0 | **125.4 / 127.0** | 22.2 / 55.3 s (was 27.1 / 70.0) |
 
 Before = `t3/optimize-phone-model-serving` 84f53c03, after = this branch;
 interleaved in one session per model (screen off, wake hold), medians of
-4 (Voxtral: 1). Transcripts identical before/after on the phone and the
+4. Transcripts identical before/after on the phone and the
 host. Every GEMV now streams 21–30 G weights/s; what remains is the GEMV
 plateau below, not dispatch overhead. The ggml CPU engine decodes
 Qwen3-0.6B at ~22 ms/token on 6 threads.
@@ -410,7 +357,7 @@ each thread's tile-load registers, +20–40 % per GEMM isolated (BK = 8
 pays less, more barriers), and the causal prefill attention now skips
 the score tiles above the diagonal and the P·V products past it. Both
 are bit-exact: transcripts identical before and after on the phone and
-the host for all seven models.
+the host for all six models.
 
 | Model (enc+prefill short / medium; wall) | before | after | wall short / medium after |
 | --- | --- | --- | --- |
@@ -419,12 +366,11 @@ the host for all seven models.
 | MOSS q4e8 | 3.01 / 7.03 s | **2.74 / 6.34 s** | 4.83 / 12.33 s (was 5.09 / 13.01) |
 | ARK-0.6B q4k | 3.39 / 9.95 s | **2.84 / 8.67 s** | 3.86 / 11.83 s (was 4.44 / 13.13) |
 | Granite dynq4 | 3.73 / 9.62 s | **3.27 / 7.86 s** | 5.79 / 13.24 s (was 6.25 / 15.04) |
-| Voxtral q4k | 9.09 / 18.2 s | **8.6 / 16.5 s** | 21.3 / 51.9 s (was 22.0 / 54.6) |
 | Parakeet (encoder) | 0.74 / 2.00 s | **0.63 / 1.62 s** | 0.80 / 1.86 s (was 0.88 / 2.22) |
 
 Before = `t3/optimize-phone-model-serving` 46cb1a38; interleaved, two
 rounds with the order reversed in the second, screen off, wake hold,
-medians of 4 (Voxtral: 2 per clip and binary). RADV unchanged (BK stays
+medians of 4. RADV unchanged (BK stays
 32 there; ±3 %). Measured not to pay on this GPU: f16 products (packed
 FMAs −30 %, `dot(f16vec4)` with k-major tiles ±), f32 shared tiles
 (−30 %), register prefetch of the next tile (−15 %), a broadcast kernel
@@ -446,7 +392,7 @@ limit, the conv by input window). Per class on Qwen3-0.6B short: LLM
 linears 489 → 246 ms, encoder linears 195 → 106, conv 137 → 69,
 attention 33 → 28. Not bit-exact with gemm.comp, but more exact against
 an f64 reference (W4/W8 weights stay f32 after dequantization) and
-transcript-equal: identical transcripts on the phone for all seven
+transcript-equal: identical transcripts on the phone for all six
 models on short and medium, and identical FLEURS en_us WER on 100 clips
 per model with 0 of 100 transcripts differing. Decode is unchanged; on
 RADV gemm.comp's packed-f16 tiles stay 2–2.5× faster, so the kernel is
@@ -459,14 +405,13 @@ PowerVR-only (`STARLING_FAST_SG`).
 | MOSS q4e8 | 2.76 / 6.30 s | **1.49 / 4.80 s** | 3.66 / 11.33 s (was 4.87 / 12.35) |
 | ARK-0.6B q4k | 2.88 / 9.00 s | **1.82 / 7.15 s** | 2.75 / 10.49 s (was 3.81 / 11.98) |
 | Granite dynq4 | 3.28 / 8.23 s | **2.05 / 5.73 s** | 4.51 / 11.83 s (was 5.65 / 13.42) |
-| Voxtral q4k | 9.06 / 19.9 s | **6.23 / 14.2 s** | 21.4 / 63.1 s (was 22.7 / 63.4) |
 | Parakeet (encoder) | 0.71 / 1.98 s | **0.43 / 1.51 s** | 0.65 / 1.87 s (was 0.93 / 2.38) |
 
 One binary, `STARLING_FAST_SG` 0 / 1 interleaved (rounds 0 1 1 0, screen
 off, wake hold), medians of 6 per arm. The long session heated the
 phone and the big models' decode drifted up in the middle rounds, which
-understates the wall gains (Voxtral most: its decode is 2/3 of the
-wall); with a cool-down before every invocation decode measured equal.
+understates the wall gains; with a cool-down before every invocation
+decode measured equal.
 Measured not to pay: f16 products (no 2× f16 rate through Vulkan on this
 driver — LiteRT's fp16 margin is an OpenCL-compiler effect), vec4
 accumulators, two rows per lane, 8 or 32 columns per workgroup. The
@@ -493,7 +438,6 @@ cache first (`POSIX_FADV_DONTNEED`; no root needed).
 | ARK-0.6B q4k (1037 MiB) | 3.75 s → **0.73–0.85 s** | 3.05 s → **1.40–2.22 s** | 2145 → **130–136 MiB** | 2.9 → 1.1 GB |
 | MOSS q4e8 (1612 MiB) | 7.39 s → **0.78–0.88 s** | 5.44 s → **2.20–2.54 s** | 3508 → **186–190 MiB** | 4.8 → 1.9 GB |
 | Granite dynq4 (2546 MiB) | 11.1 s → **1.38–1.60 s** | 12.6 s → **2.63–2.72 s** | 4615 → **321–324 MiB** | 6.6 → 2.7 GB |
-| Voxtral q4k (3845 MiB) | 20.1 s → **1.98–4.1 s** | 13.8 s → **3.38–5.3 s** | 6967 → **113–119 MiB** | 9.2 → 4.1 GB |
 
 Pixel 10 Pro, screen off with the wake hold, `starling-bench` load line
 (the whole `starling_ggml_load`: GGUF, tokenizer, engine). Before = the
@@ -501,20 +445,19 @@ first of two interleaved rounds (base, then this branch, cold then warm
 per binary; the second, warmer round was 20–60 % slower for both); after
 = the range over two sweeps of the final code (cold-load spread is mostly
 storage). Transcripts of
-short and medium are identical before and after on all six models, on
+short and medium are identical before and after on all five models, on
 the phone and on the RADV host. Cold = the GGUF evicted from the page
 cache first: storage reads ~1 GB/s here, so a cold load is now mostly
 the read itself. The MemAvailable drop is dominated by the device
 allocation, which the weights need anyway. On the host (RADV, staged
-fill): Granite 5.7 → 2.7 s and 5.1 GB → 0.7 GB peak; Voxtral, which did
-not fit the 7 GB test cgroup before, loads in 3.2 s at 0.4 GB.
+fill): Granite 5.7 → 2.7 s and 5.1 GB → 0.7 GB peak.
 
 Where a warm Granite load goes now: GGUF header parse 0.11 s, Vulkan
 device 0.08 s, two threads allocating 2.5 GB (the driver zeroes it) for
 0.5 s overlapped with the fill, which ends at 1.2 s; most of the fill's
 CPU time past the allocation is the Q5_K → W8 requantization. Two
-allocator threads instead of one: Granite ~0.4 s and Voxtral ~1.9 s
-faster (STARLING_FAST_ALLOC_THREADS A/B).
+allocator threads instead of one: Granite ~0.4 s faster
+(STARLING_FAST_ALLOC_THREADS A/B).
 
 Pipeline creation is not part of the load: pipelines are built while the
 first pass is recorded. With the pipeline cache in `STARLING_FAST_CACHE_DIR`

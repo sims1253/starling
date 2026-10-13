@@ -19,8 +19,6 @@ convert = [
     "sentencepiece>=0.2.0",
     "librosa",
     "huggingface-hub>=1.0.0",
-    # Voxtral's processor tokenizes through mistral-common (tekken.json).
-    "mistral-common>=1.11.7",
 ]
 # Corpus export and calibration (benchmarks/fast_engine/export_fleurs.py,
 # benchmarks/fleurs_*.py, benchmarks/imatrix_collect.py).

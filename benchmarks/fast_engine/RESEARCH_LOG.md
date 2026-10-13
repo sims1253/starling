@@ -1,5 +1,8 @@
 # Fast-engine research log (Pixel 10 Pro)
 
+> Note (2026-10-13): Voxtral support was removed from Starling; the Voxtral
+> measurements below are kept as history.
+
 Baseline: branch head `94230cf`. Workload: `starling-bench` on the phone,
 `STARLING_ENGINE=fast`, median of 3 runs after warm-up (`pixel_measure.sh`;
 `phone_ab.sh` for alternating A/B).
