@@ -38,30 +38,19 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR and AMD, which otherwise ship measured defaults) |
 | `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR and AMD) |
 | `STARLING_FAST_W8U=0/1` | W8 decode GEMVs through xor 0x80 + `unpackUnorm4x8` (default on for PowerVR) |
-| `STARLING_FAST_MICRO=...` | run isolated kernel probes at load, `;`-separated (`bits,N,K[,reps[,rows]]` GEMV, `gemmx,M,N,K,kind[,reps[,f\|h\|g\|-]]` prefill GEMM — `g` = `gemm_sg.comp` —, `norm,...`, `alu,...`, `alu2,...`, `idot,...`; see `Kernels::micro`) |
+| `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |
 | `STARLING_FAST_SG=0/1` | encoder/prefill GEMMs through the subgroup-broadcast kernel `gemm_sg.comp` (default on for PowerVR where compute shaders have subgroup broadcast and ≥ 16-lane subgroups; off elsewhere) |
-| `STARLING_FAST_SG_TEX=0` | `gemm_sg` reads A from the storage buffer instead of through texel-buffer views (the texture path) |
-| `STARLING_FAST_SG_TEXEL_MAX=n` | tests: cap `gemm_sg`'s texel views at `n` texels, so hosts with huge limits exercise the row-blocked views PowerVR's 65536 needs |
-| `STARLING_FAST_TILE=BM,BN,TM,TN[,BK]` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile (BK: k per tile, 32/16/8) / GEMV rows |
-| `STARLING_FAST_BK=8/16/32` | GEMM k-tile depth only (default 16 on PowerVR, 32 elsewhere) |
-| `STARLING_FAST_GEMV_RPP=n` | minimum GEMV rows per row slot, kept at ≥ 64 workgroups (default 16 on PowerVR, off elsewhere; `0` = off) |
+| `STARLING_FAST_TILE=BM,BN,TM,TN` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile / GEMV rows |
 | `STARLING_FAST_KSTEP=n` | audio-LLM decode tokens per submission (default 16) |
 | `STARLING_FAST_{ARK,GRANITE}_HOST_ENCODER=1` | keep that model's audio encoder on ggml; the fast engine takes its rows (decoder only) |
 | `STARLING_FAST_ATTN_SPLIT=S` | audio-LLM decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
 | `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times (load: GGUF map, engine create, plan, arena allocate/fill) plus the audio-LLM decode round times (ms per step) / per-kernel GPU times |
 | `STARLING_FAST_MAPPED_WEIGHTS=0/1` | repack straight into mapped device memory (default where it is CPU-cached: UMA phones) / fill one host staging buffer per device buffer and copy |
-| `STARLING_FAST_ALLOC_THREADS=n` | threads creating the mapped weight buffers while the fill runs (default 2) |
-| `STARLING_GGUF_MMAP=0` | read the GGUF into anonymous memory instead of mapping it (any engine; A/B only) |
-| `STARLING_GGUF_READAHEAD=1` | stream the mapped GGUF from storage in the background (`posix_fadvise` WILLNEED; default off — see *Model load*) |
-| `STARLING_FAST_FORCE_FAIL=1` | tests: fail the fast engine after a full load, so `auto` exercises the ggml fallback on consumed weights |
-| `STARLING_FAST_DECODE_SKIP=qkv,attn,o,up,down,lm[,empty][,bar]` | diagnostic: drop those decode dispatches (EOS off; `empty` puts a one-workgroup no-op in their place, `bar` drops the barriers) to price each kernel class by difference |
-| `STARLING_FAST_SKIP=label[,prefix*]` | diagnostic: drop every dispatch recorded under those labels (`enc_qkv`, `llm_ff_up`, `conv_pw2`, `enc_*`, …; results are garbage) to price encoder/prefill work by difference |
-| `STARLING_FAST_FULL_BARRIER=1` | every recorded barrier in the wide compute+transfer form (default: scoped to the commands it orders) |
+| `STARLING_FAST_SKIP=label[,prefix*]` | diagnostic: drop every dispatch recorded under those labels (`enc_qkv`, `llm_ff_up`, `dec_qkv`, `conv_pw2`, `enc_*`, …; results are garbage) to price work by difference where GPU timestamps are unreliable (PowerVR) |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
 | `STARLING_NPU_DIR=dir[:dir…]` | where TPU artifacts are looked up and `status-*.txt` written (default: `STARLING_FAST_CACHE_DIR`); see *Pixel TPU encoder* below |
-| `STARLING_NPU=0` | never use a TPU artifact (GPU encoder and prefill) |
-| `STARLING_NPU_PREFILL=0` | TPU encoder, but the GPU prefill (Qwen3-ASR) |
+| `STARLING_NPU=0` | never use a TPU artifact (GPU encoder) |
 
 ## Design
 
@@ -173,7 +162,7 @@ both compiles a `.tflite` on the device and runs the result. Compiling only
 works from the adb shell (the firmware's compile service serves just the apps
 on Google's EdgeTPU allowlist), so the user compiles on their own phone over
 adb and nothing precompiled ships: load the Qwen3-ASR model in the app once,
-then run `benchmarks/npu/npu_compile_all.sh`. It finds the phone
+then run `scripts/npu/npu_compile_all.sh`. It finds the phone
 (`ANDROID_SERIAL`, the one `adb devices` entry, or wireless debugging via
 mDNS; `--wait S`), the installed Starling packages (release, `.debug`,
 `.experimental`), reads what each loaded model reported (below), and compiles
@@ -194,14 +183,6 @@ clip (7.4 s, Qwen3-ASR-0.6B, after the subgroup-broadcast GEMM): encoder +
 prefill 558 → 396 ms, wall 1576 → 1422 ms (TPU encoder 54 ms); transcripts
 match the GPU's up to a punctuation near-tie.
 
-*Opt-in LLM prefill* (Qwen3-ASR-0.6B only): `npu_compile.sh … --prefill 128`
-adds the LLM trunk for prompts of up to 128 tokens (≈ 8.6 s of audio) as two
-14-layer segments (`qwen3-llm-prefill-<fingerprint>-sb128-l<a>-<b>.stnpu`,
-2 × 457 MB); the K/V rows go straight into the GPU cache and the last row into
-the first decode step. Short clip: encoder + prefill 396 → 259 ms, wall
-1422 → 1284 ms; most of what remains is the K/V hand-off (~108 ms). Off unless
-its files exist; `STARLING_NPU_PREFILL=0` skips it.
-
 *Fallback, said out loud.* Without a matching artifact, with `STARLING_NPU=0`,
 or after any TPU error the engine runs the GPU encoder as before. Each piece's
 state (`ok`, `missing`, `stale` — compiled for older firmware or by an older
@@ -210,13 +191,12 @@ existing `STARLING_NPU_DIR` directory (what `npu_compile_all.sh` reads;
 `missing` only where the firmware lists the TPU library, and without loading
 it), stale and error states are logged once per process (logcat tag
 `StarlingNpu`: "TPU … not used (stale), the GPU runs it: … — recompile via
-adb"), and `describe()` carries the stale note. Measured with
-`benchmarks/npu/phone_npu_ab.sh` and `phone_npu_fleurs.sh`.
+adb"), and `describe()` carries the stale note.
 
 *Compiler limits, and why only Qwen3-ASR* (firmware 0.21.0, Pixel 10 Pro).
 The on-device compiler accepts graphs whose tensors stay window-sized; the
-other audio encoders were tried and parked (`benchmarks/npu/parked/`, exact
-against HF on the host, not wired in):
+other audio encoders were exported (exact against HF on the host) but do not
+compile or run correctly:
 * a batched matmul with more than 256 keys fails ("Reshape input/output slice
   mismatch"), so 30 s of global (ARK-ASR) or long sliding-window attention
   does not compile as is;
@@ -237,8 +217,8 @@ MOSS-Transcribe's encoder (the Qwen3-Omni audio tower, at 32 × 1280, in
 encoder took ~1.1 s on that clip before the subgroup GEMM), but its last
 segment returns wrong rows (rel-L2 0.98: ln_post and the projection are
 exact, the gated-MLP adapter is not — its SwiGLU products are ~1e-4, half
-below fp16's normal range, and scaling them by 1024 did not help), so it is
-parked too.
+below fp16's normal range, and scaling them by 1024 did not help), so it
+stays on the GPU too.
 
 **Compiling can reboot the phone.** Twice the compiler took the whole phone
 down — `kernel_panic,system_is_deadloomld_on_oomory`, with 11.7 GB available
@@ -246,8 +226,8 @@ before the compile: once on a 4 MB probe graph (four 256-row slices of a
 `[1, 1024, 1024]` input, each through a linear layer, concatenated:
 "pslice-1024"), once on MOSS's adapter alone (`[1, 104, 2048]` → 8192 →
 2048, 100 MB). Neither size nor free memory predicts it. The compile scripts
-therefore build only the graphs with a clean record (the Qwen3-ASR encoder;
-the 0.6B prefill segments on request), with fixed shapes, refuse graphs above
+therefore build only the graph with a clean record (the Qwen3-ASR encoder),
+with fixed shapes, refuse graphs above
 640 MB, and refuse to compile with less than 4 GB available
 (`NPU_MIN_MEM_MB`); save your work on the phone before running them.
 
@@ -376,7 +356,7 @@ median in a 12-run window; Parakeet medium 2.27–2.34 s (in band).
 | MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **5.6 s** (mel 0.13 s, enc+prefill 2.95 s, decode 76 ms/tok) |
 
 **Audio-LLM decode (2026-10-12, RESEARCH_LOG P4).** Where a step went,
-priced by `STARLING_FAST_DECODE_SKIP` ablation on Qwen3-ASR-0.6B (39.8
+priced by ablation (each kernel class dropped from the recording) on Qwen3-ASR-0.6B (39.8
 ms/step): GEMVs ~33 ms (the K = 1024 ones with the fused RMSNorm at only
 15–17 G weights/s), attention 5.9 ms, and ~4 ms in 141 dispatch+barrier
 pairs at ~30 µs each. Landed, each an interleaved A/B with identical
@@ -416,7 +396,7 @@ of ~1.4 TFLOPS (`alu` probe, ≥ 280 workgroups). The probes located the
 limit: the register-tiled product loop itself, with its operands read
 from shared memory as the GEMM does, caps at ~400 GFLOPS (packed f16
 operands; ~300 with f32 words, ~800–1000 with the same FMAs on register
-operands; `alu2` modes 0/4/5), and the tile loads and barriers take the
+operands), and the tile loads and barriers take the
 rest. What paid is occupancy: 16-deep k-tiles halve the shared tiles and
 each thread's tile-load registers, +20–40 % per GEMM isolated (BK = 8
 pays less, more barriers), and the causal prefill attention now skips
@@ -445,10 +425,10 @@ thread workgroups, and hoisting the conv im2col divisions (+1 %).
 
 **Subgroup-broadcast GEMM (2026-10-13, RESEARCH_LOG P6).** LiteRT's GPU
 accelerator ran the Qwen3-ASR encoder 3.4× faster than P5's GEMMs, and
-its kernels showed why (`benchmarks/litert_gpu`): no shared memory at
-all. `gemm_sg.comp` now takes every encoder/prefill GEMM on PowerVR —
-W4 / W8 / F16 weights, the 3×3 conv GEMMs, the attention scores; P·V
-stays on gemm.comp — with one row of A per lane, 16 output columns per
+its kernels showed why: no shared memory at all. `gemm_sg.comp` now takes
+every encoder/prefill GEMM on PowerVR — W4 / W8 / F16 weights, the 3×3
+conv GEMMs, the attention scores; P·V stays on gemm.comp — with one row
+of A per lane, 16 output columns per
 subgroup-sized workgroup, each 8-deep slice of the 16 columns' weights
 loaded and dequantized to f32 by 16 lanes and handed to all 128 with
 `subgroupBroadcast`, f32 dot products, and A read through texel-buffer
@@ -521,8 +501,7 @@ Where a warm Granite load goes now: GGUF header parse 0.11 s, Vulkan
 device 0.08 s, two threads allocating 2.5 GB (the driver zeroes it) for
 0.5 s overlapped with the fill, which ends at 1.2 s; most of the fill's
 CPU time past the allocation is the Q5_K → W8 requantization. Two
-allocator threads instead of one: Granite ~0.4 s faster
-(STARLING_FAST_ALLOC_THREADS A/B).
+allocator threads instead of one: Granite ~0.4 s faster.
 
 Pipeline creation is not part of the load: pipelines are built while the
 first pass is recorded. With the pipeline cache in `STARLING_FAST_CACHE_DIR`
@@ -531,9 +510,10 @@ nothing measurable on Granite; with an empty cache directory (first
 launch, or a cleared app cache) it costs ~7 s on Parakeet and ~6.6 s on
 Granite — worth keeping the cache directory out of anything the OS
 trims. The ggml fallback is unaffected by the fast engine having
-consumed (and dropped) the mapped GGUF pages: `STARLING_ENGINE=auto` with
-`STARLING_FAST_FORCE_FAIL=1` gives the ggml transcripts on the phone
-(Parakeet, Qwen3) and on the host (all six models).
+consumed (and dropped) the mapped GGUF pages: with the fast engine forced
+to fail after a full load, `STARLING_ENGINE=auto` gave the ggml
+transcripts on the phone (Parakeet, Qwen3) and on the host (all six
+models).
 
 Measured and not kept: a CPU-cached (non-coherent) memory type for the
 weights (no gain once the copy was gone; the coherent write-combined
@@ -545,8 +525,8 @@ GGUF (`posix_fadvise` WILLNEED from a thread: on cold Pixel loads it
 never beat the fill's own parallel page faults and often queued the
 header parse behind it — Qwen3 0.94–1.0 s without, 1.0–1.7 s with;
 Granite 1.95–2.16 s vs 2.26–2.86 s — and over a cached file walking its
-pages contends with the faults: host warm Qwen3 0.82 → 0.52 s without;
-`STARLING_GGUF_READAHEAD=1` keeps it as an option); an inlined f32→f16 conversion (5.0 → 3.3 ns per value, too small
+pages contends with the faults: host warm Qwen3 0.82 → 0.52 s without);
+an inlined f32→f16 conversion (5.0 → 3.3 ns per value, too small
 to matter); lazily reading GGUF string arrays (2 ms). A repacked-weight
 cache on disk was not built: on a warm Granite load it could save at
 most the ~0.7 s the fill runs past the allocation (the fill would become

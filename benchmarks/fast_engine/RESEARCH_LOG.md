@@ -2,6 +2,14 @@
 
 > Note (2026-10-13): Voxtral support was removed from Starling; the Voxtral
 > measurements below are kept as history.
+>
+> Note (2026-10-13): the one-off tooling behind P4–P7 was removed once its
+> results landed: the decode ablation knob, the `gemmx` / `alu2` kernel
+> probes, the LiteRT GPU study (harness, OpenCL interposer, Vulkan probes),
+> the TPU A/B, ablation, FLEURS and probe scripts, the parked ARK / Granite /
+> MOSS TPU exports, and the opt-in Qwen3 TPU prefill (P7-1). The entries
+> below keep what they measured; the tooling is in the git history. The TPU
+> encoder compile flow lives in `scripts/npu/`.
 
 Baseline: branch head `94230cf`. Workload: `starling-bench` on the phone,
 `STARLING_ENGINE=fast`, median of 3 runs after warm-up (`pixel_measure.sh`;
@@ -1039,8 +1047,8 @@ Granite, short and medium.
 **Where the 40 ms went** (Qwen3-0.6B short, 39.8 ms/step). The per-kernel
 timestamps (`STARLING_FAST_PROFILE`) are misattributed on the tiler
 (ff_up 28 %, ff_down 22 %, attn 16 %, o 13 %, qkv 13 %, lm_head 9 %), so
-the new `STARLING_FAST_DECODE_SKIP` ablation prices each class by
-difference: attention 5.9, qkv 7.6, o 2.1, gate/up 10.8, down 3.0,
+a decode ablation knob (dropping a kernel class from the recording;
+since removed) prices each class by difference: attention 5.9, qkv 7.6, o 2.1, gate/up 10.8, down 3.0,
 lm_head 9.3 ms/step; 141 no-op dispatches with their barriers 3.3–4.8
 ms/step (24–34 µs each; with no dispatches at all 0.08). The K = 1024
 GEMVs with the fused RMSNorm (qkv, gate/up, the 151936-row lm_head) ran
@@ -1112,9 +1120,9 @@ build). Parakeet medium (2.0 s): feed forwards 1180 ms (58 %), q/k/v/o/pos
 277, pointwise convs 225, attention 142, depthwise conv + norms 15,
 subsampling 58.
 
-**What limits the GEMM** (`STARLING_FAST_MICRO` probes, new: `gemmx` times
+**What limits the GEMM** (kernel probes, since removed: `gemmx` timed
 a prefill GEMM at a real shape with a CPU reference and a bitwise
-comparison; `alu2` prices register-operand FMAs; all probes now warm the
+comparison; `alu2` priced register-operand FMAs; all probes now warm the
 GPU clock for 100 ms — the governor idles at 396 MHz and polls every 20 ms):
 
 | # | Probe / hypothesis | Result |
@@ -1128,7 +1136,7 @@ GPU clock for 100 ms — the governor idles at 396 MHz and polls every 20 ms):
 | P5-7 | f32 shared tiles (no unpack in the product loop) | −30 % (twice the shared bytes). discard |
 | P5-8 | Register double-buffering of the next tile (global loads issued before the products) | −15 % (down projection +20 %): the extra registers cost occupancy. discard |
 | P5-9 | Broadcast kernel: each thread owns whole weight columns, dequantizes its weights in registers, A broadcast from a tiny shared tile; with and without double-buffered A and prefetched weights | bit-exact, but 0.75–1.1× of the tile kernel at every shape (one session showed +25 % that did not reproduce). discard |
-| P5-10 | **Half-depth k-tiles (BK 32 → 16)**: half the shared tiles (10 → 5 KiB) and half the tile-load registers per thread | isolated W4 +3..+40 %, W8 +24..+43 %, conv +37 %; BK 8 gains less (more barriers). In context: Qwen3-0.6B enc+prefill −12 % short / −15.5 % medium, Parakeet encoder −20 %. Bit-exact (each output's k order is unchanged). **keep** (PowerVR default; BK is now a spec constant, `STARLING_FAST_BK`) |
+| P5-10 | **Half-depth k-tiles (BK 32 → 16)**: half the shared tiles (10 → 5 KiB) and half the tile-load registers per thread | isolated W4 +3..+40 %, W8 +24..+43 %, conv +37 %; BK 8 gains less (more barriers). In context: Qwen3-0.6B enc+prefill −12 % short / −15.5 % medium, Parakeet encoder −20 %. Bit-exact (each output's k order is unchanged). **keep** (PowerVR default; BK is now a spec constant) |
 | P5-11 | Tile shapes at BK 16 (32,128,8,4 / 64,128,4,8 / 64,128,8,8 / 32,256,4,8 / 16,128,2,8 / 128,128,8,8@8) | isolated mixed (32,128,8,4 +4..20 % on W4, 64,128,4,8 +29 % on W8 gate/up); in context 32,128,8,4 −1.5 % medium / ±0 short, 64,128,4,8 +15 % and +24 % (Parakeet). discard |
 | P5-12 | Unorm-trick dequant in the tile loads (`unpackUnorm4x8`, the GEMV trick) | ± and not bit-exact (q/255 rounding). discard |
 | P5-13 | **Causal prefill attention**: skip score tiles above the diagonal, stop P·V at the last visible key | medium −1.9 %, short ±0 (S ≈ 112 is a handful of tiles). Bit-exact. **keep** |
@@ -1174,19 +1182,19 @@ operand reads from shared memory. Base: `t3/optimize-phone-model-serving`
 interleaved rounds 0 1 1 0, medians); one binary, `STARLING_FAST_SG=0`
 (gemm.comp) vs `=1` (gemm_sg.comp).
 
-**Where it came from** (`benchmarks/litert_gpu`, the LiteRT study).
+**Where it came from** (the LiteRT study).
 LiteRT 2.3's GPU accelerator (ML Drift, OpenCL on this phone) runs the
 Qwen3-ASR-0.6B audio encoder window in 120 ms fp16 / 347 ms fp32 against
 our 409 ms (encoder-only by `STARLING_FAST_SKIP`); its fp32 numbers match
 torch (rel-L2 2e-6), fp16 gives rel-L2 2.7e-2 with the reference
-transcript. An OpenCL interposer (`clshim`) dumped its kernels: no shared
+transcript. An OpenCL interposer dumped its kernels: no shared
 memory and no barriers in any matmul; a 128-lane workgroup (= one
 subgroup) with one thread per output row; 8 lanes load the weights of
 the step and `sub_group_broadcast(w, const)` hands them to every lane;
 activations come per thread through `read_imageh` (texture path, clamp
 bounds); register blocks as small as one half4 accumulator.
 
-**Probes** (Vulkan, standalone, `benchmarks/litert_gpu/vk_probe`):
+**Probes** (Vulkan, standalone):
 
 | # | Probe / hypothesis | Result |
 | --- | --- | --- |
@@ -1290,12 +1298,12 @@ Goal: take the Tensor G5 TPU path (our own `cpp/npu` client on the
 firmware's on-device compiler, no Tensor SDK) from Qwen3-ASR's encoder to
 every model where it pays: Qwen3's LLM prefill and the audio encoders of
 ARK-ASR, Granite Speech, Voxtral (removed from Starling meanwhile) and
-MOSS-Transcribe. Outcome: Qwen3-ASR only; the rest is parked
-(`benchmarks/npu/parked/`).
+MOSS-Transcribe. Outcome: Qwen3-ASR's encoder only; the other encoders
+do not compile or run correctly, and their exports were dropped.
 
 | # | Piece | Result | Verdict |
 |---|---|---|---|
-| P7-1 | Qwen3-ASR-0.6B LLM prefill on the TPU (sb128, two 14-layer segments, 2 × 457 MB) | short clip after the subgroup GEMM: enc+prefill 558 (GPU) → 396 (TPU encoder) → **259 ms** (+ TPU prefill), wall 1576 → 1422 → **1284 ms**; TPU trunk 78.6 ms, K/V hand-off into the GPU cache 108 ms, first token 13 ms; transcript = GPU's up to a punctuation near-tie. A whole 28-layer trunk (1.76 GB) and sb416 fail to compile (FAILED_TRANSACTION). | **keep, opt-in** (`npu_compile.sh --prefill 128`, 0.6B only) |
+| P7-1 | Qwen3-ASR-0.6B LLM prefill on the TPU (sb128, two 14-layer segments, 2 × 457 MB) | short clip after the subgroup GEMM: enc+prefill 558 (GPU) → 396 (TPU encoder) → **259 ms** (+ TPU prefill), wall 1576 → 1422 → **1284 ms**; TPU trunk 78.6 ms, K/V hand-off into the GPU cache 108 ms, first token 13 ms; transcript = GPU's up to a punctuation near-tie. A whole 28-layer trunk (1.76 GB) and sb416 fail to compile (FAILED_TRANSACTION). | kept opt-in at first, then **removed**: 2 × 457 MB of artifacts per model for ~140 ms per short clip |
 | P7-2 | ARK-ASR / Voxtral encoders, 1500 positions | interleaved RoPE: "Reshape input/output slice mismatch"; probes: any batched matmul with > 256 keys fails the same way (256 compiles), as does the rotate-half's last-dim slice of a 64-wide head (a constant `[hd, hd]` matmul compiles) | compiler limit |
 | P7-3 | ARK with blocked attention (≤ 250-row blocks sliced from `[1, P, d]`, online softmax; exact vs HF on 29 s) | "Cannot remove elements due to shape mismatch" (layers 0–2); "TENSOR_MOVEMENT layer … overflows memory" (layers 8–16) | **parked** |
 | P7-4 | Granite (conformer, Shaw block attention 200, Q-Former; P = 1600, exact vs HF) | 1 layer @ 600: "Cannot remove elements …" (fp16 and int8 weights alike; K/V and GLU halves are activation slices); 0–8 @ 1600: TENSOR_MOVEMENT overflow; 8–16 (680 MB .tflite): compile service `DEAD_OBJECT`, lmkd killed background apps | **parked** |
@@ -1304,8 +1312,8 @@ MOSS-Transcribe. Outcome: Qwen3-ASR only; the rest is parked
 | P7-7 | MOSS adapter alone (`[1, 104, 2048]` → 8192 → 2048, 100 MB) | **second kernel panic** during compile (uptime 14 s after), 11.7 GB available before | stop; Qwen3 only |
 | P7-8 | `FAILED_TRANSACTION` / "Binder buffer full" | only the compiler's error text exceeding the binder reply; the real error is in logcat (`edgetpu_vendor_service`) | diagnosis |
 
-Kept: the compile scripts build only graphs with a clean record (Qwen3-ASR
-encoder; the 0.6B prefill on request), with fixed shapes, a 640 MB graph cap
+Kept: the compile scripts build only the graph with a clean record (the
+Qwen3-ASR encoder), with fixed shapes, a 640 MB graph cap
 and a 4 GB MemAvailable floor; `npu_compile_all.sh` compiles the Qwen3-ASR
 encoders the installed app reported (status files), into the release
 (external files dir) or debuggable (run-as) package; the engine reports
