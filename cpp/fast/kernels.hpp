@@ -190,6 +190,8 @@ public:
     vk::Context& ctx() { return *ctx_; }
 
     bool gemm(vk::Recording& rec, const GemmCall& c, std::string& err);
+    // Whether gemm() would take the subgroup-broadcast kernel for `c`.
+    bool sg_eligible(const GemmCall& c) const;
     // Convenience: activation [M, K] (f16) times a resident weight matrix.
     bool gemm_w(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref A, uint32_t M,
                 uint32_t lda, vk::Ref C, uint32_t ldc, Epi epi, Act act, vk::Ref bias,
@@ -240,8 +242,17 @@ public:
     const char* gemv_shader(GpuFmt f) const;
     bool tile_pinned_ = false;  // STARLING_FAST_TILE given: no per-op tile heuristics
     bool rsplit_on_ = true;  // RSPLIT row slots to pad GEMV workgroups
+    // Encoder/prefill GEMMs through gemm_sg.comp (subgroup-broadcast weights,
+    // no shared memory) instead of gemm.comp's shared tiles; sg_tex_: its A
+    // operand through the texture path where the view limits allow.
+    bool sg_gemm_ = false;
+    bool sg_tex_ = true;
+    // Columns per gemm_sg workgroup: 16, or 8 when a 16-column grid would
+    // have fewer than sg_min_wgs_ workgroups (STARLING_FAST_SG_NB=8/16 pins).
+    uint32_t sg_nb_ = 0, sg_min_wgs_ = 128;
 
 private:
+    bool gemm_sg(vk::Recording& rec, const GemmCall& c, std::string& err);
     vk::Context* ctx_ = nullptr;
     vk::Buffer dummy_;
 };

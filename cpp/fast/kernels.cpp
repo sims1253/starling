@@ -619,6 +619,29 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     w8_unpack_ = ctx.info().vendor_id == 0x1010;
     if (const char* e = std::getenv("STARLING_FAST_W8U")) w8_unpack_ = e[0] == '1';
     rsplit_on_ = !(std::getenv("STARLING_FAST_NORSPLIT") && std::getenv("STARLING_FAST_NORSPLIT")[0] == '1');
+    // Subgroup-broadcast GEMM (gemm_sg.comp, the structure of LiteRT's
+    // PowerVR matmul): one row of A per lane, 16 output columns per
+    // workgroup, the weights loaded and dequantized by 16 lanes and handed
+    // to all of them with subgroupBroadcast, A through the texture path, no
+    // shared memory. PowerVR (DXT, subgroup 128): ~2x gemm.comp's GFLOPS at
+    // the encoder/prefill shapes (benchmarks/litert_gpu, RESEARCH_LOG P6).
+    // Needs subgroup broadcast in compute shaders and a subgroup of >= 16
+    // lanes that fits one workgroup. STARLING_FAST_SG=0/1 overrides the
+    // vendor default; STARLING_FAST_SG_TEX=0 reads A from the storage buffer.
+    {
+        const vk::DeviceInfo& di = ctx.info();
+        const bool sg_ok = di.subgroup_compute && (di.subgroup_ops & VK_SUBGROUP_FEATURE_BALLOT_BIT) &&
+                           di.subgroup_size >= 16 && di.subgroup_size <= di.max_wg_invocations;
+        sg_gemm_ = sg_ok && di.vendor_id == 0x1010;
+        if (const char* e = std::getenv("STARLING_FAST_SG")) sg_gemm_ = sg_ok && e[0] == '1';
+        if (const char* e = std::getenv("STARLING_FAST_SG_TEX")) sg_tex_ = e[0] == '1';
+        if (const char* e = std::getenv("STARLING_FAST_SG_NB")) {
+            const int nb = std::atoi(e);
+            sg_nb_ = nb == 8 || nb == 16 ? (uint32_t)nb : 0;
+        }
+        if (const char* e = std::getenv("STARLING_FAST_SG_MIN_WGS")) sg_min_wgs_ = (uint32_t)std::atoi(e);
+        if (di.max_texel_elems < 1024) sg_tex_ = false;
+    }
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn, bk = tile.BK;
         if (std::sscanf(e, "%u,%u,%u,%u,%u", &bm, &bn, &tm, &tn, &bk) >= 4 &&
@@ -652,7 +675,102 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     return true;
 }
 
+bool Kernels::sg_eligible(const GemmCall& c) const {
+    if (!sg_gemm_ || c.b == BKind::F16T || c.a.K % 8 || !c.a.M || !c.a.N) return false;
+    if ((c.b == BKind::W4 || c.b == BKind::W8) && c.a.K % 32) return false;
+    if (c.a.lda % 8 || c.a.a_off % 8 || c.a.sa_hi % 8 || c.a.sa_lo % 8) return false;
+    if (c.a_conv) return c.b == BKind::F16 && c.a.cv_cin % 8 == 0 && c.a.cv_cin >= 8;
+    if (c.b == BKind::F16 && (c.a.ldb % 8 || c.a.b_off % 8 || c.a.sb_hi % 8 || c.a.sb_lo % 8)) return false;
+    return true;
+}
+
+// gemm_sg.comp's push block: gemm.comp's plus the A view's first texel and
+// the first row of the dispatch.
+struct SgArgs {
+    GemmArgs a;
+    uint32_t a_tex0 = 0, m_first = 0;
+};
+static_assert(sizeof(SgArgs) <= vk::kPushBytes, "gemm_sg push constants");
+
+bool Kernels::gemm_sg(vk::Recording& rec, const GemmCall& c, std::string& err) {
+    const vk::DeviceInfo& di = ctx_->info();
+    const uint32_t WG = di.subgroup_size;
+    // 8 columns per workgroup where 16 would leave the GPU short of
+    // workgroups (the encoders' d x d projections); the k order of every
+    // output is the same either way.
+    uint32_t nb = sg_nb_;
+    if (!nb) nb = (uint64_t)ceil_div(c.a.N, 16) * ceil_div(c.a.M, WG) * c.batch < sg_min_wgs_ ? 8 : 16;
+    const std::string base = std::string(c.a_conv ? "gemm_sg_conv" : c.b == BKind::W4 ? "gemm_sg_w4"
+                                         : c.b == BKind::W8 ? "gemm_sg_w8" : "gemm_sg_f16") +
+                             (nb == 8 ? "_n8" : "");
+    const uint32_t gx = ceil_div(c.a.N, nb);
+    const std::vector<uint32_t> spec{WG, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode};
+    auto bindings = [&](vk::Ref a) {
+        return std::vector<vk::Ref>{a, or_dummy(c.Bq), or_dummy(c.Bs), or_dummy(c.C),
+                                    or_dummy(c.bias), or_dummy(c.bias2), or_dummy(c.C2)};
+    };
+    // Elements of A (relative to the Ref) the dispatch reads: [lo, hi).
+    const uint64_t lo = c.a.a_off;
+    uint64_t hi;
+    if (c.a_conv) {
+        const uint64_t chunks = ceil_div(c.a.M, c.a.cv_to * c.a.cv_fo);
+        hi = lo + chunks * c.a.cv_ti * c.a.cv_fi * c.a.cv_cin;
+    } else {
+        const uint64_t zh = (c.batch - 1) / c.a.nb_lo, zl = std::min(c.batch - 1, c.a.nb_lo - 1);
+        hi = lo + zh * c.a.sa_hi + zl * c.a.sa_lo + (uint64_t)(c.a.M - 1) * c.a.lda + c.a.K;
+    }
+    const uint64_t max_bytes = (uint64_t)di.max_texel_elems * 16;
+    const uint64_t align = di.min_texel_align;
+    // A texture-path dispatch of rows [m_first, m_first + rows) reading
+    // elements [elo, ehi): a view from the aligned byte below elo.
+    auto tex_dispatch = [&](uint32_t m_first, uint32_t rows, uint64_t elo, uint64_t ehi) -> bool {
+        const VkDeviceSize a0 = c.A.off + elo * 2;
+        const VkDeviceSize voff = a0 / align * align;
+        const VkDeviceSize need = c.A.off + ehi * 2 - voff;
+        const VkDeviceSize avail = c.A.buf->size - voff;
+        const VkDeviceSize range = std::min<VkDeviceSize>(std::min<VkDeviceSize>(avail, max_bytes), (need + 15) / 16 * 16);
+        const vk::Pipeline* p = ctx_->pipeline((base + "_t").c_str(), spec, err);
+        if (!p) return false;
+        SgArgs a;
+        a.a = c.a;
+        // texel = (element >> 3) - a_tex0, with the element counted from the
+        // Ref (A.off is 16-byte aligned, checked by the caller).
+        a.a_tex0 = (uint32_t)(((int64_t)voff - (int64_t)c.A.off) / 16);
+        a.m_first = m_first;
+        rec.dispatch(*p, bindings(vk::Ref(*c.A.buf, voff, range)), &a, sizeof(a), gx, ceil_div(rows, WG),
+                     c.batch);
+        return true;
+    };
+    if (sg_tex_ && c.A.buf && c.A.off % 16 == 0) {
+        const VkDeviceSize a0 = c.A.off + lo * 2;
+        if (c.A.off + hi * 2 - a0 / align * align <= max_bytes) return tex_dispatch(0, c.a.M, lo, hi);
+        // Too large for one view: row blocks of whole workgroups, each with
+        // its own view (plain row-major A only).
+        if (!c.a_conv && c.batch == 1) {
+            const uint64_t row_bytes = (uint64_t)c.a.lda * 2;
+            const uint64_t fit = max_bytes > align + c.a.K * 2u ? (max_bytes - align - c.a.K * 2u) / row_bytes + 1 : 0;
+            const uint32_t rb = (uint32_t)std::min<uint64_t>(fit / WG * WG, c.a.M);
+            if (rb >= WG) {
+                for (uint32_t m0 = 0; m0 < c.a.M; m0 += rb) {
+                    const uint32_t rows = std::min(rb, c.a.M - m0);
+                    const uint64_t elo = lo + (uint64_t)m0 * c.a.lda;
+                    const uint64_t ehi = elo + (uint64_t)(rows - 1) * c.a.lda + c.a.K;
+                    if (!tex_dispatch(m0, rows, elo, ehi)) return false;
+                }
+                return true;
+            }
+        }
+    }
+    const vk::Pipeline* p = ctx_->pipeline(base.c_str(), spec, err);
+    if (!p) return false;
+    SgArgs a;
+    a.a = c.a;
+    rec.dispatch(*p, bindings(or_dummy(c.A)), &a, sizeof(a), gx, ceil_div(c.a.M, WG), c.batch);
+    return true;
+}
+
 bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
+    if (sg_eligible(c)) return gemm_sg(rec, c, err);
     std::string name = c.b == BKind::W4 ? "gemm_w4" : c.b == BKind::W8 ? "gemm_w8"
                      : c.b == BKind::F16 ? "gemm_f16" : "gemm_f16t";
     if (c.a_conv) {
@@ -972,10 +1090,11 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (std::strncmp(mi, "gemmx,", 6) == 0) {
         // Prefill/encoder GEMM probe at a real shape:
         // STARLING_FAST_MICRO=gemmx,M,N,K,kind[,reps[,variant[,BM,BN,TM,TN[,BK]]]]
-        // with kind w4|w8|f16|f16t and variant f (f32 products) | h (packed
-        // f16) | - (the device default). Prints GFLOPS, the max relative
-        // error of 64 outputs against a CPU reference, and how many outputs
-        // differ bitwise from the f32 kernel at the device's default tile.
+        // with kind w4|w8|f16|f16t and variant f (gemm.comp, f32 products) |
+        // h (gemm.comp, packed f16) | g (gemm_sg.comp) | - (the device
+        // default). Prints GFLOPS, the max relative error of 64 outputs
+        // against a CPU reference, and how many outputs differ bitwise from
+        // gemm.comp's f32 kernel at the device's default tile.
         unsigned M = 0, N = 0, Kd = 0, reps = 8;
         char kind[8] = {0}, var[8] = {0};
         unsigned tb[5] = {0, 0, 0, 0, 32};
@@ -984,7 +1103,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
         const std::string kd(kind);
         if (got < 4 || !M || !N || !Kd || Kd % 32 || !reps ||
             (kd != "w4" && kd != "w8" && kd != "f16" && kd != "f16t")) {
-            err = "STARLING_FAST_MICRO=gemmx,M,N,K,w4|w8|f16|f16t[,reps[,f|h|-[,BM,BN,TM,TN[,BK]]]]";
+            err = "STARLING_FAST_MICRO=gemmx,M,N,K,w4|w8|f16|f16t[,reps[,f|h|g|-[,BM,BN,TM,TN[,BK]]]]";
             return false;
         }
         std::mt19937 rng(777);
@@ -1051,10 +1170,17 @@ bool Kernels::micro(const char* mi, std::string& err) {
         u.epi = Epi::F32;
         u.a.M = M; u.a.N = N; u.a.K = Kd; u.a.lda = Kd; u.a.ldb = kd == "f16t" ? N : Kd; u.a.ldc = N;
         u.A = vk::Ref(A); u.Bq = vk::Ref(Bq); if (!bs.empty()) u.Bs = vk::Ref(Bs); u.C = vk::Ref(C);
-        const bool saved_f16 = f16_math;
-        if (var[0] == 'f') f16_math = false;
-        if (var[0] == 'h') f16_math = ctx_->info().f16;
-        const std::string sfx = f16_math ? "_h" : "";
+        const bool saved_f16 = f16_math, saved_sg = sg_gemm_;
+        if (var[0] == 'f') { f16_math = false; sg_gemm_ = false; }
+        if (var[0] == 'h') { f16_math = ctx_->info().f16; sg_gemm_ = false; }
+        if (var[0] == 'g') {
+            const vk::DeviceInfo& di = ctx_->info();
+            sg_gemm_ = di.subgroup_compute && (di.subgroup_ops & VK_SUBGROUP_FEATURE_BALLOT_BIT) &&
+                       di.subgroup_size >= 16;
+            if (!sg_gemm_) { err = "gemmx g: no subgroup broadcast"; f16_math = saved_f16; sg_gemm_ = saved_sg; return false; }
+        }
+        const bool use_sg = sg_eligible(u);
+        const std::string sfx = use_sg ? (sg_tex_ ? "_sg_t" : "_sg") : f16_math ? "_h" : "";
         const TileCfg saved_tile = tile;
         const bool saved_pin = tile_pinned_;
         if (got >= 10) { tile = TileCfg{tb[0], tb[1], tb[2], tb[3], tb[4]}; tile_pinned_ = true; }
@@ -1072,6 +1198,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
         ok = ok && gemm(r1, u, err);
         r1.end();
         f16_math = saved_f16;
+        sg_gemm_ = saved_sg;
         tile = saved_tile;
         tile_pinned_ = saved_pin;
         if (!ok) return false;
@@ -1081,14 +1208,16 @@ bool Kernels::micro(const char* mi, std::string& err) {
         if (!ctx_->download(C, 0, c.data(), c.size() * 4, err)) return false;
         size_t ndiff = 0;
         {
-            // Bitwise comparison against the f32-product kernel.
-            const bool f2 = f16_math;
+            // Bitwise comparison against gemm.comp's f32-product kernel.
+            const bool f2 = f16_math, s2 = sg_gemm_;
             f16_math = false;
+            sg_gemm_ = false;
             vk::Recording r2(*ctx_);
             r2.begin();
             const bool ok2 = gemm(r2, u, err);
             r2.end();
             f16_math = f2;
+            sg_gemm_ = s2;
             if (!ok2 || !r2.submit_and_wait(err)) return false;
             std::vector<float> c2((size_t)M * N);
             if (!ctx_->download(C, 0, c2.data(), c2.size() * 4, err)) return false;

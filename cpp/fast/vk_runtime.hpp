@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace starling::fast::vk {
@@ -75,6 +76,8 @@ namespace starling::fast::vk {
     X(vkDestroyDescriptorPool)                 \
     X(vkAllocateDescriptorSets)                \
     X(vkUpdateDescriptorSets)                  \
+    X(vkCreateBufferView)                      \
+    X(vkDestroyBufferView)                     \
     X(vkCreateCommandPool)                     \
     X(vkDestroyCommandPool)                    \
     X(vkAllocateCommandBuffers)                \
@@ -118,6 +121,10 @@ struct DeviceInfo {
     bool uma = false;                    // a device-local memory type is host-visible
     bool uma_cached = false;             // ... and CPU-cached (mapped writes are fast)
     uint32_t subgroup_size = 0;
+    uint32_t subgroup_ops = 0;           // VkSubgroupFeatureFlags supported in ...
+    bool subgroup_compute = false;       // ... compute shaders
+    uint32_t max_texel_elems = 0;        // maxTexelBufferElements
+    uint64_t min_texel_align = 0;        // minTexelBufferOffsetAlignment
     uint32_t max_shared_bytes = 0;       // maxComputeSharedMemorySize
     uint32_t max_wg_invocations = 0;
     uint64_t max_storage_range = 0;      // maxStorageBufferRange
@@ -175,16 +182,20 @@ struct ShaderBlob {
     const uint32_t* words;
     size_t n_words;
     uint32_t n_bindings;
+    uint32_t texel_mask;   // bit i: binding i is a uniform texel buffer (R32G32B32A32_UINT view)
 };
 const ShaderBlob* find_shader(const char* name);
 
 // A specialized compute pipeline. All kernels share one layout shape: N
-// storage-buffer bindings in set 0 plus a 128-byte push-constant block.
+// storage-buffer bindings in set 0 plus a 128-byte push-constant block;
+// bindings in texel_mask are uniform texel buffers instead (the dispatch
+// Ref then names the bytes a 16-byte-texel view covers, see texel_view()).
 struct Pipeline {
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     uint32_t n_bindings = 0;
+    uint32_t texel_mask = 0;
     std::string label;
 };
 
@@ -284,6 +295,11 @@ public:
     // buffer visible to the device (no-op for coherent or unmapped memory).
     void flush(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes);
 
+    // A cached R32G32B32A32_UINT view of [off, off + range) of `b` (off a
+    // multiple of minTexelBufferOffsetAlignment, range <= 16 *
+    // maxTexelBufferElements). Lives until the buffer is released.
+    VkBufferView texel_view(const Buffer& b, VkDeviceSize off, VkDeviceSize range, std::string& err);
+
     // Pipeline for `shader` specialized with `spec` (constant_id i = spec[i]).
     // Cached; the pointer stays valid for the context's lifetime.
     const Pipeline* pipeline(const char* shader, const std::vector<uint32_t>& spec,
@@ -334,6 +350,9 @@ private:
     std::map<std::string, std::unique_ptr<Pipeline>> pipes_;
     std::map<uint32_t, std::pair<VkDescriptorSetLayout, VkPipelineLayout>> layouts_;
     std::map<std::string, VkShaderModule> modules_;
+    std::mutex view_mu_;
+    std::map<std::tuple<VkBuffer, VkDeviceSize, VkDeviceSize>, VkBufferView> views_;
+    void drop_views(VkBuffer b);
 
     // Transfer helpers (staging buffer + a one-shot command buffer).
     Buffer staging_;

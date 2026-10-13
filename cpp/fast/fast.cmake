@@ -61,6 +61,7 @@ endif()
 
 # ---- shader variants ----------------------------------------------------------
 # name | source | defines (";"-free, comma separated) | binding count
+#      [| texel mask: bit i = binding i is a uniform texel buffer, not an SSBO]
 set(STARLING_FAST_SHADERS
   "gemm_w4|gemm.comp|B_W4|7"
   "gemm_w8|gemm.comp|B_W8|7"
@@ -72,6 +73,22 @@ set(STARLING_FAST_SHADERS
   "gemm_f16t_h|gemm.comp|B_F16T,F16MATH|7"
   "gemm_conv|gemm.comp|B_F16,A_CONV|7"
   "gemm_conv_h|gemm.comp|B_F16,A_CONV,F16MATH|7"
+  "gemm_sg_w4|gemm_sg.comp|B_W4|7"
+  "gemm_sg_w8|gemm_sg.comp|B_W8|7"
+  "gemm_sg_f16|gemm_sg.comp|B_F16|7"
+  "gemm_sg_conv|gemm_sg.comp|B_F16,A_CONV|7"
+  "gemm_sg_w4_t|gemm_sg.comp|B_W4,ATEX|7|1"
+  "gemm_sg_w8_t|gemm_sg.comp|B_W8,ATEX|7|1"
+  "gemm_sg_f16_t|gemm_sg.comp|B_F16,ATEX|7|1"
+  "gemm_sg_conv_t|gemm_sg.comp|B_F16,A_CONV,ATEX|7|1"
+  "gemm_sg_w4_n8|gemm_sg.comp|B_W4,NB=8|7"
+  "gemm_sg_w8_n8|gemm_sg.comp|B_W8,NB=8|7"
+  "gemm_sg_f16_n8|gemm_sg.comp|B_F16,NB=8|7"
+  "gemm_sg_conv_n8|gemm_sg.comp|B_F16,A_CONV,NB=8|7"
+  "gemm_sg_w4_n8_t|gemm_sg.comp|B_W4,ATEX,NB=8|7|1"
+  "gemm_sg_w8_n8_t|gemm_sg.comp|B_W8,ATEX,NB=8|7|1"
+  "gemm_sg_f16_n8_t|gemm_sg.comp|B_F16,ATEX,NB=8|7|1"
+  "gemm_sg_conv_n8_t|gemm_sg.comp|B_F16,A_CONV,ATEX,NB=8|7|1"
   "alu_probe|alu_probe.comp||1"
   "alu2_probe|alu2_probe.comp||1"
   "gemv_w4|gemv.comp|W_W4|7"
@@ -130,6 +147,11 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
   list(GET _parts 1 _src)
   list(GET _parts 2 _defs)
   list(GET _parts 3 _nb)
+  list(LENGTH _parts _np)
+  set(_tmask 0)
+  if(_np GREATER 4)
+    list(GET _parts 4 _tmask)
+  endif()
   set(_def_args "")
   if(_defs)
     string(REPLACE "," ";" _deflist "${_defs}")
@@ -146,7 +168,7 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
     DEPENDS ${STARLING_FAST_DIR}/shaders/${_src} ${_fast_glsl_includes}
     COMMENT "glslc ${_name}" VERBATIM)
   list(APPEND _spv_files ${_out})
-  list(APPEND _embed_list "${_name}@${_out}@${_nb}")
+  list(APPEND _embed_list "${_name}@${_out}@${_nb}@${_tmask}")
 endforeach()
 
 string(REPLACE ";" "|" _embed_arg "${_embed_list}")

@@ -86,6 +86,7 @@ void Buffer::release() {
         return;
     }
     const Fns& f = ctx->fn_;
+    if (buf) ctx->drop_views(buf);
     if (host) f.vkUnmapMemory(ctx->dev_, mem);
     if (buf) f.vkDestroyBuffer(ctx->dev_, buf, nullptr);
     if (mem) f.vkFreeMemory(ctx->dev_, mem, nullptr);
@@ -238,6 +239,10 @@ bool Context::init(std::string& err) {
     info_.api_version = props.apiVersion;
     info_.discrete = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
     info_.subgroup_size = sgp.subgroupSize;
+    info_.subgroup_ops = sgp.supportedOperations;
+    info_.subgroup_compute = (sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+    info_.max_texel_elems = props.limits.maxTexelBufferElements;
+    info_.min_texel_align = std::max<uint64_t>(props.limits.minTexelBufferOffsetAlignment, 16);
     info_.max_shared_bytes = props.limits.maxComputeSharedMemorySize;
     info_.max_wg_invocations = props.limits.maxComputeWorkGroupInvocations;
     info_.max_storage_range = props.limits.maxStorageBufferRange;
@@ -481,6 +486,7 @@ Context::~Context() {
         fn_.vkDestroyDescriptorSetLayout(dev_, kv.second.first, nullptr);
     }
     for (auto& kv : modules_) fn_.vkDestroyShaderModule(dev_, kv.second, nullptr);
+    for (auto& kv : views_) fn_.vkDestroyBufferView(dev_, kv.second, nullptr);
     if (pcache_) fn_.vkDestroyPipelineCache(dev_, pcache_, nullptr);
     if (xfer_fence_) fn_.vkDestroyFence(dev_, xfer_fence_, nullptr);
     if (xfer_pool_) fn_.vkDestroyCommandPool(dev_, xfer_pool_, nullptr);
@@ -622,8 +628,10 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
     bytes = (bytes + 15) & ~VkDeviceSize(15);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
+    // Uniform-texel usage lets kernels read activations through the texture
+    // path (gemm_sg's A operand, a view per dispatch window).
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult r = fn_.vkCreateBuffer(dev_, &bci, nullptr, &out.buf);
     if (r != VK_SUCCESS) { err = vk_err("vkCreateBuffer", r); return false; }
@@ -809,13 +817,14 @@ const Pipeline* Context::pipeline(const char* shader, const std::vector<uint32_t
         if (r != VK_SUCCESS) { err = vk_err("vkCreateShaderModule", r); return nullptr; }
         modules_[shader] = mod;
     }
-    auto& lay = layouts_[blob->n_bindings];
+    auto& lay = layouts_[blob->n_bindings | (blob->texel_mask << 8)];
     if (!lay.first) {
         std::vector<VkDescriptorSetLayoutBinding> b(blob->n_bindings);
         for (uint32_t i = 0; i < blob->n_bindings; ++i) {
             b[i] = {};
             b[i].binding = i;
-            b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorType = (blob->texel_mask >> i) & 1u ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+                                                               : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             b[i].descriptorCount = 1;
             b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
@@ -853,10 +862,48 @@ const Pipeline* Context::pipeline(const char* shader, const std::vector<uint32_t
     p->layout = lay.second;
     p->dsl = lay.first;
     p->n_bindings = blob->n_bindings;
+    p->texel_mask = blob->texel_mask;
     p->label = shader;
     const Pipeline* raw = p.get();
     pipes_[key] = std::move(p);
     return raw;
+}
+
+VkBufferView Context::texel_view(const Buffer& b, VkDeviceSize off, VkDeviceSize range,
+                                 std::string& err) {
+    range &= ~VkDeviceSize(15);
+    if (!b.buf || !range || off % info_.min_texel_align ||
+        range / 16 > info_.max_texel_elems) {
+        err = "texel view out of limits (off " + std::to_string(off) + ", range " +
+              std::to_string(range) + ")";
+        return VK_NULL_HANDLE;
+    }
+    std::lock_guard<std::mutex> lk(view_mu_);
+    const auto key = std::make_tuple(b.buf, off, range);
+    auto it = views_.find(key);
+    if (it != views_.end()) return it->second;
+    VkBufferViewCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+    ci.buffer = b.buf;
+    ci.format = VK_FORMAT_R32G32B32A32_UINT;
+    ci.offset = off;
+    ci.range = range;
+    VkBufferView v = VK_NULL_HANDLE;
+    const VkResult r = fn_.vkCreateBufferView(dev_, &ci, nullptr, &v);
+    if (r != VK_SUCCESS) { err = vk_err("vkCreateBufferView", r); return VK_NULL_HANDLE; }
+    views_[key] = v;
+    return v;
+}
+
+void Context::drop_views(VkBuffer b) {
+    std::lock_guard<std::mutex> lk(view_mu_);
+    for (auto it = views_.begin(); it != views_.end();) {
+        if (std::get<0>(it->first) == b) {
+            fn_.vkDestroyBufferView(dev_, it->second, nullptr);
+            it = views_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -943,11 +990,12 @@ VkDescriptorSet Recording::alloc_set(const Pipeline& p) {
     // descriptors before sets when layouts have many bindings).
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (dpools_.empty() || dpool_left_ == 0) {
-            VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 16};
+            const VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 16},
+                                                {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, kSets}};
             VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
             dpci.maxSets = kSets;
-            dpci.poolSizeCount = 1;
-            dpci.pPoolSizes = &ps;
+            dpci.poolSizeCount = 2;
+            dpci.pPoolSizes = ps;
             VkDescriptorPool dp = VK_NULL_HANDLE;
             VkResult r = f.vkCreateDescriptorPool(ctx_.dev_, &dpci, nullptr, &dp);
             if (r != VK_SUCCESS) {
@@ -1011,9 +1059,26 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
     VkDescriptorSet set = alloc_set(p);
     if (!set) return;   // fail_ is set; submit_and_wait reports it
     std::vector<VkDescriptorBufferInfo> infos(p.n_bindings);
+    std::vector<VkBufferView> views(p.n_bindings);
     std::vector<VkWriteDescriptorSet> writes(p.n_bindings);
     for (uint32_t i = 0; i < p.n_bindings; ++i) {
         const Ref& r = i < bindings.size() ? bindings[i] : bindings.back();
+        if ((p.texel_mask >> i) & 1u) {
+            const VkDeviceSize range = r.range == VK_WHOLE_SIZE ? r.buf->size - r.off : r.range;
+            std::string verr;
+            views[i] = ctx_.texel_view(*r.buf, r.off, range, verr);
+            if (!views[i]) {
+                if (fail_.empty()) fail_ = verr + " (" + p.label + ")";
+                return;
+            }
+            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstSet = set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+            writes[i].pTexelBufferView = &views[i];
+            continue;
+        }
         infos[i].buffer = r.buf->buf;
         infos[i].offset = r.off;
         VkDeviceSize range = r.range == VK_WHOLE_SIZE ? r.buf->size - r.off : r.range;

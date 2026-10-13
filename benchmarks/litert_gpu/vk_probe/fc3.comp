@@ -1,0 +1,112 @@
+#version 450
+// Prototype of the subgroup-broadcast GEMM for cpp/fast, on the engine's own
+// operand layouts:
+//   A  f16 activations, row-major [M][lda] (as gemm.comp);
+//   B  W4 / W8 / F16 weights, row-major [N][K] in 32-k groups (gemm.comp's B_W4/B_W8/B_F16).
+// One thread per row of A (RM rows per thread), one subgroup per workgroup,
+// NB output columns per workgroup. Per 8-k chunk, lane j < NB loads and
+// dequantizes the 8 weights of column n0 + j; subgroupBroadcast(w, j) hands
+// them to every lane; each thread does dot(A[m][k..k+7], w) per column.
+// No shared memory, no barriers.
+// Macros: BKIND 0 W4 / 1 W8 / 2 F16; NB 8|12|16|32; RM 1|2; ATEX 0 SSBO / 1 texel buffer (RGBA32UI);
+// ACCV 1: vec4 accumulators (component-wise FMAs, reduced at the end) instead of dot().
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+layout(local_size_x_id = 0) in;
+
+#if ATEX
+layout(binding = 0) uniform usamplerBuffer At;
+#define LOADA(i) texelFetch(At, int(i))
+#else
+layout(std430, binding = 0) readonly buffer Ab { uvec4 Aw[]; };
+#define LOADA(i) Aw[i]
+#endif
+layout(std430, binding = 1) readonly buffer Bq { uint bq[]; };
+layout(std430, binding = 1) readonly buffer Bq4 { uvec4 bq4[]; };
+layout(std430, binding = 2) readonly buffer Bs { uint bs[]; };
+layout(std430, binding = 3) writeonly buffer Cb { float C[]; };
+layout(push_constant) uniform PC { uint M, N, K, lda; } p;
+
+#define J8(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7)
+#define J12(X) J8(X) X(8) X(9) X(10) X(11)
+#define J16(X) J8(X) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+#define J32(X) J16(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31)
+#if NB == 8
+#define JN J8
+#elif NB == 12
+#define JN J12
+#elif NB == 16
+#define JN J16
+#else
+#define JN J32
+#endif
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint WGR = gl_WorkGroupSize.x * RM;
+    const uint m0 = gl_WorkGroupID.y * WGR + gl_LocalInvocationID.x;
+    const uint n0 = gl_WorkGroupID.x * NB;
+    const uint nl = min(n0 + min(lane, NB - 1), p.N - 1);    // column this lane loads
+#if ACCV
+    vec4 acc[RM][NB];
+    for (int r = 0; r < RM; ++r) for (int j = 0; j < NB; ++j) acc[r][j] = vec4(0.0);
+#else
+    float acc[RM][NB];
+    for (int r = 0; r < RM; ++r) for (int j = 0; j < NB; ++j) acc[r][j] = 0.0;
+#endif
+    uint arow[RM];
+    for (int r = 0; r < RM; ++r) arow[r] = min(m0 + r * gl_WorkGroupSize.x, p.M - 1) * (p.lda / 8);
+    const uint G = p.K / 32;
+    for (uint k8 = 0; k8 < p.K / 8; ++k8) {
+        // ---- this lane's 8 weights of column nl (lanes >= NB load a duplicate) ----
+        vec4 w0, w1;
+#if BKIND == 0
+        {
+            const uint g = nl * G + (k8 >> 2);
+            const vec2 so = unpackHalf2x16(bs[g]);
+            const uint q = bq[g * 4 + (k8 & 3u)];
+            w0 = so.x * vec4(q & 15u, (q >> 4) & 15u, (q >> 8) & 15u, (q >> 12) & 15u) + so.y;
+            w1 = so.x * vec4((q >> 16) & 15u, (q >> 20) & 15u, (q >> 24) & 15u, q >> 28) + so.y;
+        }
+#elif BKIND == 1
+        {
+            const uint g = nl * G + (k8 >> 2);
+            const float s = unpackHalf2x16(bs[g])[(k8 >> 1) & 1u];
+            const uint q0 = bq[g * 8 + (k8 & 3u) * 2], q1 = bq[g * 8 + (k8 & 3u) * 2 + 1];
+            w0 = s * vec4(bitfieldExtract(int(q0), 0, 8), bitfieldExtract(int(q0), 8, 8), bitfieldExtract(int(q0), 16, 8), bitfieldExtract(int(q0), 24, 8));
+            w1 = s * vec4(bitfieldExtract(int(q1), 0, 8), bitfieldExtract(int(q1), 8, 8), bitfieldExtract(int(q1), 16, 8), bitfieldExtract(int(q1), 24, 8));
+        }
+#else
+        {
+            const uvec4 h = bq4[(nl * p.K) / 8 + k8];
+            w0 = vec4(unpackHalf2x16(h.x), unpackHalf2x16(h.y));
+            w1 = vec4(unpackHalf2x16(h.z), unpackHalf2x16(h.w));
+        }
+#endif
+        vec4 a0[RM], a1[RM];
+        for (int r = 0; r < RM; ++r) {
+            const uvec4 av = LOADA(arow[r] + k8);
+            a0[r] = vec4(unpackHalf2x16(av.x), unpackHalf2x16(av.y));
+            a1[r] = vec4(unpackHalf2x16(av.z), unpackHalf2x16(av.w));
+        }
+#if ACCV
+#define ACCUM(r, j) acc[r][j] += a0[r] * b0 + a1[r] * b1;
+#else
+#define ACCUM(r, j) acc[r][j] += dot(a0[r], b0) + dot(a1[r], b1);
+#endif
+#define COL(j) {                                                         \
+            const vec4 b0 = subgroupBroadcast(w0, j), b1 = subgroupBroadcast(w1, j); \
+            for (int r = 0; r < RM; ++r) ACCUM(r, j) }
+        JN(COL)
+    }
+    for (int r = 0; r < RM; ++r) {
+        const uint m = m0 + r * gl_WorkGroupSize.x;
+        if (m < p.M)
+            for (int j = 0; j < NB; ++j)
+#if ACCV
+                if (n0 + j < p.N) C[m * p.N + n0 + j] = (acc[r][j].x + acc[r][j].y) + (acc[r][j].z + acc[r][j].w);
+#else
+                if (n0 + j < p.N) C[m * p.N + n0 + j] = acc[r][j];
+#endif
+    }
+}

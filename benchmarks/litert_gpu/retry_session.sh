@@ -4,7 +4,7 @@
 #   benchmarks/litert_gpu/retry_session.sh LOGDIR PHASE...
 HERE=$(cd "$(dirname "$0")" && pwd)
 for i in $(seq 1 40); do
-  flock -w 3600 /tmp/starling-phone.lock "$HERE/phone_session.sh" "$@"
+  flock -w 3600 /tmp/starling-phone.lock "$HERE/${SESSION:-phone_session.sh}" "$@"
   rc=$?
   [ $rc -ne 3 ] && exit $rc
   echo "phone in use, retry $i in 180 s ($(date +%T))"

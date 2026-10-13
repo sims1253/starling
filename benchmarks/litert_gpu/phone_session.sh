@@ -15,6 +15,7 @@
 #   alu     OpenCL ALU probes (cl_alu_probe.c): f32 vs f16 FMA rate, broadcast loop
 #   valu    the same probes in Vulkan (vk_probe/): f32/f16 mad vs fma(), f16vec2 fma, broadcast
 #   vfc     ML Drift's FC kernel ported to Vulkan (vk_probe/fc.comp) at our GEMM shapes
+#   vfc3    fc3.comp: the subgroup-broadcast GEMM on cpp/fast's W4/W8/F16 layouts
 #   ours    starling-bench: full, encoder-only by ablation, prefill-only, gemmx probes
 #
 # Only /data/local/tmp/litert-gpu is written (plus the shared wake-hold dex).
@@ -24,7 +25,7 @@ LOG=${1:?LOGDIR}; shift
 mkdir -p "$LOG"
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/../fast_engine/phone_common.sh"
-BENCH_BINS="$BENCH_BINS litert_gpu_bench cl_alu_probe vk_alu_probe vk_fc_probe"
+BENCH_BINS="$BENCH_BINS litert_gpu_bench cl_alu_probe vk_alu_probe vk_fc_probe vk_fc3_probe"
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/android-sdk}
 
 D=/data/local/tmp/litert-gpu
@@ -166,6 +167,14 @@ for phase in "$@"; do
     for shp in "104 1024 4096" "104 896 3584" "104 3584 896" "112 1024 6144" "112 3072 1024" "320 1024 4096"; do
       wait_benches || true
       timeout 300 adb shell "$D/bin/vk_fc_probe $shp 20" 2>&1 | tee -a "$LOG/vfc.txt"
+    done
+    ;;
+  vfc3)
+    push_if "$STAGE/vk_fc3_probe" $D/bin/vk_fc3_probe
+    adb shell "chmod 755 $D/bin/vk_fc3_probe"
+    for shp in "104 1024 4096" "104 896 3584" "104 3584 896" "112 1024 6144" "112 3072 1024" "320 1024 4096"; do
+      wait_benches || true
+      timeout 600 adb shell "$D/bin/vk_fc3_probe $shp 20" 2>&1 | tee -a "$LOG/vfc3.txt"
     done
     ;;
   *) echo "unknown phase $phase" ;;
