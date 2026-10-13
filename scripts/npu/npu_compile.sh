@@ -18,7 +18,9 @@
 # 1. Host: export the encoder graph from the HF checkpoint (export_encoder.py;
 #    fp16 weights, metadata patched).
 # 2. Phone, adb shell: fingerprint the GGUF the engine will load (or take
-#    --hash, the fingerprint the app wrote to its status-*.txt), compile the
+#    --hash, the fingerprint the app wrote to its status-*.txt), check that it
+#    is HF_MODEL's own fingerprint (a fine-tune with the same shapes is
+#    refused: the artifact would carry the base model's weights), compile the
 #    graph with the phone's own on-device compiler (starling-npu-tool) and
 #    write qwen3-asr-enc-<fingerprint>.stnpu.
 #    Compiling must run as the adb shell user: the firmware's compile service
@@ -61,7 +63,7 @@ WORK=$(mktemp -d /tmp/npu-compile.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 LOCK=/tmp/starling-host-heavy.lock
 T=/data/local/tmp/starling-npu-work
-field() { "$PY" -I -c "import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]] if sys.argv[2]=='key' else ','.join(map(str,json.loads(sys.argv[1])[sys.argv[2]])))" "$META" "$1"; }
+field() { "$PY" -I -c "import json,sys; v=json.loads(sys.argv[1])[sys.argv[2]]; print(v if isinstance(v,str) else ','.join(map(str,v)))" "$META" "$1"; }
 cfg() {  # cfg PYTHON-EXPR over the checkpoint's config.json (as c)
   "$PY" -I -c "import glob,json,os,sys; m=sys.argv[1]; d=m if os.path.isdir(m) else glob.glob(os.path.expanduser('~/.cache/huggingface/hub/models--'+m.replace('/','--')+'/snapshots/*/'))[0]; c=json.load(open(d+'/config.json')); print($1)" "$MODEL"
 }
@@ -71,8 +73,19 @@ cfg() {  # cfg PYTHON-EXPR over the checkpoint's config.json (as c)
 TYPE=$(cfg "c['model_type']")
 [ "$TYPE" = qwen3_asr ] ||
   { echo "$MODEL ($TYPE): no TPU graphs for this model (supported: Qwen3-ASR)" >&2; exit 2; }
+# The checkpoint must be the app's model: its fingerprint (the same few F32
+# tensors the GGUF fingerprint hashes) has to match before anything is built.
+CKHASH=$("$PY" -I "$ROOT/scripts/npu/export_encoder.py" --fingerprint "$MODEL" | tail -1)
+case $SRC in
+  0x*|0X*)
+    if [ "$("$PY" -I -c 'import sys; print(int(sys.argv[1], 16) == int(sys.argv[2], 16))' "$SRC" "$CKHASH")" != True ]; then
+      echo "refusing: the app's model ($SRC) is not $MODEL ($CKHASH): a fine-tune or other weights;" >&2
+      echo "  its TPU encoder cannot be built from this checkpoint" >&2
+      exit 1
+    fi ;;
+esac
 TFL=$WORK/enc.tflite
-echo "== export $MODEL (encoder)"
+echo "== export $MODEL (encoder, fingerprint $CKHASH)"
 CMD=("$PY" -I "$ROOT/scripts/npu/export_encoder.py" "$MODEL" "$TFL")
 if command -v systemd-run >/dev/null; then
   CMD=(systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 "${CMD[@]}")
@@ -80,7 +93,8 @@ fi
 META=$(flock "$LOCK" "${CMD[@]}" 2>"$WORK/export.log" | tail -1) || { tail -20 "$WORK/export.log" >&2; exit 1; }
 echo "$META"
 KEY=$(field key); IN=$(field in); OUT=$(field out)
+[ "$(field model_hash)" = "$CKHASH" ] || { echo "export fingerprint changed under us" >&2; exit 1; }
 echo "== compile on the phone"
 PHONE_LOCK=(flock /tmp/starling-phone.lock)
 [ -n "${STARLING_PHONE_LOCK_HELD:-}" ] && PHONE_LOCK=()   # the caller holds it
-"${PHONE_LOCK[@]}" "$ROOT/scripts/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$KEY" "$IN" "$OUT" "$DIR" "$APP" "$T"
+PY=$PY "${PHONE_LOCK[@]}" "$ROOT/scripts/npu/npu_compile_phone.sh" "$NPU_TOOL" "$TFL" "$SRC" "$CKHASH" "$KEY" "$IN" "$OUT" "$DIR" "$APP" "$T"

@@ -7,7 +7,10 @@ fp16 either way), and the converter's `keep_stablehlo_constant` metadata key,
 which the phone's on-device compiler rejects, is renamed in place.
 
 python -I export_encoder.py MODEL OUT.tflite      (MODEL: HF id or snapshot dir)
-Prints one JSON line: {"key": ..., "in": [...], "out": [...], "tflite": ...}.
+Prints one JSON line: {"key": ..., "in": [...], "out": [...], "model_hash": "0x...", "tflite": ...}.
+
+python -I export_encoder.py --fingerprint MODEL
+Prints only the checkpoint's model fingerprint (0x...), without exporting.
 """
 import glob
 import json
@@ -19,7 +22,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-model, out_path = sys.argv[1], sys.argv[2]
+fingerprint_only = sys.argv[1] == "--fingerprint"
+model = sys.argv[2] if fingerprint_only else sys.argv[1]
+out_path = None if fingerprint_only else sys.argv[2]
 if os.path.isdir(model):
     snap = model
 else:
@@ -30,6 +35,42 @@ else:
     snap = cands[0]
 
 from safetensors import safe_open  # noqa: E402
+
+# The model fingerprint of cpp/npu/encoder_contract.hpp: FNV-1a 64 over the
+# f32 bytes of these tensors, in this order (kQwen3EncFingerprintTensors).
+# Starling GGUFs keep them F32, widened exactly from the checkpoint's values,
+# so a checkpoint and the GGUFs converted from it share the fingerprint; a
+# fine-tune with the same dims does not.
+FINGERPRINT_TENSORS = [  # (GGUF name, checkpoint name)
+    ("enc.conv1.bias", "model.audio_tower.conv2d1.bias"),
+    ("enc.ln_post.weight", "model.audio_tower.ln_post.weight"),
+    ("enc.ln_post.bias", "model.audio_tower.ln_post.bias"),
+    ("proj.linear_2.bias", "model.multi_modal_projector.linear_2.bias"),
+    ("enc.blk.0.attn_norm.weight", "model.audio_tower.layers.0.self_attn_layer_norm.weight"),
+]
+
+
+def fingerprint(snap_dir):
+    found = {}
+    for f in sorted(glob.glob(os.path.join(snap_dir, "*.safetensors"))):
+        with safe_open(f, "pt") as h:
+            for _, k in FINGERPRINT_TENSORS:
+                if k in h.keys():
+                    found[k] = h.get_tensor(k)
+    h = 0xCBF29CE484222325
+    for g, k in FINGERPRINT_TENSORS:
+        if k not in found:
+            raise SystemExit(f"{snap_dir}: no {k} (for {g}); not a Qwen3-ASR checkpoint")
+        for b in found[k].float().contiguous().numpy().astype("<f4").tobytes():
+            h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"0x{h:016x}"
+
+
+model_hash = fingerprint(snap)
+if fingerprint_only:
+    print(model_hash)
+    sys.exit(0)
+
 from transformers import AutoConfig, AutoModel  # noqa: E402
 
 torch.set_grad_enabled(False)
@@ -129,4 +170,4 @@ with tempfile.TemporaryDirectory() as td:
 ckey = (f"qwen3-asr-enc/1 mels={NM} frames={FR} tokens={TOK} d={D} L={ac.encoder_layers} H={H} "
         f"ff={ac.encoder_ffn_dim} ds={DS} out={ac.output_dim}")
 print(json.dumps({"key": ckey, "in": [NM * FR * 4, TOK * 4], "out": [TOK * ac.output_dim * 4],
-                  "tflite": out_path, "bytes": os.path.getsize(out_path)}))
+                  "model_hash": model_hash, "tflite": out_path, "bytes": os.path.getsize(out_path)}))

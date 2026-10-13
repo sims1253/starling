@@ -26,7 +26,9 @@
 #      Qwen3-ASR encoder (--all: also the ok ones) with npu_compile.sh, each
 #      into every package that asked for it.
 # The HF checkpoint is downloaded on first use (Qwen/Qwen3-ASR-0.6B-hf,
-# Qwen/Qwen3-ASR-1.7B-hf; weights and config only). Nothing is precompiled or
+# Qwen/Qwen3-ASR-1.7B-hf; weights and config only) and must be the app's
+# model: npu_compile.sh refuses a model whose fingerprint is not the
+# checkpoint's (a fine-tune with the same shapes). Nothing is precompiled or
 # shipped: the phone's own compiler builds every artifact for its firmware,
 # and after a firmware update the app reports the files as stale until this
 # is rerun.
@@ -49,7 +51,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# (piece, arch, LLM hidden size) -> HF checkpoint. Nothing else is compiled.
+# (piece, arch, LLM hidden size) -> the candidate HF checkpoint; npu_compile.sh
+# then checks its fingerprint against the app's. Nothing else is compiled.
 checkpoint() {
   case "$1:$2:$3" in
     qwen3-asr-enc:qwen3:1024) echo Qwen/Qwen3-ASR-0.6B-hf ;;
