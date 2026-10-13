@@ -186,7 +186,15 @@ EXP=$(canon "$EXPECT")
 [ -n "$EXP" ] || { echo "bad expected identity '$EXPECT'" >&2; exit 2; }
 adb shell "mkdir -p $(q "$T") $(q "$DIR")" </dev/null
 adb push -q "$NPU_TOOL" "$T/starling-npu-tool" </dev/null >/dev/null
-TOOL=$(q "$T/starling-npu-tool")
+# The tool links ggml-base (GGUF parsing); it sits next to the tool or, in a
+# CMake build tree, under ggml/src.
+BASE_LIB=
+for c in "$(dirname "$NPU_TOOL")/libggml-base.so" "$(dirname "$NPU_TOOL")/ggml/src/libggml-base.so"; do
+  [ -f "$c" ] && { BASE_LIB=$c; break; }
+done
+[ -n "$BASE_LIB" ] || { echo "no libggml-base.so next to $NPU_TOOL (or in its ggml/src)" >&2; exit 1; }
+adb push -q "$BASE_LIB" "$T/libggml-base.so" </dev/null >/dev/null
+TOOL="LD_LIBRARY_PATH=$(q "$T") $(q "$T/starling-npu-tool")"
 case $SRC in
   0x*|0X*)
     HASH=${SRC%%,*}
@@ -214,7 +222,7 @@ AVAIL=$(adb shell "grep MemAvailable /proc/meminfo" </dev/null | tr -dc '0-9')
 echo "MemAvailable $((AVAIL / 1024)) MB"
 adb push -q "$TFL" "$T/graph.tflite" </dev/null >/dev/null
 ART=$(q "$DIR/$NAME")
-adb shell "cd $(q "$T") && ./starling-npu-tool compile graph.tflite $ART --in $IN --out $OUT --key $(q "$KEY") --hash $HC" </dev/null
+adb shell "cd $(q "$T") && LD_LIBRARY_PATH=. ./starling-npu-tool compile graph.tflite $ART --in $IN --out $OUT --key $(q "$KEY") --hash $HC" </dev/null
 adb shell "rm -f $(q "$T/graph.tflite"); $TOOL info $ART" </dev/null
 
 # ---- install ----
