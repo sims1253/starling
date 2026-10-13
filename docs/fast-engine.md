@@ -230,8 +230,8 @@ before the compile: once on a 4 MB probe graph (four 256-row slices of a
 "pslice-1024"), once on MOSS's adapter alone (`[1, 104, 2048]` → 8192 →
 2048, 100 MB). Neither size nor free memory predicts it. The compile scripts
 therefore build only the graph with a clean record (the Qwen3-ASR encoder),
-with fixed shapes, refuse graphs above
-640 MB, and refuse to compile with less than 4 GB available
+with fixed shapes, refuse graphs larger than the window has been
+(640 MB for 0.6B, 1300 MB for 1.7B), and refuse to compile with less than 4 GB available
 (`NPU_MIN_MEM_MB`); save your work on the phone before running them.
 
 ## Kernels

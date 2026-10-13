@@ -11,7 +11,7 @@
 # WARNING: the phone's compiler can exhaust the phone's memory and panic its
 # kernel (it rebooted twice on other graphs, see docs/fast-engine.md, Pixel
 # TPU). Save your work on the phone first; npu_compile_phone.sh refuses to
-# compile with less than 4 GB available or graphs above 640 MB.
+# compile with less than 4 GB available or a graph larger than its window has been (640 MB 0.6B, 1300 MB 1.7B).
 #   e.g. scripts/npu/npu_compile.sh Qwen/Qwen3-ASR-0.6B-hf \
 #            --gguf /data/local/tmp/starling/qwen3-asr-0.6b-q4e8.gguf --app dev.starling.mobile
 #

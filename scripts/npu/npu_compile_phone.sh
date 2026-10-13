@@ -12,7 +12,8 @@
 #    app's status-*.txt), equals EXPECT_HASH, the fingerprint of the checkpoint
 #    TFLITE was exported from (export_encoder.py --fingerprint);
 #  * the phone has at least NPU_MIN_MEM_MB (default 4096) available and TFLITE
-#    is at most 640 MB.
+#    is no larger than its window's graph has been (0.6B: 640 MB; 1.7B, which
+#    exports with f32 weights: 1300 MB; both compiled cleanly).
 # APPS: comma-separated packages; a debuggable one gets the artifact in
 # files/npu (run-as), any other in its external files dir
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
@@ -39,15 +40,15 @@ canon() {
 
 # ---- the graph: a supported encoder window, and nothing else ----
 case $KEY in
-  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024") OUTD=1024 ;;
-  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=1024 L=24 H=16 ff=4096 ds=480 out=2048") OUTD=2048 ;;
+  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024") OUTD=1024 MAXMB=640 ;;
+  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=1024 L=24 H=16 ff=4096 ds=480 out=2048") OUTD=2048 MAXMB=1300 ;;
   *) echo "refusing '$KEY': only the Qwen3-ASR 0.6B/1.7B encoder windows compile safely on the phone" >&2; exit 2 ;;
 esac
 MELS=128 FRAMES=800 TOKENS=104
 IN=$((MELS * FRAMES * 4)),$((TOKENS * 4))
 OUT=$((TOKENS * OUTD * 4))
 SIZE=$(stat -c %s "$TFL")
-[ "$SIZE" -le $((640 << 20)) ] || { echo "graph is $((SIZE >> 20)) MB, above the 640 MB safety limit" >&2; exit 1; }
+[ "$SIZE" -le $((MAXMB << 20)) ] || { echo "graph is $((SIZE >> 20)) MB, above this window's $MAXMB MB safety limit" >&2; exit 1; }
 # The .tflite's own inputs and output (flatbuffer: Model.subgraphs ->
 # SubGraph.{tensors, inputs, outputs} -> Tensor.{shape, type}).
 "$PY" -I - "$TFL" "$MELS" "$FRAMES" "$TOKENS" "$OUTD" <<'EOF' || exit 2
