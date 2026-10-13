@@ -2,16 +2,22 @@
 // it replaced in ark (sequential f64 accumulation, explicit zero
 // padding). The contract is BIT equality on every output, for symmetric
 // (ark) and left-only (causal) padding, stride 1 and 2, OC/OL sizes that
-// are not multiples of the tile, and any thread count. No model needed.
+// are not multiples of the tile, and any thread count. An exception in a
+// worker thread (scratch allocation, `post`) reaches the caller after every
+// thread has joined, instead of terminating the process. No model needed.
 //
 // Usage: host_conv_test     Exit 0 = pass, 1 = mismatch.
 #include "lib/host_conv.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <random>
+#include <thread>
 #include <vector>
 
 using starling::ggml::lib::host_conv1d_k3;
@@ -72,6 +78,39 @@ int run_case(std::mt19937& rng, int64_t OC, int64_t IC, int64_t L, int64_t pad_l
     return 0;
 }
 
+// `post` throws std::bad_alloc (every call, or only off the calling thread,
+// whose own calls are slowed so the workers get items): the call must throw
+// it to the caller, and the next call must work normally.
+int throw_case(bool off_caller_only, int threads) {
+    const int64_t OC = 256, IC = 64, L = 512;
+    std::vector<float> w((size_t) OC * IC * 3, 0.01f), b((size_t) OC, 0.5f);
+    std::vector<ggml_bf16_t> in((size_t) IC * L, ggml_fp32_to_bf16(1.0f));
+    const std::thread::id caller = std::this_thread::get_id();
+    std::atomic<int> thrown{0};
+    auto post = [&](float*, int64_t) {
+        if (std::this_thread::get_id() == caller && off_caller_only) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            return;
+        }
+        thrown.fetch_add(1);
+        throw std::bad_alloc();
+    };
+    std::vector<float> y;
+    bool caught = false;
+    try {
+        host_conv1d_k3(w.data(), b.data(), OC, IC, in.data(), L, 1, 1, 1, y, threads, post);
+    } catch (const std::bad_alloc&) {
+        caught = true;
+    }
+    if (!caught || thrown.load() == 0) {
+        std::printf("FAIL exception off_caller_only=%d thr=%d: caught=%d thrown=%d\n", (int) off_caller_only,
+                    threads, (int) caught, thrown.load());
+        return 1;
+    }
+    std::mt19937 rng(7);
+    return run_case(rng, 37, 65, 150, 1, 1, 1, threads, false);
+}
+
 } // namespace
 
 int main() {
@@ -88,6 +127,8 @@ int main() {
                                           /*f32_weights=*/OC == 37);
     // Stride 2 with symmetric padding (ark conv2).
     fails += run_case(rng, 96, 200, 301, 1, 1, 2, 4, false);
+    for (int threads : {1, 4}) fails += throw_case(false, threads);
+    fails += throw_case(true, 4);
     if (fails) {
         std::printf("host_conv_test: %d case(s) FAILED\n", fails);
         return 1;

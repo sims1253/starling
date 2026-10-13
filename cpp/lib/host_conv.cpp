@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <exception>
+#include <mutex>
 #include <thread>
 
 namespace starling::ggml::lib {
@@ -103,15 +105,37 @@ int64_t host_conv1d_k3(const float* w, const float* bias, int64_t OC, int64_t IC
     // Weights packed per kMR-row micro panel: wp[ob4][c*3+k][i] (rows >= OC
     // stay zero and are discarded).
     std::vector<float> wpk((size_t) OCr * IC * K, 0.0f);
+    // Work items from an atomic counter on nthr threads (this one included).
+    // The first exception, from a body (scratch allocation, `post`) or from
+    // starting a thread, stops the remaining items and is rethrown here once
+    // every started thread has joined.
     auto run = [&](const auto& body, int64_t total) {
         std::atomic<int64_t> next{0};
+        std::exception_ptr first;
+        std::mutex mu;
+        auto stop = [&](std::exception_ptr e) {
+            next.store(total);
+            std::lock_guard<std::mutex> lk(mu);
+            if (!first) first = e;
+        };
         auto worker = [&]() {
-            for (int64_t it; (it = next.fetch_add(1)) < total;) body(it);
+            try {
+                for (int64_t it; (it = next.fetch_add(1)) < total;) body(it);
+            } catch (...) {
+                stop(std::current_exception());
+            }
         };
         std::vector<std::thread> ths;
-        for (int i = 1; i < std::min<int64_t>(nthr, total); ++i) ths.emplace_back(worker);
+        try {
+            const int64_t n = std::min<int64_t>(nthr, total);
+            ths.reserve((size_t) std::max<int64_t>(n - 1, 0));
+            for (int64_t i = 1; i < n; ++i) ths.emplace_back(worker);
+        } catch (...) {
+            stop(std::current_exception());
+        }
         worker();
         for (auto& t : ths) t.join();
+        if (first) std::rethrow_exception(first);
     };
     run([&](int64_t c) {
         const ggml_bf16_t* src = x + (size_t) c * L;
