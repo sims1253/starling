@@ -82,6 +82,15 @@ class NativeSupportTest {
     }
 
     @Test
+    fun npuArtifactDirsJoinInOrderWithoutDuplicatesOrColons() {
+        val dirs = listOf(java.io.File("/data/user/0/app/files/npu"), java.io.File("/sdcard/Android/data/app/files/npu"),
+            java.io.File("/data/user/0/app/files/npu"), java.io.File("/bad:dir"))
+
+        assertEquals("/data/user/0/app/files/npu:/sdcard/Android/data/app/files/npu", NativeSupport.npuDirValue(dirs))
+        assertNull(NativeSupport.npuDirValue(emptyList()))
+    }
+
+    @Test
     fun unreadableFrequenciesFallBackToHalfTheCores() {
         assertEquals(4, NativeSupport.performanceCores(emptyList(), 8))
         assertEquals(1, NativeSupport.performanceCores(emptyList(), 1))

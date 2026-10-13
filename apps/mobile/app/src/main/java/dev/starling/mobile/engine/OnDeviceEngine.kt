@@ -59,6 +59,8 @@ class OnDeviceEngine(
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
     private val keepAwake: () -> AutoCloseable = { AutoCloseable {} },
     private val partialTag: String = "local",
+    /** Directories searched for Pixel TPU encoder artifacts (STARLING_NPU_DIR). */
+    private val npuDirs: List<File> = emptyList(),
 ) : OnDeviceStreamSession.LiveEngine {
     /** An engine whose models and active-model marker all live in [modelDir]. */
     constructor(
@@ -66,7 +68,8 @@ class OnDeviceEngine(
         memoryGate: (modelBytes: Long, kind: ModelKind) -> String? = { _, _ -> null },
         nativeSupport: () -> String? = NativeSupport::unsupportedReason,
         keepAwake: () -> AutoCloseable = { AutoCloseable {} },
-    ) : this({ modelDir }, modelDir, memoryGate, nativeSupport, keepAwake)
+        npuDirs: List<File> = emptyList(),
+    ) : this({ modelDir }, modelDir, memoryGate, nativeSupport, keepAwake, npuDirs = npuDirs)
 
     /**
      * What [adoptModels] did: models moved (an identical copy already in
@@ -794,7 +797,7 @@ class OnDeviceEngine(
         NativeSupport.applyThreadDefault()
         // The fast engine's pipeline cache and GPU-wedge marker stay with
         // this install, not in a model folder other builds share.
-        NativeSupport.applyFastEngineDefaults(ownDir)
+        NativeSupport.applyFastEngineDefaults(ownDir, npuDirs)
         val abi = StarlingNative.abiVersion()
         if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
             loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"

@@ -25,6 +25,8 @@ object NativeSupport {
 
     private const val FAST_CACHE_ENV = "STARLING_FAST_CACHE_DIR"
 
+    private const val NPU_DIR_ENV = "STARLING_NPU_DIR"
+
     @Volatile
     private var threadsApplied = false
 
@@ -101,13 +103,26 @@ object NativeSupport {
      * so driver shader compilation is paid once, not on every process start.
      * Must run before the first model load; an explicit environment wins.
      */
-    fun applyFastEngineDefaults(cacheDir: File?) {
-        if (cacheDir == null || !System.getenv(FAST_CACHE_ENV).isNullOrEmpty()) return
-        // The engine writes there but never creates it (a reinstall that
-        // finds its models in shared storage has no private model folder).
-        cacheDir.mkdirs()
-        runCatching { Os.setenv(FAST_CACHE_ENV, cacheDir.absolutePath, false) }
+    fun applyFastEngineDefaults(cacheDir: File?, npuDirs: List<File> = emptyList()) {
+        if (cacheDir != null && System.getenv(FAST_CACHE_ENV).isNullOrEmpty()) {
+            // The engine writes there but never creates it (a reinstall that
+            // finds its models in shared storage has no private model folder).
+            cacheDir.mkdirs()
+            runCatching { Os.setenv(FAST_CACHE_ENV, cacheDir.absolutePath, false) }
+        }
+        npuDirValue(npuDirs)?.let { dirs ->
+            if (System.getenv(NPU_DIR_ENV).isNullOrEmpty()) runCatching { Os.setenv(NPU_DIR_ENV, dirs, false) }
+        }
     }
+
+    /**
+     * Where the engine looks for Pixel TPU encoder artifacts (compiled over
+     * adb by benchmarks/npu/npu_compile.sh; the app only loads them):
+     * colon-separated, first match wins. Null when there is nothing to set.
+     */
+    internal fun npuDirValue(npuDirs: List<File>): String? =
+        npuDirs.map { it.absolutePath }.filter { it.isNotEmpty() && ':' !in it }.distinct()
+            .joinToString(":").ifEmpty { null }
 
     /**
      * Every core except the slowest cluster: the prime and performance
