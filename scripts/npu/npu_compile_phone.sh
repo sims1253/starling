@@ -27,8 +27,9 @@ for APP in "${PKGS[@]}"; do
   [[ $APP =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] || { echo "bad package name '$APP'" >&2; exit 2; }
 done
 
-# One argument quoted for the phone's shell.
-q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# One argument quoted for the phone's shell (every byte kept, trailing
+# newlines included: no command substitution).
+q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 # A fingerprint in canonical form (0x + 16 lower-case hex digits), or "".
 canon() {
   local h
