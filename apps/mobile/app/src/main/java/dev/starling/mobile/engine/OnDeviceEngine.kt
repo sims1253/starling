@@ -755,7 +755,9 @@ class OnDeviceEngine(
         }
         observer.loading(modelFile.name)
         NativeSupport.applyThreadDefault()
-        NativeSupport.applyFastEngineDefaults(modelFile.parentFile)
+        // The fast engine's pipeline cache and GPU-wedge marker stay with
+        // this install, not in a model folder other builds share.
+        NativeSupport.applyFastEngineDefaults(ownDir)
         val abi = StarlingNative.abiVersion()
         if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
             loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
