@@ -71,29 +71,36 @@ class OnDeviceTranscriptionE2ETest {
         val model = InstrumentationRegistry.getArguments().getString("model")
         assumeTrue("set the model instrumentation argument to run", model != null)
         val context = instrumentation.targetContext
-        // Same TPU artifact directory as the app (scripts/npu/npu_compile.sh --app).
-        val engine = OnDeviceEngine(File(context.filesDir, "e2e-models"), npuDirs = listOf(File(context.filesDir, "npu")))
+        // Same TPU artifact directories as the app (StarlingApplication;
+        // scripts/npu/npu_compile.sh --app installs into one of them).
+        val engine = OnDeviceEngine(
+            File(context.filesDir, "e2e-models"),
+            npuDirs = listOfNotNull(File(context.filesDir, "npu"), context.getExternalFilesDir("npu")),
+        )
         assumeTrue("$model is not in files/e2e-models", engine.installedModels().any { it.name == model })
         val wav = File(context.cacheDir, "e2e.wav")
         instrumentation.context.assets.open("librispeech-2086-149220-0033.wav").use { input ->
             wav.outputStream().use { input.copyTo(it) }
         }
-        // The first call loads and warms the model; the second is the steady state.
-        for (run in 0 until 2) {
-            val started = System.nanoTime()
-            val result = engine.transcribe(wav, model)
-            val millis = (System.nanoTime() - started) / 1_000_000
-            val text = (result as? InferenceResult.Success)?.rawTranscript
-                ?: throw AssertionError("transcription failed: $result")
-            Log.i("StarlingE2E", "$model run $run: ${millis} ms: $text")
-            val expected = normalize(REFERENCE).split(' ')
-            val got = normalize(text).split(' ').toSet()
-            val matched = expected.count { it in got }
-            // Models differ in spelling ("any more"/"anymore") and casing; a
-            // wrong engine or garbled audio path matches almost nothing.
-            assertTrue("transcript too far from the reference: $text", matched >= expected.size * 8 / 10)
+        try {
+            // The first call loads and warms the model; the second is the steady state.
+            for (run in 0 until 2) {
+                val started = System.nanoTime()
+                val result = engine.transcribe(wav, model)
+                val millis = (System.nanoTime() - started) / 1_000_000
+                val text = (result as? InferenceResult.Success)?.rawTranscript
+                    ?: throw AssertionError("transcription failed: $result")
+                Log.i("StarlingE2E", "$model run $run: ${millis} ms: $text")
+                val expected = normalize(REFERENCE).split(' ')
+                val got = normalize(text).split(' ').toSet()
+                val matched = expected.count { it in got }
+                // Models differ in spelling ("any more"/"anymore") and casing; a
+                // wrong engine or garbled audio path matches almost nothing.
+                assertTrue("transcript too far from the reference: $text", matched >= expected.size * 8 / 10)
+            }
+        } finally {
+            engine.releaseWhenIdle()
         }
-        engine.releaseWhenIdle()
     }
 
     private fun normalize(text: String) =
