@@ -12,6 +12,9 @@ fun gradleFlag(name: String): Boolean {
 }
 val starlingExperimental = gradleFlag("starlingExperimental")
 val starlingArm64Only = gradleFlag("starlingArm64Only")
+// Builds the debug APK's native engine optimized (RelWithDebInfo), so
+// on-device tests of the larger models finish in seconds, not minutes.
+val starlingOptimizedDebugNative = gradleFlag("starlingOptimizedDebugNative")
 val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse("1").get().let { raw ->
     raw.toIntOrNull()?.takeIf { it > 0 }
         ?: throw GradleException("starlingVersionCode must be an integer in 1..${Int.MAX_VALUE}: $raw")
@@ -188,6 +191,9 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             buildConfigField("String", "GIT_SHA", "\"$starlingGitSha\"")
+            if (starlingOptimizedDebugNative) {
+                externalNativeBuild { cmake { arguments += "-DCMAKE_BUILD_TYPE=RelWithDebInfo" } }
+            }
         }
         release {
             if (starlingExperimental) {

@@ -8,6 +8,7 @@ import dev.starling.mobile.engine.ModelDownloader
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.transcription.InferenceResult
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -21,6 +22,16 @@ import java.io.File
  *   ./gradlew connectedDebugAndroidTest \
  *     -Pandroid.testInstrumentationRunnerArguments.e2e=true
  * Gradle uninstalls the test app afterwards, so every run downloads again.
+ *
+ * [installedModelTranscribesLibriSpeechClip] runs any other model family the
+ * same way, from a GGUF placed in the app's files/e2e-models beforehand
+ * (connectedAndroidTest would uninstall it, so install the APKs and run
+ * `am instrument` directly):
+ *   adb shell run-as dev.starling.mobile.debug mkdir -p files/e2e-models
+ *   adb shell run-as dev.starling.mobile.debug cp /data/local/tmp/m.gguf files/e2e-models/
+ *   adb shell am instrument -w -e model m.gguf \
+ *     -e class dev.starling.mobile.OnDeviceTranscriptionE2ETest#installedModelTranscribesLibriSpeechClip \
+ *     dev.starling.mobile.debug.test/androidx.test.runner.AndroidJUnitRunner
  */
 @RunWith(AndroidJUnit4::class)
 class OnDeviceTranscriptionE2ETest {
@@ -53,6 +64,35 @@ class OnDeviceTranscriptionE2ETest {
             ?: throw AssertionError("transcription failed: $result")
         Log.i("StarlingE2E", "transcript: $text")
         assertEquals("transcript mismatch, got: $text", normalize(REFERENCE), normalize(text))
+    }
+
+    @Test
+    fun installedModelTranscribesLibriSpeechClip() {
+        val model = InstrumentationRegistry.getArguments().getString("model")
+        assumeTrue("set the model instrumentation argument to run", model != null)
+        val context = instrumentation.targetContext
+        val engine = OnDeviceEngine(File(context.filesDir, "e2e-models"))
+        assumeTrue("$model is not in files/e2e-models", engine.installedModels().any { it.name == model })
+        val wav = File(context.cacheDir, "e2e.wav")
+        instrumentation.context.assets.open("librispeech-2086-149220-0033.wav").use { input ->
+            wav.outputStream().use { input.copyTo(it) }
+        }
+        // The first call loads and warms the model; the second is the steady state.
+        for (run in 0 until 2) {
+            val started = System.nanoTime()
+            val result = engine.transcribe(wav, model)
+            val millis = (System.nanoTime() - started) / 1_000_000
+            val text = (result as? InferenceResult.Success)?.rawTranscript
+                ?: throw AssertionError("transcription failed: $result")
+            Log.i("StarlingE2E", "$model run $run: ${millis} ms: $text")
+            val expected = normalize(REFERENCE).split(' ')
+            val got = normalize(text).split(' ').toSet()
+            val matched = expected.count { it in got }
+            // Models differ in spelling ("any more"/"anymore") and casing; a
+            // wrong engine or garbled audio path matches almost nothing.
+            assertTrue("transcript too far from the reference: $text", matched >= expected.size * 8 / 10)
+        }
+        engine.releaseWhenIdle()
     }
 
     private fun normalize(text: String) =

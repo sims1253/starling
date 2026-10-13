@@ -66,7 +66,9 @@ own metadata (`engine/ModelKind.kt`); anything else, including the S1-mini
 text model, is refused at import. These LLM-decoder models are several
 times larger and slower than Parakeet on a phone, and their load is
 memory-gated with a larger working-set estimate (a KV cache on top of the
-weights). The model is loaded on first use. When a transcription fails —
+weights); they transcribe long recordings in 30 s windows, and live
+previews of a slow model are spaced so they keep the engine busy at most
+half of the time. The model is loaded on first use. When a transcription fails —
 missing model, load failure — the failure is surfaced and the local
 recording remains available for retry.
 Building the app additionally requires the Android NDK and CMake SDK packages.
