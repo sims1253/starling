@@ -96,6 +96,11 @@ struct Spec {
     std::string conv_out, pos_embed, proj1, proj2;
     std::string eq, ek, ev, eo, efc1, efc2;
     bool adapter = false;   // MOSS: SwiGLU adapter between projection and LLM
+    // Conv-stack chunk length of a single-chunk clip (< 100 mel frames).
+    // Qwen3-ASR pads the mel to whole 100-frame chunks (HF Qwen3ASREncoder),
+    // and the padded frames reach the last valid rows through the three
+    // convs; MOSS packs chunks to the longest piece, i.e. the clip itself.
+    bool full_chunks = false;
     // encoder
     uint32_t ED = 0, EH = 0, EHD = 0, EFF = 0, EL = 0, DS = 0, EOUT = 0, n_window_infer = 0, n_mels = 0;
     float enc_eps = 1e-5f;
@@ -159,6 +164,7 @@ Spec qwen3_spec(const q3::Config& c) {
     s.proj1 = "proj.linear_1"; s.proj2 = "proj.linear_2";
     s.eq = "attn_q"; s.ek = "attn_k"; s.ev = "attn_v"; s.eo = "attn_o"; s.efc1 = "ff_up"; s.efc2 = "ff_down";
     s.adapter = false;
+    s.full_chunks = true;
     const auto& ec = c.encoder;
     const auto& lc = c.llm;
     s.ED = ec.hidden; s.EH = ec.n_heads; s.EHD = ec.head_dim; s.EFF = ec.ffn_dim; s.EL = ec.n_layers;
@@ -334,6 +340,8 @@ struct AudioLlmEngine::Impl {
     bool alloc_static(std::string& err);
     bool ensure(int C, int A, int S, std::string& err);
     bool record_prefill(int C, int tail, Rec& r, std::string& err);
+    // Mel frames per conv chunk for C chunks with `tail` frames in the last.
+    int chunk_frames(int C, int tail) const { return C == 1 && !sp.full_chunks ? tail : 100; }
     // Decoder-only prefill over S host-supplied rows (embedding lookup of
     // the text slots, then the LLM).
     bool record_prefill_rows(int S, Rec& r, std::string& err);
@@ -1249,7 +1257,7 @@ bool AudioLlmEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
 }
 
 bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err) {
-    const int P = C == 1 ? tail : 100;
+    const int P = chunk_frames(C, tail);
     const int T1 = half_len(P), F1 = 64, T2 = half_len(T1), F2 = 32, T3 = half_len(T2), F3 = 16;
     const int64_t Tm = (int64_t)(C - 1) * 100 + tail;
     const uint32_t A = (uint32_t)audio_tokens(Tm);
@@ -2106,7 +2114,7 @@ bool AudioLlmEngine::generate(const float* pcm, size_t n, uint32_t budget, std::
     if (T <= 0) { err = std::string("fast ") + tag + ": empty audio"; return false; }
     const int C = (int)((T + 99) / 100);
     const int tail = (int)(T % 100 ? T % 100 : 100);
-    const int P = C == 1 ? tail : 100;
+    const int P = I.chunk_frames(C, tail);
     const int A = (int)audio_tokens(T);
     const int S = (int)(I.sp.prefix.size() + A + I.sp.suffix.size());
     if (S + (int)max_new > (int)I.MAXPOS) {
