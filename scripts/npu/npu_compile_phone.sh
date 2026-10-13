@@ -7,7 +7,9 @@
 # everything itself, however it is called:
 #  * KEY is one of the supported encoder windows (Qwen3-ASR 0.6B or 1.7B,
 #    cpp/npu/encoder_contract.hpp), and TFLITE's single subgraph has exactly
-#    that window's inputs and output; the artifact's I/O sizes follow from KEY;
+#    that window's inputs and output and the operator signature (operator and
+#    tensor counts, operators per builtin) export_encoder.py produces for it;
+#    the artifact's I/O sizes follow from KEY;
 #  * the model fingerprint, from the phone-side GGUF or given (0x..., from the
 #    app's status-*.txt), equals EXPECT_HASH, the fingerprint of the checkpoint
 #    TFLITE was exported from (export_encoder.py --fingerprint);
@@ -19,7 +21,7 @@
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 8 ] || { sed -n 2,19p "$0" >&2; exit 2; }
+[ $# -eq 8 ] || { sed -n 2,22p "$0" >&2; exit 2; }
 NPU_TOOL=$1; TFL=$2; SRC=$3; EXPECT=$4; KEY=$5; DIR=$6; APPS=$7; T=$8
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
@@ -40,9 +42,23 @@ canon() {
 }
 
 # ---- the graph: a supported encoder window, and nothing else ----
+# GRAPH: what export_encoder.py produces for the window — tensor count,
+# operator count and operators per TFLite builtin code (0 ADD, 3 CONV_2D,
+# 4 DEPTHWISE_CONV_2D, 6 DEQUANTIZE, 9 FULLY_CONNECTED, 18 MUL, 22 RESHAPE,
+# 25 SOFTMAX, 34 PAD, 39 TRANSPOSE, 40 MEAN, 41 SUB, 76 RSQRT,
+# 99 SQUARED_DIFFERENCE, 126 BATCH_MATMUL, 150 GELU), so a different graph
+# (a constant, a no-op) cannot pass under an encoder's key. 1.7B converts
+# with lightweight_conversion and keeps f32 weights (no DEQUANTIZE).
+# Measured with litert-torch 0.9.4 and ai-edge-quantizer 0.9.0; a converter
+# that emits a different graph needs these updated (and the graph compiled
+# once with care: see docs/fast-engine.md, Pixel TPU encoder).
 case $KEY in
-  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024") OUTD=1024 MAXMB=640 ;;
-  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=1024 L=24 H=16 ff=4096 ds=480 out=2048") OUTD=2048 MAXMB=1300 ;;
+  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024")
+    OUTD=1024 MAXMB=640
+    GRAPH="1294 1046 0:129 3:2 4:1 6:114 9:111 18:74 22:277 25:18 34:3 39:74 40:74 41:37 76:37 99:37 126:36 150:22" ;;
+  "qwen3-asr-enc/1 mels=128 frames=800 tokens=104 d=1024 L=24 H=16 ff=4096 ds=480 out=2048")
+    OUTD=2048 MAXMB=1300
+    GRAPH="1871 1452 0:171 3:2 4:1 9:244 18:219 22:367 25:24 34:3 39:100 40:98 41:49 76:49 99:49 126:48 150:28" ;;
   *) echo "refusing '$KEY': only the Qwen3-ASR 0.6B/1.7B encoder windows compile safely on the phone" >&2; exit 2 ;;
 esac
 MELS=128 FRAMES=800 TOKENS=104
@@ -50,14 +66,22 @@ IN=$((MELS * FRAMES * 4)),$((TOKENS * 4))
 OUT=$((TOKENS * OUTD * 4))
 SIZE=$(stat -c %s "$TFL")
 [ "$SIZE" -le $((MAXMB << 20)) ] || { echo "graph is $((SIZE >> 20)) MB, above this window's $MAXMB MB safety limit" >&2; exit 1; }
-# The .tflite's own inputs and output (flatbuffer: Model.subgraphs ->
-# SubGraph.{tensors, inputs, outputs} -> Tensor.{shape, type}).
-"$PY" -I - "$TFL" "$MELS" "$FRAMES" "$TOKENS" "$OUTD" <<'EOF' || exit 2
+# The .tflite's own inputs, output and operators (flatbuffer: Model.
+# {operator_codes, subgraphs} -> SubGraph.{tensors, inputs, outputs,
+# operators} -> Tensor.{shape, type}, Operator.opcode_index,
+# OperatorCode.{deprecated_builtin_code, custom_code, builtin_code}).
+# shellcheck disable=SC2086
+"$PY" -I - "$TFL" "$MELS" "$FRAMES" "$TOKENS" "$OUTD" $GRAPH <<'EOF' || exit 2
 import mmap
 import struct
 import sys
 
-path, mels, frames, tokens, outd = sys.argv[1], *map(int, sys.argv[2:])
+path = sys.argv[1]
+mels, frames, tokens, outd, want_tensors, want_ops = map(int, sys.argv[2:8])
+want_hist = {int(c): int(n) for c, n in (a.split(":") for a in sys.argv[8:])}
+NAMES = {0: "ADD", 3: "CONV_2D", 4: "DEPTHWISE_CONV_2D", 6: "DEQUANTIZE", 9: "FULLY_CONNECTED",
+         18: "MUL", 22: "RESHAPE", 25: "SOFTMAX", 34: "PAD", 39: "TRANSPOSE", 40: "MEAN", 41: "SUB",
+         76: "RSQRT", 99: "SQUARED_DIFFERENCE", 126: "BATCH_MATMUL", 150: "GELU"}
 
 
 def fail(msg):
@@ -127,6 +151,32 @@ want_out = [([1, tokens, outd], 0)]
 got_in, got_out = io(1), io(2)
 if got_in != want_in or got_out != want_out:
     fail(f"inputs {got_in} / outputs {got_out} are not the encoder window's {want_in} / {want_out}")
+
+
+def opcode(oc):  # builtin code, or "custom"
+    if field(oc, 1):
+        return "custom"
+    dep, bc = field(oc, 0), field(oc, 3)
+    return max(u("<b", dep) if dep else 0, u("<i", bc) if bc else 0)
+
+
+oc = field(root, 1)
+codes = [opcode(t) for t in (tables(oc) if oc else [])]
+op = field(s, 3)
+hist = {}
+for o in tables(op) if op else []:
+    i = field(o, 0)
+    k = u("<I", i) if i else 0
+    if k >= len(codes):
+        fail("operator code index out of range")
+    hist[codes[k]] = hist.get(codes[k], 0) + 1
+n_ops = sum(hist.values())
+if (len(tensors), n_ops, hist) != (want_tensors, want_ops, want_hist):
+    def show(h):
+        order = sorted(h, key=lambda c: (isinstance(c, str), str(c).zfill(4)))
+        return ", ".join(f"{NAMES.get(c, c)} {h[c]}" for c in order)
+    fail(f"not the encoder window export_encoder.py builds: {len(tensors)} tensors, {n_ops} operators "
+         f"({show(hist)}); expected {want_tensors} tensors, {want_ops} operators ({show(want_hist)})")
 EOF
 
 # ---- the model it belongs to ----
