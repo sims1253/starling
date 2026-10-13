@@ -688,6 +688,21 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         err = "fast " + tag + ": unsupported configuration";
         return false;
     }
+    // Each KV cache (all layers) is one storage-buffer binding addressed with
+    // whole-cache offsets. The C APIs size their requests from the GGUF's
+    // cache length (Granite chunks audio to it, MOSS decodes whole clips
+    // into it), so a cache that does not fit the device's binding range is
+    // refused here (STARLING_ENGINE=auto then loads the ggml engine) rather
+    // than shortened.
+    {
+        const uint64_t cache_bytes = (uint64_t)NL * NKV * MAXPOS * HDIM * 2;
+        if (cache_bytes > ctx->info().max_storage_range) {
+            err = "fast " + tag + ": KV cache of " + std::to_string(MAXPOS) + " positions (" +
+                  std::to_string(cache_bytes >> 20) + " MiB) exceeds this device's storage-buffer range (" +
+                  std::to_string(ctx->info().max_storage_range >> 20) + " MiB)";
+            return false;
+        }
+    }
     auto T = [&](const std::string& n) -> const ggml_tensor* {
         const ggml_tensor* t = ml.tensor(n.c_str());
         if (!t && err.empty()) err = "fast " + tag + ": missing tensor " + n;
@@ -1183,7 +1198,16 @@ bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
     // Prefill attention scores are processed in head groups (prefill_hgroup).
     // record_prefill sizes its groups from the actual buffer capacity, so a
     // shorter prompt recorded against these buffers can never overrun them.
+    // Bound whole (all but the conv-stack buffers, which record_prefill binds
+    // per group of chunks): past the binding range, refuse the clip rather
+    // than compute on a truncated view.
     auto mk = [&](vk::Buffer& b, size_t bytes, vk::Mem kind = vk::Mem::Device) {
+        const bool grouped = !sp.whisper && !sp.conformer && (&b == &mel_in || &b == &cv1 || &b == &cv2);
+        if (!grouped && bytes > ctx->info().max_storage_range) {
+            err = std::string("fast ") + sp.tag + ": audio too long for this device (a " +
+                  std::to_string(bytes >> 20) + " MiB buffer exceeds the storage-buffer range)";
+            return false;
+        }
         return ctx->create_buffer(b, std::max<size_t>(bytes, 16), kind, err);
     };
     const size_t hgroup = prefill_hgroup((size_t)S);
@@ -1290,26 +1314,48 @@ bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& 
     rc.begin();
 
     // ---- conv stack ----
-    rc.label("enc_conv1");
-    if (!K.pk_conv(rc, 3, {DS, (uint32_t)P, 128, (uint32_t)T1, (uint32_t)F1, 0}, F1, (uint32_t)(C * T1),
-                   vk::Ref(mel_in), R(c1_w), R(c1_b), {}, vk::Ref(cv1), err))
+    // Chunks are independent here, so the convs run over groups of chunks
+    // whose conv1 output (the largest intermediate, ~3 MB per chunk) fits
+    // one storage-buffer binding: long clips exceed PowerVR's 128 MiB.
+    const VkDeviceSize mel_cb = (VkDeviceSize)128 * P * 4, cv1_cb = (VkDeviceSize)T1 * F1 * DS * 2,
+                       cv2_cb = (VkDeviceSize)T2 * F2 * DS * 2, cv3_cb = (VkDeviceSize)T3 * F3 * DS * 2;
+    const int G = (int)std::max<VkDeviceSize>(1, std::min<VkDeviceSize>(C, ctx->info().max_storage_range / cv1_cb));
+    if (G < C && (cv1_cb % 256 || cv2_cb % 256 || cv3_cb % 256 || mel_cb % 256)) {
+        err = std::string("fast ") + sp.tag + ": conv chunk groups would be misaligned";
         return false;
+    }
+    auto group = [](vk::Buffer& b, VkDeviceSize per, int c0, int n) {
+        return vk::Ref(b, per * (VkDeviceSize)c0, per * (VkDeviceSize)n);
+    };
+    for (int c0 = 0; c0 < C; c0 += G) {
+        const int n = std::min(G, C - c0);
+        rc.label("enc_conv1");
+        if (!K.pk_conv(rc, 3, {DS, (uint32_t)P, 128, (uint32_t)T1, (uint32_t)F1, 0}, F1, (uint32_t)(n * T1),
+                       group(mel_in, mel_cb, c0, n), R(c1_w), R(c1_b), {}, group(cv1, cv1_cb, c0, n), err))
+            return false;
+    }
     rc.barrier();
-    auto conv = [&](const GMat& w, Arena::Id b, vk::Buffer& in, vk::Buffer& out, int ti, int fi, int to, int fo) {
+    auto conv = [&](const GMat& w, Arena::Id b, vk::Ref in, vk::Ref out, int n, int ti, int fi, int to, int fo) {
         GemmCall c;
         c.b = BKind::F16; c.a_conv = true; c.epi = Epi::F16; c.act = Act::Gelu; c.bias_mode = 1;
-        c.a.M = (uint32_t)(C * to * fo); c.a.N = DS; c.a.K = 9 * DS;
+        c.a.M = (uint32_t)(n * to * fo); c.a.N = DS; c.a.K = 9 * DS;
         c.a.lda = DS; c.a.ldb = 9 * DS; c.a.ldc = DS;
         c.a.cv_cin = DS; c.a.cv_ti = (uint32_t)ti; c.a.cv_fi = (uint32_t)fi;
         c.a.cv_to = (uint32_t)to; c.a.cv_fo = (uint32_t)fo;
-        c.A = vk::Ref(in); c.Bq = R(w.q); c.C = vk::Ref(out); c.bias = R(b);
+        c.A = in; c.Bq = R(w.q); c.C = out; c.bias = R(b);
         return K.gemm(rc, c, err);
     };
-    rc.label("enc_conv2");
-    if (!conv(c2, c2_b, cv1, cv2, T1, F1, T2, F2)) return false;
+    for (int c0 = 0; c0 < C; c0 += G) {
+        const int n = std::min(G, C - c0);
+        rc.label("enc_conv2");
+        if (!conv(c2, c2_b, group(cv1, cv1_cb, c0, n), group(cv2, cv2_cb, c0, n), n, T1, F1, T2, F2)) return false;
+    }
     rc.barrier();
-    rc.label("enc_conv3");
-    if (!conv(c3, c3_b, cv2, cv3, T2, F2, T3, F3)) return false;
+    for (int c0 = 0; c0 < C; c0 += G) {
+        const int n = std::min(G, C - c0);
+        rc.label("enc_conv3");
+        if (!conv(c3, c3_b, group(cv2, cv2_cb, c0, n), group(cv3, cv3_cb, c0, n), n, T2, F2, T3, F3)) return false;
+    }
     rc.barrier();
     // conv_out over the first A (valid) tokens + per-chunk positional table.
     rc.label("enc_conv_out");

@@ -12,7 +12,8 @@
 // Portability rules (the target GPUs include mobile drivers of uneven
 // quality): shaders use only Vulkan 1.0 core features (16-bit values are
 // packed/unpacked from 32-bit words, no 8/16-bit storage, no subgroup ops);
-// every storage-buffer binding stays below maxStorageBufferRange; tuning knobs
+// every storage-buffer binding stays within maxStorageBufferRange (a larger
+// one fails the recording instead of being clamped); tuning knobs
 // are specialization constants, so the same SPIR-V runs everywhere.
 
 #pragma once

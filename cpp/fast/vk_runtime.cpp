@@ -1081,8 +1081,16 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
         }
         infos[i].buffer = r.buf->buf;
         infos[i].offset = r.off;
-        VkDeviceSize range = r.range == VK_WHOLE_SIZE ? r.buf->size - r.off : r.range;
-        range = std::min<VkDeviceSize>(range, ctx_.info_.max_storage_range);
+        const VkDeviceSize range = r.range == VK_WHOLE_SIZE ? r.buf->size - r.off : r.range;
+        // Never clamp: the kernels address the whole range, so a shorter view
+        // would read and write outside it. Callers size bindings to fit.
+        if (range > ctx_.info_.max_storage_range) {
+            if (fail_.empty())
+                fail_ = std::string("binding ") + std::to_string(i) + " of " + p.label + ": " +
+                        std::to_string(range) + " bytes exceed maxStorageBufferRange (" +
+                        std::to_string(ctx_.info_.max_storage_range) + ")";
+            return;
+        }
         infos[i].range = range;
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[i].dstSet = set;
