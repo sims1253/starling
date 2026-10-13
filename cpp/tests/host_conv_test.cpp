@@ -1,7 +1,7 @@
 // host_conv_test.cpp — lib::host_conv1d_k3 against the scalar reference loop
-// it replaced in ark/voxtral (sequential f64 accumulation, explicit zero
+// it replaced in ark (sequential f64 accumulation, explicit zero
 // padding). The contract is BIT equality on every output, for symmetric
-// (ark) and left-only (voxtral) padding, stride 1 and 2, OC/OL sizes that
+// (ark) and left-only (causal) padding, stride 1 and 2, OC/OL sizes that
 // are not multiples of the tile, and any thread count. No model needed.
 //
 // Usage: host_conv_test     Exit 0 = pass, 1 = mismatch.
@@ -77,7 +77,7 @@ int run_case(std::mt19937& rng, int64_t OC, int64_t IC, int64_t L, int64_t pad_l
 int main() {
     std::mt19937 rng(1234);
     int fails = 0;
-    // ark: symmetric pad 1; voxtral: left pad 2 (s1) / 1 (s2).
+    // ark: symmetric pad 1; causal: left pad 2 (s1) / 1 (s2).
     const int64_t pads[3][3] = {{1, 1, 1}, {2, 0, 1}, {1, 0, 2}};  // {pad_l, pad_r, stride}
     for (const auto& p : pads)
         for (int64_t OC : {4, 37, 130})

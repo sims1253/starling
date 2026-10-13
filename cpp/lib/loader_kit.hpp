@@ -90,7 +90,7 @@ inline bool check_gguf_header(const ModelLoader& m, const char* arch, const char
 // Exact tensor-shape equation shared by the per-model loaders: `name` must
 // have exactly the ggml dims in `want` (GGUF stores row-major [out, in];
 // ggml exposes ne innermost-first). `label` names the model in the error
-// ("QWEN3"/"VOXTRAL"/...); presence errors read
+// ("QWEN3"/"ARK"/...); presence errors read
 // "<label> GGUF missing required tensor: <name>".
 // The vector overload is the implementation; the initializer_list overload
 // forwards to it (tests build macro-derived want lists that an

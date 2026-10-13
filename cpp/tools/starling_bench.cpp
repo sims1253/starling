@@ -63,7 +63,7 @@ void usage() {
 starling_ggml_model model_kind(const std::string& s) {
     // Any registry slug resolves through the model table (model_registry.cpp),
     // so every native model (parakeet, moss, ark, ark06, qwen3, granite,
-    // s1, voxtral, ...) is benchable; the historical
+    // s1, ...) is benchable; the historical
     // hardcoded names are registry slugs and keep working unchanged (#176).
     const starling::ggml::lib::ModelDescriptor* d =
         starling::ggml::lib::find_model_by_slug(s);

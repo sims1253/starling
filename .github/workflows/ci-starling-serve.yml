@@ -18,7 +18,6 @@ on:
       - 'backends/native/**'
       - 'third_party/**'
       - 'scripts/apply_ggml_patches.sh'
-      - 'scripts/make_voxtral_tiny_gguf.py'
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
       - 'quants/recipes/**'
@@ -30,7 +29,6 @@ on:
       - 'backends/native/**'
       - 'third_party/**'
       - 'scripts/apply_ggml_patches.sh'
-      - 'scripts/make_voxtral_tiny_gguf.py'
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
       - 'quants/recipes/**'
@@ -148,7 +146,6 @@ jobs:
             granite_ctc_proposer_test granite_ctc_entry_test model_lifetime_test \
             starling-quantize \
             parakeet_compact_engine_test parakeet_word_frames_test s1_quant_loader_test \
-            voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
             granite_fairness_test \
             graph_snapshot_test \
@@ -206,24 +203,6 @@ jobs:
           ./build/serve_trace_test
           ./build/granite_fairness_test
           ./build/graph_snapshot_test
-
-      # Voxtral engine suite: the tiny-GGUF fixture is generated in-workflow
-      # (CPU torch wheel; numpy/gguf come with the quantizer step above), so
-      # the encoder/engine tests run their full replay/oracle paths.
-      # voxtral_loader_guard_test SKIPs cleanly without the gitignored
-      # real-model GGUF.
-      - name: Voxtral engine tests (tiny GGUF generated in-workflow)
-        run: |
-          # The runner's system pip (< 25.2) crashes with an AssertionError in
-          # get_topological_weights when the torch index serves dependency
-          # metadata that forms a cycle; upgrade pip first.
-          pip install --quiet --upgrade pip
-          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet transformers
-          python scripts/make_voxtral_tiny_gguf.py
-          ./build/voxtral_encoder_test
-          ./build/voxtral_engine_test
-          ./build/voxtral_loader_guard_test
 
       # Repacking is the default; this pins the plain (unrepacked) path.
       - name: Quantized Parakeet prediction and joint CPU regression (repack off)

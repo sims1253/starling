@@ -207,8 +207,6 @@ public:
         uint32_t T, ld_s, ld_b, ld_p, sh_s, sh_b, sh_p;
         float scale;
         uint32_t key_valid, causal_off, T_rel;
-        // Sliding window over query blocks (softmax.comp); win 0 = off.
-        uint32_t win = 0, blk_q = 0, nb_h = 1, blk0 = 0;
     };
     bool softmax(vk::Recording& rec, bool relpos, uint32_t rows, uint32_t heads,
                  const SoftmaxArgs& a, vk::Ref S, vk::Ref BD, vk::Ref P, std::string& err);

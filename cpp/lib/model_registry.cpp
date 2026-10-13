@@ -49,10 +49,6 @@ char * starling_ggml_s1_decode(void * handle, const float * pcm, int64_t n,
 char * starling_ggml_s1_normalize(void * handle, const char * transcript,
                                   const char * styling, const char * structure,
                                   const char * context, const char ** err_out);
-void * starling_ggml_voxtral_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_voxtral_free(void * handle);
-char * starling_ggml_voxtral_decode(void * handle, const float * pcm, int64_t n,
-                                    const char ** err_out);
 }
 
 // One row per engine, in starling_ggml_model enum order (serve's
@@ -113,14 +109,6 @@ constexpr ModelDescriptor kRegistry[] = {
       "starling_ggml_transcribe_pcm: ARK expects 16 kHz",
       /*rate_error_in_ctx=*/true,
       "ARK transcribe failed" },
-    // Voxtral-Mini-4B-Realtime (Phase 1: load + metadata/tokenizer validation;
-    // decode returns the Phase-2 error until the encoder/decoder graph lands).
-    { STARLING_GGML_VOXTRAL, "voxtral",
-      starling_ggml_voxtral_load, starling_ggml_voxtral_free,
-      starling_ggml_voxtral_decode,
-      "starling_ggml_transcribe_pcm: VOXTRAL expects 16 kHz",
-      /*rate_error_in_ctx=*/true,
-      "VOXTRAL transcribe failed" },
     // Qwen3-ASR-0.6B-hf rides the QWEN3 engine unchanged (identical frontend,
     // tokenizer and chat template; every dim comes from qwen3.* GGUF metadata,
     // validated at load — including the 0.6B's 2048-wide attention over a
@@ -134,8 +122,8 @@ constexpr ModelDescriptor kRegistry[] = {
       "QWEN3 transcribe failed" },
 };
 
-// Kinds 4, 5 and 9 belong to removed engines and stay reserved (ABI 10), so
-// the kinds are strictly increasing rather than contiguous.
+// Kinds 4, 5, 9 and 11 belong to removed engines and stay reserved (ABI 10
+// and 11), so the kinds are strictly increasing rather than contiguous.
 static_assert([] {
     int prev = 0;
     for (size_t i = 0; i < sizeof(kRegistry) / sizeof(kRegistry[0]); ++i) {

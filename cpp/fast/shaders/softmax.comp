@@ -7,13 +7,6 @@
 //
 // RELPOS folds FastConformer's rel_shift (the bd skew) into the read index,
 // so the skewed matrix is never materialized.
-//
-// Sliding window (win != 0, with causal_off set): query blocks of blk_q rows
-// whose keys start causal_off rows before the block (Voxtral's encoder).
-// Workgroup row h belongs to block blk = blk0 + h / nb_h; query i of it is
-// position blk*blk_q + i and key j is position blk*blk_q + j - causal_off,
-// so keys at negative positions (j < causal_off - blk*blk_q) and keys
-// win or more positions back (j <= i + causal_off - win) are masked too.
 
 #include "common.glsl"
 
@@ -33,10 +26,6 @@ layout(push_constant) uniform PC {
     uint key_valid;
     uint causal_off;   // 0xffffffff = no causal mask
     uint T_rel;        // query count used by the skew (= T for self-attention)
-    uint win;          // sliding window (keys per query), 0 = none
-    uint blk_q;        // window mode: queries per block
-    uint nb_h;         // window mode: heads per block in this dispatch
-    uint blk0;         // window mode: block of workgroup row 0
 } p;
 
 shared float red[WG];
@@ -74,21 +63,16 @@ void main() {
     const uint bb = h * p.sh_b + i * p.ld_b + (p.T_rel - 1u - i);
     const uint pb = h * p.sh_p + i * p.ld_p;
     const uint lim = min(p.key_valid, p.causal_off == 0xffffffffu ? p.T : i + p.causal_off + 1u);
-    uint lo = 0u;
-    if (p.win != 0u) {
-        const int blk_pos = int((p.blk0 + h / p.nb_h) * p.blk_q);
-        lo = uint(max(0, max(int(p.causal_off) - blk_pos, int(i + p.causal_off + 1u) - int(p.win))));
-    }
 
     float mx = -3.0e38;
-    for (uint j = lo + tid; j < lim; j += WG) {
+    for (uint j = tid; j < lim; j += WG) {
         float v = s[sb + j];
         if (RELPOS != 0u) v += bd[bb + j];
         mx = max(mx, v * p.scale);
     }
     mx = block_max(mx);
     float sum = 0.0;
-    for (uint j = lo + tid; j < lim; j += WG) {
+    for (uint j = tid; j < lim; j += WG) {
         float v = s[sb + j];
         if (RELPOS != 0u) v += bd[bb + j];
         sum += exp(v * p.scale - mx);
@@ -99,7 +83,7 @@ void main() {
         vec2 pr = vec2(0.0);
         [[unroll]] for (uint c = 0; c < 2; ++c) {
             const uint j = 2 * q + c;
-            if (j >= lo && j < lim) {
+            if (j < lim) {
                 float v = s[sb + j];
                 if (RELPOS != 0u) v += bd[bb + j];
                 pr[c] = exp(v * p.scale - mx) * inv;

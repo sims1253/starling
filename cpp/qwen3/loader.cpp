@@ -156,9 +156,8 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     // NOTE: llm.hidden_size and the attention width heads*head_dim are
     // INDEPENDENT fields. The 1.7B happens to equate them (2048 == 16*128);
     // the 0.6B runs a 1024-wide trunk under a 2048-wide attention (16 heads x
-    // 128), which the shared decode stack has supported since voxtral's
-    // 4096-wide attention over a 3072 trunk. The dimensions are validated
-    // against the actual tensor shapes below instead of equated.
+    // 128), which the shared decode stack supports. The dimensions are
+    // validated against the actual tensor shapes below instead of equated.
     if (c.llm.n_heads % c.llm.n_kv_heads != 0) {
         err = "QWEN3 GGUF llm.num_heads must be a multiple of llm.num_kv_heads";
         return false;

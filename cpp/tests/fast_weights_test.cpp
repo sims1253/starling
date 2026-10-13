@@ -519,7 +519,7 @@ int check_mat_specs() {
                 same("glu interleave", want, got);
             }
         }
-        // A permutation (Voxtral's RoPE head halves).
+        // A permutation (e.g. de-interleaving RoPE head halves).
         {
             std::vector<uint32_t> order(N);
             for (uint32_t r = 0; r < N; ++r) order[r] = (r * 7 + 3) % N;

@@ -13,7 +13,6 @@
 #include "moss/mel.hpp"
 #include "qwen3/loader.hpp"
 #include "qwen3/mel.hpp"
-#include "voxtral/loader.hpp"
 #if defined(STARLING_HAVE_NPU)
 #include "encoder_contract.hpp"   // cpp/npu: Pixel TPU encoder artifacts
 #include "tpu_runtime.hpp"
@@ -47,7 +46,6 @@ namespace ms = starling::ggml::moss;
 namespace q3 = starling::ggml::qwen3;
 namespace ak = starling::ggml::ark;
 namespace gr = starling::ggml::granite;
-namespace vx = starling::ggml::voxtral;
 
 namespace {
 
@@ -97,15 +95,6 @@ struct Spec {
     std::string conv_out, pos_embed, proj1, proj2;
     std::string eq, ek, ev, eo, efc1, efc2;
     bool adapter = false;   // MOSS: SwiGLU adapter between projection and LLM
-    // Voxtral's causal encoder (with `encoder` false): conv stem with left
-    // pads, RMSNorm/SwiGLU layers whose attention is EAW wide (heads x
-    // head_dim, not d_model) and looks `win` positions back, final RMSNorm,
-    // merge-by-`merge` GELU projector. Its rows are ADDED to the input
-    // embedding of every position (`audio_add`), and the AdaRMSNorm delay
-    // conditioning (`ada`) is folded into the MLP-norm weights at load.
-    bool voxtral = false, audio_add = false, ada = false;
-    uint32_t EAW = 0, win = 0;
-    float rope_theta_enc = 0;
     // encoder
     uint32_t ED = 0, EH = 0, EHD = 0, EFF = 0, EL = 0, DS = 0, EOUT = 0, n_window_infer = 0, n_mels = 0;
     float enc_eps = 1e-5f;
@@ -256,38 +245,6 @@ Spec granite_spec(const gr::Config& c) {
     return s;
 }
 
-// Voxtral-Mini-4B-Realtime. The KV cache spans the GGUF's whole max_cache
-// (4096 positions, 5.4 min of audio): decoding runs in lockstep with the
-// audio, so the sequence is exactly as long as the audio.
-Spec voxtral_spec(const vx::Config& c) {
-    Spec s;
-    s.tag = "voxtral";
-    s.encoder = false;
-    const auto& lc = c.llm;
-    const auto& ec = c.encoder;
-    const auto& pc = c.projector;
-    s.HD = lc.hidden; s.NH = lc.n_heads; s.NKV = lc.n_kv_heads; s.HDIM = lc.head_dim; s.FF = lc.intermediate;
-    s.NL = lc.n_layers; s.MAXPOS = std::min<uint32_t>(lc.max_cache, 4096);
-    s.rope_theta = lc.rope_theta; s.rms_eps = lc.rms_norm_eps;
-    // The decoder's sliding window never binds inside the cache.
-    s.tied = lc.tied != 0 && lc.sliding_window >= s.MAXPOS;
-    s.qk_norm = false;
-    s.audio_add = true;
-    s.ada = true;
-    s.eos = c.eos_token_id;
-    s.max_new_tokens = s.MAXPOS;   // the audio length is the real cap (per call)
-    // The encoder on the device unless STARLING_FAST_VOXTRAL_HOST_ENCODER=1
-    // keeps it on ggml (decoder-only).
-    s.voxtral = !env_on("STARLING_FAST_VOXTRAL_HOST_ENCODER") && ec.conv_kernel == 3 &&
-                ec.conv_left_pad1 == 2 && ec.conv_left_pad2 == 1 && ec.conv_stride2 == 2 && pc.act == "gelu" &&
-                pc.input_size == ec.d_model * pc.downsample && pc.output_size == lc.hidden;
-    s.ED = ec.d_model; s.EH = ec.n_heads; s.EHD = ec.head_dim; s.EFF = ec.ffn_dim; s.EL = ec.n_layers;
-    s.EAW = ec.n_heads * ec.head_dim; s.win = ec.sliding_window;
-    s.n_mels = ec.num_mel_bins; s.enc_eps = ec.rms_norm_eps; s.rope_theta_enc = ec.rope_theta;
-    s.merge = pc.downsample; s.AH = pc.output_size; s.EOUT = pc.output_size;
-    return s;
-}
-
 struct EncLayer {
     GMat q, k, v, o, fc1, fc2;
     Arena::Id q_b, k_b, v_b, o_b, fc1_b, fc2_b, ln1_g, ln1_b, ln2_g, ln2_b;
@@ -362,7 +319,6 @@ struct AudioLlmEngine::Impl {
     vk::Buffer mel_in, cv1, cv2, cv3, ex, eh, eq, ek, ev, esc, ep, ectx, effh, eproj, eproj2, adh;
     vk::Buffer lx, lhn, lqkv, lqr, lsc, lp, lctx, lmlp;
     vk::Buffer apart;   // attention split partials [NH][S][2+HDIM]
-    vk::Buffer aud;     // additive audio rows [MAXPOS][HD] f32 (Voxtral)
     static constexpr uint32_t kAttnSplitMax = 8;
     int cap_C = 0, cap_A = 0, cap_S = 0;
     uint32_t n_part = 0;
@@ -387,22 +343,6 @@ struct AudioLlmEngine::Impl {
     // Granite prefill: T stacked mel frames through the conformer and the
     // Q-Former into the audio slots, then the LLM over S rows.
     bool record_prefill_conformer(int T, int S, int slot0, int n_slots, Rec& r, std::string& err);
-    // Voxtral prefill: L mel frames through the causal conv stem, encoder
-    // layers and projector into the audio rows `aud`, then the S prompt
-    // rows (embedding + audio row) through the LLM.
-    bool record_prefill_voxtral(int L, int S, Rec& r, std::string& err);
-    // Upload a whole prompt's ids (additive audio: every row is a token).
-    bool upload_prompt_ids(const std::vector<int32_t>& prompt_ids, std::string& err);
-    // Voxtral's sliding-window attention runs over query blocks of B rows;
-    // block b's keys are the B + kpad rows from position b*B - kpad, kept in
-    // k/v buffers with kpad leading pad rows. Audio no longer than the
-    // window is one causal block (kpad 0).
-    struct Band { uint32_t B, kpad, nblk; };
-    Band band(uint32_t T) const {
-        constexpr uint32_t kQ = 128;
-        if (T <= sp.win) return {T, 0, 1};
-        return {kQ, sp.win - 1, ceil_div(T, kQ)};
-    }
     // Windowed multi-head attention over f16 activations: window w's Mq
     // queries are rows q_row0 + w*Mq.. of q (stride ldq) and its Nk keys and
     // values rows kv_row0 + w*Nk.. of k / v (stride ldkv; heads at column
@@ -656,14 +596,6 @@ std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const gr::GraniteModel& m
     return e;
 }
 
-std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const vx::VoxtralModel& m, std::string& err) {
-    auto I = make_impl(voxtral_spec(m.config), m.loader, err);
-    if (!I) return nullptr;
-    std::unique_ptr<AudioLlmEngine> e(new AudioLlmEngine());
-    e->impl_ = std::move(I);
-    return e;
-}
-
 size_t release_host_weights(const ggml::ModelLoader& loader, const std::vector<std::string>& prefixes) {
     size_t released = 0;
 #if defined(__linux__)
@@ -709,16 +641,6 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     DS = sp.DS; EOUT = sp.EOUT; AH = sp.AH;
     HD = sp.HD; NH = sp.NH; NKV = sp.NKV; HDIM = sp.HDIM; FF = sp.FF;
     NL = sp.NL; MAXPOS = sp.MAXPOS;
-    // Each KV cache (all layers) is one storage-buffer binding. Voxtral's
-    // would span the GGUF's 4096 positions (218 MiB each at q4k dims), past
-    // PowerVR's 128 MiB range: it gets the positions that fit (2304 there,
-    // ~3 min of audio; longer audio is refused with a clear error).
-    if (sp.audio_add) {
-        const uint64_t per_pos = (uint64_t)NL * sp.NKV * sp.HDIM * 2;
-        if (per_pos && (uint64_t)MAXPOS * per_pos > ctx->info().max_storage_range)
-            MAXPOS = (uint32_t)(ctx->info().max_storage_range / per_pos) / 256 * 256;
-        sp.max_new_tokens = std::min(sp.max_new_tokens, MAXPOS);
-    }
     // EOUT == HD without an adapter: the projection writes the LLM input rows.
     const bool enc_ok = !sp.encoder ||
         (EHD == 64 && DS % 8 == 0 && sp.n_mels == 128 && sp.n_window_infer % 100 == 0 &&
@@ -732,12 +654,9 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
          EHD % 2 == 0 && EH * EHD <= 4096 && sp.g_ck % 2 == 1 && sp.g_cs > 0 && sp.g_mid < EL &&
          sp.q_heads != 0 && ED % sp.q_heads == 0 && (ED / sp.q_heads) % 2 == 0 && sp.q_ff % 32 == 0 &&
          sp.q_win != 0 && sp.q_n != 0);
-    const bool voxtral_ok = !sp.voxtral ||
-        (sp.n_mels % 8 == 0 && ED % 32 == 0 && EFF % 32 == 0 && sp.EAW % 32 == 0 && EHD % 2 == 0 &&
-         sp.win >= 2 && sp.merge != 0 && AH % 32 == 0 && EOUT == HD);
     // The input-embedding multiplier is folded into the input table, so it
     // needs an untied head.
-    if (!enc_ok || !whisper_ok || !conformer_ok || !voxtral_ok || (HDIM != 128 && HDIM != 64) || (!sp.tied && sp.lm_head.empty()) || MAXPOS > 4096 ||
+    if (!enc_ok || !whisper_ok || !conformer_ok || (HDIM != 128 && HDIM != 64) || (!sp.tied && sp.lm_head.empty()) || MAXPOS > 4096 ||
         NKV == 0 || NH % NKV || HD % 32 || FF % 32 || sp.max_new_tokens > MAXPOS ||
         (sp.emb_mult != 1.0f && sp.lm_head.empty())) {
         err = "fast " + tag + ": unsupported configuration";
@@ -888,7 +807,7 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     }
 
     // Conv1d k3 weights [OC][IC][K] (GGUF ne = K, IC, OC) as GEMM rows
-    // [OC][k * IC + ic]: the stems (ARK, Voxtral) convolve time-major
+    // [OC][k * IC + ic]: the stem (ARK) convolves time-major
     // activations, whose three input rows of an output are one contiguous
     // run of 3*IC.
     // (Reordered and converted during ar.finalize, in parallel.)
@@ -940,64 +859,6 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         if (!vec_id("enc.ln_post.weight", lnp_g) || !vec_id("enc.ln_post.bias", lnp_b) ||
             !mat("adapter.fc0.weight", p1) || !vec_id("adapter.fc0.bias", p1_b) ||
             !mat("adapter.fc2.weight", p2) || !vec_id("adapter.fc2.bias", p2_b))
-            return false;
-    }
-
-    // ---- Voxtral causal encoder + projector ----
-    if (sp.voxtral) {
-        if (!conv("enc.conv1", sp.n_mels, wc1, wc1_b) || !conv("enc.conv2", ED, wc2, wc2_b)) return false;
-        // Rotate-half RoPE (dims i and i + D/2 of a head turn together)
-        // becomes enc_rope's adjacent pairs once the halves of every q and k
-        // head are interleaved: q.k is unchanged when both permute alike.
-        const uint32_t half = EHD / 2;
-        std::vector<uint32_t> order(sp.EAW);
-        for (uint32_t h = 0; h < EH; ++h)
-            for (uint32_t i = 0; i < half; ++i) {
-                order[h * EHD + 2 * i] = h * EHD + i;
-                order[h * EHD + 2 * i + 1] = h * EHD + half + i;
-            }
-        auto rope_mat = [&](const std::string& n, GMat& g) {
-            MatSpec m;
-            if (!rows_of(n, m)) return false;
-            if (m.N != order.size()) { err = n + ": unexpected row count"; return false; }
-            return ar.add_matrix(spec_permute(std::move(m), order), g, err);
-        };
-        enc.resize(EL);
-        for (uint32_t l = 0; l < EL; ++l) {
-            EncLayer& Y = enc[l];
-            const std::string p = "enc.blk." + std::to_string(l) + ".";
-            // q, v, o and down are biased, k is not; gate/up interleave for
-            // the SwiGLU epilogue.
-            std::vector<float> qb;
-            if (!rope_mat(p + "attn.q.weight", Y.q) || !rope_mat(p + "attn.k.weight", Y.k) ||
-                !mat(p + "attn.v.weight", Y.v) || !mat(p + "attn.o.weight", Y.o) ||
-                !interleave(p + "ffn.gate.weight", p + "ffn.up.weight", Y.fc1) ||
-                !mat(p + "ffn.down.weight", Y.fc2) || !f32(p + "attn.q.bias", qb) ||
-                !vec_id(p + "attn.v.bias", Y.v_b) || !vec_id(p + "attn.o.bias", Y.o_b) ||
-                !vec_id(p + "ffn.down.bias", Y.fc2_b) || !vec_id(p + "attn_norm.weight", Y.ln1_g) ||
-                !vec_id(p + "ffn_norm.weight", Y.ln2_g))
-                return false;
-            if (qb.size() != order.size()) { err = "fast " + tag + ": q bias shape"; return false; }
-            std::vector<float> qp(qb.size());
-            for (size_t r = 0; r < qp.size(); ++r) qp[r] = qb[order[r]];
-            Y.q_b = ar.add_f32(qp);
-        }
-        // RoPE tables [frame][D/2] for every encoder frame the KV cache can
-        // serve (merge frames per position), in f32 like the reference:
-        // inverse frequency, then the angle, then cos / sin.
-        rope_rows = MAXPOS * sp.merge;
-        std::vector<float> cs((size_t)rope_rows * half), sn(cs.size());
-        for (uint32_t i = 0; i < half; ++i) {
-            const float inv = 1.0f / std::pow(sp.rope_theta_enc, (2.0f * (float)i) / (float)EHD);
-            for (uint32_t t = 0; t < rope_rows; ++t) {
-                const float a = (float)t * inv;
-                cs[(size_t)t * half + i] = std::cos(a);
-                sn[(size_t)t * half + i] = std::sin(a);
-            }
-        }
-        rope_cos = ar.add_f32(cs);
-        rope_sin = ar.add_f32(sn);
-        if (!vec_id("enc.final_norm.weight", lnp_g) || !mat("proj.fc0.weight", p1) || !mat("proj.fc2.weight", p2))
             return false;
     }
 
@@ -1126,35 +987,6 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     }
 
     // ---- LLM ----
-    // Voxtral's AdaRMSNorm scales the MLP branch's normalized input by
-    // (1 + fc2(gelu(fc0(t_cond)))), a constant per layer (t_cond is the
-    // baked delay embedding): folded into that layer's ffn_norm weights.
-    std::vector<float> t_cond;
-    if (sp.ada && !f32("llm.t_cond", t_cond)) return false;
-    auto ffn_norm = [&](const std::string& p, Arena::Id& id) {
-        if (!sp.ada) return vec_id(p + "ffn_norm.weight", id);
-        std::vector<float> g, fc0, fc2;
-        if (!f32(p + "ffn_norm.weight", g) || !f32(p + "ada.fc0.weight", fc0) || !f32(p + "ada.fc2.weight", fc2))
-            return false;
-        const size_t H = t_cond.size(), A = fc0.size() / std::max<size_t>(H, 1);
-        if (g.size() != H || A == 0 || fc0.size() != A * H || fc2.size() != H * A) {
-            err = "fast " + tag + ": " + p + "ada shapes";
-            return false;
-        }
-        std::vector<double> u(A);
-        for (size_t a = 0; a < A; ++a) {
-            double v = 0;
-            for (size_t h = 0; h < H; ++h) v += (double)fc0[a * H + h] * t_cond[h];
-            u[a] = 0.5 * v * (1.0 + std::erf(v / std::sqrt(2.0)));   // exact GELU
-        }
-        for (size_t h = 0; h < H; ++h) {
-            double m = 0;
-            for (size_t a = 0; a < A; ++a) m += (double)fc2[h * A + a] * u[a];
-            g[h] = (float)(g[h] * (1.0 + m));
-        }
-        id = ar.add_f32(g);
-        return true;
-    };
     llm.resize(NL);
     for (uint32_t l = 0; l < NL; ++l) {
         LlmLayer& Y = llm[l];
@@ -1178,7 +1010,7 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         if (!resid_mat(p + "attn.o.weight", Y.o) ||
             !interleave(p + "ffn.gate.weight", p + "ffn.up.weight", Y.gateup) ||
             !resid_mat(p + "ffn.down.weight", Y.down) || !vec_id(p + "attn_norm.weight", Y.attn_norm) ||
-            !ffn_norm(p, Y.ffn_norm))
+            !vec_id(p + "ffn_norm.weight", Y.ffn_norm))
             return false;
         if (sp.qk_norm &&
             (!vec_id(p + "attn.q_norm.weight", Y.q_norm) || !vec_id(p + "attn.k_norm.weight", Y.k_norm)))
@@ -1297,8 +1129,7 @@ bool AudioLlmEngine::Impl::alloc_static(std::string& err) {
            mk(state, (16 + (size_t)sp.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, n_ids * 4, vk::Mem::Readback) &&
            mk(xd, HD * 4) && mk(xn, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
            mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8) &&
-           mk(apart, (size_t)NH * kAttnSplitMax * (2 + HDIM) * 4) &&
-           (!sp.audio_add || mk(aud, (size_t)MAXPOS * HD * 4));
+           mk(apart, (size_t)NH * kAttnSplitMax * (2 + HDIM) * 4);
 }
 
 bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
@@ -1352,32 +1183,6 @@ bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
         genc_b = gkv_rows * ED * 2;
     }
     size_t eq_b = (size_t)A * ED * 2, ectx_b = eq_b, eproj2_b = (size_t)A * EOUT * 2;
-    if (sp.voxtral && A > 0) {
-        // C = mel frames (time-major f16 after two zero rows), A = encoder
-        // frames. q / context rows padded to whole query blocks, k / v with
-        // the band's leading pad rows; scores in groups of (block, head)
-        // pairs under a 64 MiB budget (at least one pair).
-        const Band b = band((uint32_t)A);
-        const size_t Tp = (size_t)b.nblk * b.B, NK = b.B + b.kpad;
-        const size_t pairs = (size_t)b.nblk * EH;
-        const size_t fit = std::max<size_t>(1, std::min<size_t>(pairs, (64ull << 20) / (b.B * NK * 4)));
-        mel_b = ((size_t)C + 2) * sp.n_mels * 2;
-        cv1_b = ((size_t)C + 1) * ED * 2;
-        cv2_b = cv3_b = 0;
-        eq_b = ectx_b = Tp * sp.EAW * 2;
-        ek_b = ev_b = (b.kpad + Tp) * sp.EAW * 2;
-        esc_b = fit * b.B * NK * 4;
-        ep_b = fit * b.B * round_up((uint32_t)NK, 8) * 2;
-        adh_b = ((size_t)A / sp.merge) * AH * 2;
-        eproj_b = eproj2_b = 0;
-        // One binding covers each buffer: longer audio than the device's
-        // storage-buffer range cannot run.
-        const size_t big = std::max({(size_t)A * EFF * 2, (size_t)A * ED * 4, ek_b, eq_b});
-        if (big > ctx->info().max_storage_range) {
-            err = std::string("fast ") + sp.tag + ": audio too long for this device's buffer range";
-            return false;
-        }
-    }
     if (!mk(mel_in, mel_b, ctx->info().uma ? vk::Mem::Device : vk::Mem::Upload) ||
         !mk(cv1, cv1_b) || !mk(cv2, cv2_b) ||
         !mk(cv3, cv3_b) || !mk(ex, (size_t)A * ED * 4) || !mk(eh, (size_t)A * ED * 2) ||
@@ -1415,10 +1220,9 @@ bool AudioLlmEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off,
 
 bool AudioLlmEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
     const char* name = embed.fmt == GpuFmt::W8 ? "dec_next" : embed.fmt == GpuFmt::W4 ? "dec_next_w4" : "dec_next_f16";
-    // Additive audio (Voxtral): the next input also gets its position's row.
-    const vk::Pipeline* p = ctx->pipeline(name, {256u, embed.chunk_rows, sp.audio_add ? 1u : 0u}, err);
+    const vk::Pipeline* p = ctx->pipeline(name, {256u, embed.chunk_rows}, err);
     if (!p) return false;
-    std::vector<vk::Ref> b(12, vk::Ref(K.dummy()));
+    std::vector<vk::Ref> b(11, vk::Ref(K.dummy()));
     b[0] = vk::Ref(part);
     for (size_t c = 0; c < embed.parts.size(); ++c) {
         b[1 + c] = R(embed.parts[c].q);
@@ -1426,7 +1230,6 @@ bool AudioLlmEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
     }
     b[9] = vk::Ref(xd);
     b[10] = vk::Ref(state);
-    if (sp.audio_add) b[11] = vk::Ref(aud);
     struct { uint32_t n_part, K, eos, max_steps; } pc{n_part, HD, dec_ablate ? 0xffffffffu : (uint32_t)sp.eos, sp.max_new_tokens};
     rc.label("dec_next");
     rc.dispatch(*p, b, &pc, sizeof(pc), 1);
@@ -1602,18 +1405,15 @@ bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& 
 bool AudioLlmEngine::Impl::embed_lookup(vk::Recording& rc, uint32_t n, uint32_t ids_off, uint32_t out_row0,
                                         std::string& err) {
     const char* name = embed.fmt == GpuFmt::W8 ? "embed_rows_w8" : embed.fmt == GpuFmt::W4 ? "embed_rows" : "embed_rows_f16";
-    // Additive audio (Voxtral): row r also gets audio row r (rows are
-    // sequence positions).
-    const vk::Pipeline* pp = ctx->pipeline(name, {256u, embed.chunk_rows, sp.audio_add ? 1u : 0u}, err);
+    const vk::Pipeline* pp = ctx->pipeline(name, {256u, embed.chunk_rows}, err);
     if (!pp) return false;
-    std::vector<vk::Ref> b(11, vk::Ref(K.dummy()));
+    std::vector<vk::Ref> b(10, vk::Ref(K.dummy()));
     b[0] = vk::Ref(ids);
     for (size_t c = 0; c < embed.parts.size(); ++c) {
         b[1 + c] = R(embed.parts[c].q);
         if (embed.parts[c].has_s) b[5 + c] = R(embed.parts[c].s);
     }
     b[9] = vk::Ref(lx);
-    if (sp.audio_add) b[10] = vk::Ref(aud);
     struct { uint32_t K, ids_off, out_row0; } a{HD, ids_off, out_row0};
     rc.label("embed");
     rc.dispatch(*pp, b, &a, sizeof(a), n);
@@ -2091,172 +1891,6 @@ bool AudioLlmEngine::Impl::record_prefill_conformer(int Ti, int S, int slot0, in
     rc.end();
     return true;
 }
-bool AudioLlmEngine::Impl::record_prefill_voxtral(int L, int S, Rec& r, std::string& err) {
-    const uint32_t T = (uint32_t)L / 2;                   // conv2 stride 2
-    const uint32_t N = T / sp.merge;                       // audio rows
-    const uint32_t AW = sp.EAW, IC = sp.n_mels;
-    const Band bd = band(T);
-    const uint32_t Bq = bd.B, kp = bd.kpad, NK = Bq + kp, Tp = bd.nblk * Bq, ldP = round_up(NK, 8);
-    const VkDeviceSize row16 = (VkDeviceSize)AW * 2;       // one f16 q/k/v row
-    r.A = (int)T;
-    r.S = S;
-    r.rec = std::make_unique<vk::Recording>(*ctx);
-    vk::Recording& rc = *r.rec;
-    rc.begin();
-
-    // Pad rows: conv2's one leading zero row of cv1; the band's leading key
-    // rows and the rows past T in the last query block (their probabilities
-    // are zero, but 0 * garbage could be NaN).
-    rc.fill(cv1, 0, (VkDeviceSize)ED * 2, 0);
-    for (vk::Buffer* b : {&ek, &ev}) {
-        if (kp) rc.fill(*b, 0, kp * row16, 0);
-        if (Tp > T) rc.fill(*b, (kp + T) * row16, (Tp - T) * row16, 0);
-    }
-    rc.barrier();
-
-    // ---- causal conv stem: two k3 Conv1d + GELU as GEMMs over time-major
-    // rows. mel_in is [L + 2][IC] f16 after two zero rows, so conv1's output
-    // t reads rows t .. t+2 (left pad 2); it writes rows 1..L of cv1 behind
-    // one zero row, so conv2's output t reads rows 2t .. 2t+2 (left pad 1,
-    // stride 2). ----
-    auto stem = [&](const GMat& w, Arena::Id b, vk::Buffer& in, uint32_t M, uint32_t cin, uint32_t stride,
-                    vk::Buffer& out, uint32_t c_off, Epi epi) {
-        GemmCall c;
-        c.b = BKind::F16; c.epi = epi; c.act = Act::Gelu; c.bias_mode = 1;
-        c.a.M = M; c.a.N = ED; c.a.K = 3 * cin;
-        c.a.lda = stride * cin; c.a.ldb = 3 * cin; c.a.ldc = ED; c.a.c_off = c_off;
-        c.A = vk::Ref(in); c.Bq = R(w.q); c.C = vk::Ref(out); c.bias = R(b);
-        return K.gemm(rc, c, err);
-    };
-    rc.label("enc_conv1");
-    if (!stem(wc1, wc1_b, mel_in, (uint32_t)L, IC, 1, cv1, ED, Epi::F16)) return false;
-    rc.barrier();
-    rc.label("enc_conv2");
-    if (!stem(wc2, wc2_b, cv1, T, ED, 2, ex, 0, Epi::F32)) return false;
-    rc.barrier();
-
-    // ---- encoder layers: pre-RMSNorm, RoPE sliding-window attention,
-    // SwiGLU MLP ----
-    const vk::Pipeline* rope = ctx->pipeline("enc_rope", {}, err);
-    if (!rope) return false;
-    // (block, head) pairs per score group: whole blocks with every head
-    // when they fit the score buffers, else head groups of one block.
-    const uint32_t units = (uint32_t)std::min<VkDeviceSize>(esc.size / ((VkDeviceSize)Bq * NK * 4),
-                                                            ep.size / ((VkDeviceSize)Bq * ldP * 2));
-    if (units == 0) { err = std::string("fast ") + sp.tag + ": attention score buffers too small"; return false; }
-    const uint32_t gb = units >= EH ? std::min(bd.nblk, units / EH) : 1;
-    const uint32_t hg = std::min(units, EH);
-    const float escale = 1.0f / std::sqrt((float)EHD);
-    const float eps = sp.enc_eps;
-    const vk::Ref kref(ek, kp * row16), vref(ev, kp * row16);   // rows of position 0
-    for (uint32_t l = 0; l < EL; ++l) {
-        const EncLayer& Y = enc[l];
-        rc.split();
-        rc.label("norm");
-        if (!K.norm(rc, 2, T, ED, vk::Ref(ex), ED, R(Y.ln1_g), {}, {}, {}, vk::Ref(eh), ED, eps, eps, err))
-            return false;
-        rc.barrier();
-        rc.label("enc_qkv");
-        if (!K.gemm_w(rc, ar, Y.q, vk::Ref(eh), T, ED, vk::Ref(eq), AW, Epi::F16, Act::None, R(Y.q_b), 1.0f, ~0u, err) ||
-            !K.gemm_w(rc, ar, Y.k, vk::Ref(eh), T, ED, kref, AW, Epi::F16, Act::None, {}, 1.0f, ~0u, err) ||
-            !K.gemm_w(rc, ar, Y.v, vk::Ref(eh), T, ED, vref, AW, Epi::F16, Act::None, R(Y.v_b), 1.0f, ~0u, err))
-            return false;
-        rc.barrier();
-        // RoPE on whole heads (the halves interleaved at load), in row
-        // chunks that keep the dispatch within 65535 workgroups.
-        rc.label("enc_rope");
-        for (uint32_t t0 = 0; t0 < T; t0 += 1024) {
-            const uint32_t tn = std::min(1024u, T - t0);
-            struct { uint32_t T, H, D, half_n; } a{tn, EH, EHD, EHD / 2};
-            const VkDeviceSize ro = (VkDeviceSize)t0 * row16, to = (VkDeviceSize)t0 * (EHD / 2) * 4;
-            auto table = [&](Arena::Id id) {
-                vk::Ref t = R(id);
-                t.off += to;
-                t.range -= to;
-                return t;
-            };
-            rc.dispatch(*rope, {vk::Ref(eq, ro), vk::Ref(ek, kp * row16 + ro), table(rope_cos), table(rope_sin)},
-                        &a, sizeof(a), ceil_div(tn * EH * (EHD / 2), 64));
-        }
-        rc.barrier();
-        for (uint32_t b0 = 0; b0 < bd.nblk; b0 += gb) {
-            const uint32_t nb = std::min(gb, bd.nblk - b0);
-            for (uint32_t h0 = 0; h0 < EH; h0 += hg) {
-                const uint32_t hn = std::min(hg, EH - h0);
-                // Scores: block b's queries (rows b*Bq..) against its keys
-                // (padded rows b*Bq.., i.e. positions b*Bq - kp ..).
-                GemmCall c;
-                c.b = BKind::F16; c.epi = Epi::F32;
-                c.a.M = Bq; c.a.N = NK; c.a.K = EHD;
-                c.a.lda = AW; c.a.ldb = AW; c.a.ldc = NK;
-                c.a.a_off = b0 * Bq * AW + h0 * EHD; c.a.b_off = b0 * Bq * AW + h0 * EHD;
-                c.a.nb_lo = hn;
-                c.a.sa_hi = Bq * AW; c.a.sa_lo = EHD; c.a.sb_hi = Bq * AW; c.a.sb_lo = EHD;
-                c.a.sc_hi = hn * Bq * NK; c.a.sc_lo = Bq * NK;
-                c.batch = nb * hn;
-                c.A = vk::Ref(eq); c.Bq = vk::Ref(ek); c.C = vk::Ref(esc);
-                rc.label("enc_attn_qk");
-                if (!K.gemm(rc, c, err)) return false;
-                rc.barrier();
-                Kernels::SoftmaxArgs sa{NK, NK, 0, ldP, Bq * NK, 0, Bq * ldP, escale, NK, kp, NK};
-                sa.win = sp.win; sa.blk_q = Bq; sa.nb_h = hn; sa.blk0 = b0;
-                rc.label("enc_softmax");
-                if (!K.softmax(rc, false, Bq, nb * hn, sa, vk::Ref(esc), {}, vk::Ref(ep), err)) return false;
-                rc.barrier();
-                GemmCall v;
-                v.b = BKind::F16T; v.epi = Epi::F16;
-                v.a.M = Bq; v.a.N = EHD; v.a.K = NK;
-                v.a.lda = ldP; v.a.ldb = AW; v.a.ldc = AW;
-                v.a.b_off = b0 * Bq * AW + h0 * EHD; v.a.c_off = b0 * Bq * AW + h0 * EHD;
-                v.a.nb_lo = hn;
-                v.a.sa_hi = hn * Bq * ldP; v.a.sa_lo = Bq * ldP;
-                v.a.sb_hi = Bq * AW; v.a.sb_lo = EHD; v.a.sc_hi = Bq * AW; v.a.sc_lo = EHD;
-                v.batch = nb * hn;
-                v.A = vk::Ref(ep); v.Bq = vk::Ref(ev); v.C = vk::Ref(ectx);
-                rc.label("enc_attn_pv");
-                if (!K.gemm(rc, v, err)) return false;
-                rc.barrier();
-            }
-        }
-        rc.label("enc_attn_o");
-        if (!K.gemm_w(rc, ar, Y.o, vk::Ref(ectx), T, AW, vk::Ref(ex), ED, Epi::Residual, Act::None, R(Y.o_b), 1.0f, ~0u, err))
-            return false;
-        rc.barrier();
-        rc.label("norm");
-        if (!K.norm(rc, 2, T, ED, vk::Ref(ex), ED, R(Y.ln2_g), {}, {}, {}, vk::Ref(eh), ED, eps, eps, err))
-            return false;
-        rc.barrier();
-        rc.label("enc_ff_up");
-        if (!K.gemm_w(rc, ar, Y.fc1, vk::Ref(eh), T, ED, vk::Ref(effh), EFF, Epi::SwiGlu, Act::None, {}, 1.0f, ~0u, err))
-            return false;
-        rc.barrier();
-        rc.label("enc_ff_down");
-        if (!K.gemm_w(rc, ar, Y.fc2, vk::Ref(effh), T, EFF, vk::Ref(ex), ED, Epi::Residual, Act::None, R(Y.fc2_b), 1.0f, ~0u, err))
-            return false;
-        rc.barrier();
-    }
-
-    // ---- final RMSNorm, then the projector: `merge` consecutive frames are
-    // one contiguous row of merge*ED; GELU MLP into the audio rows ----
-    rc.split();
-    rc.label("norm");
-    if (!K.norm(rc, 2, T, ED, vk::Ref(ex), ED, R(lnp_g), {}, {}, {}, vk::Ref(eh), ED, eps, eps, err))
-        return false;
-    rc.barrier();
-    rc.label("projector");
-    if (!K.gemm_w(rc, ar, p1, vk::Ref(eh), N, sp.merge * ED, vk::Ref(adh), AH, Epi::F16, Act::Gelu, {}, 1.0f, ~0u, err))
-        return false;
-    rc.barrier();
-    if (!K.gemm_w(rc, ar, p2, vk::Ref(adh), N, AH, vk::Ref(aud), HD, Epi::F32, Act::None, {}, 1.0f, ~0u, err))
-        return false;
-    rc.barrier();
-    // Prompt rows: token embedding plus the audio row of the same position.
-    if (!embed_lookup(rc, (uint32_t)S, 0, 0, err)) return false;
-    rc.barrier();
-    if (!record_llm(rc, (uint32_t)S, err)) return false;
-    rc.end();
-    return true;
-}
 
 bool AudioLlmEngine::Impl::record_llm(vk::Recording& rc, uint32_t S, std::string& err) {
     const uint32_t QKVW = (NH + 2 * NKV) * HDIM;
@@ -2719,9 +2353,8 @@ bool AudioLlmEngine::generate(const std::vector<int32_t>& prompt_ids, const std:
                               std::vector<int32_t>& out_ids, bool& eos, std::string& err) {
     Impl& I = *impl_;
     const char* tag = I.sp.tag;
-    if (I.sp.encoder || I.sp.whisper || I.sp.audio_add) {
-        err = std::string("fast ") + tag + (I.sp.audio_add ? ": additive audio needs generate_additive"
-                                                           : ": this engine encodes the audio itself");
+    if (I.sp.encoder || I.sp.whisper) {
+        err = std::string("fast ") + tag + ": this engine encodes the audio itself";
         return false;
     }
     const uint32_t max_new = budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens;
@@ -2755,7 +2388,7 @@ bool AudioLlmEngine::generate(const std::vector<int32_t>& prompt_ids, const std:
 }
 
 bool AudioLlmEngine::encodes_audio() const {
-    return impl_->sp.encoder || impl_->sp.whisper || impl_->sp.conformer || impl_->sp.voxtral;
+    return impl_->sp.encoder || impl_->sp.whisper || impl_->sp.conformer;
 }
 
 bool AudioLlmEngine::generate_from_mel(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
@@ -2854,119 +2487,6 @@ bool AudioLlmEngine::generate_from_mel(const std::vector<int32_t>& prompt_ids, c
         std::fprintf(stderr, "[fast-%s] mel_T=%lld upload=%.1fms enc+prefill=%.1fms decode=%.1fms (%zu tokens, %d rounds) total=%.1fms (T=%lld S=%d)\n",
                      tag, (long long)mel_T, t_up, t_pre - t_up, ms_since(t0) - t_pre, out_ids.size(), rounds,
                      ms_since(t0), (long long)T, S);
-    return true;
-}
-
-namespace {
-// Additive-audio budget: the sequence ends at the last audio row (the stock
-// offline cap, total length == audio rows), optionally earlier.
-uint32_t additive_budget(int64_t n_rows, size_t prompt, uint32_t budget) {
-    const int64_t room = n_rows - (int64_t)prompt;
-    if (room <= 0) return 0;
-    return budget ? std::min<uint32_t>(budget, (uint32_t)room) : (uint32_t)room;
-}
-} // namespace
-
-bool AudioLlmEngine::Impl::upload_prompt_ids(const std::vector<int32_t>& prompt_ids, std::string& err) {
-    std::vector<uint32_t> idv(prompt_ids.size());
-    for (size_t i = 0; i < prompt_ids.size(); ++i) {
-        if (prompt_ids[i] < 0 || (uint32_t)prompt_ids[i] >= embed.N) {
-            err = std::string("fast ") + sp.tag + ": prompt id out of range";
-            return false;
-        }
-        idv[i] = (uint32_t)prompt_ids[i];
-    }
-    return ctx->upload(ids, 0, idv.data(), idv.size() * 4, err);
-}
-
-bool AudioLlmEngine::generate_additive(const std::vector<int32_t>& prompt_ids, const float* audio,
-                                       int64_t audio_rows, uint32_t budget, std::vector<int32_t>& out_ids,
-                                       bool& eos, std::string& err) {
-    Impl& I = *impl_;
-    const char* tag = I.sp.tag;
-    out_ids.clear();
-    eos = false;
-    if (!I.sp.audio_add) { err = std::string("fast ") + tag + ": not an additive-audio engine"; return false; }
-    const auto t0 = std::chrono::steady_clock::now();
-    const int S = (int)prompt_ids.size();
-    if (S == 0 || audio_rows < 0 || (audio_rows > 0 && !audio)) {
-        err = std::string("fast ") + tag + ": invalid prompt";
-        return false;
-    }
-    if (audio_rows > (int64_t)I.MAXPOS) {
-        err = std::string("fast ") + tag + ": audio too long for the KV cache";
-        return false;
-    }
-    const uint32_t max_new = additive_budget(audio_rows, prompt_ids.size(), budget);
-    if (max_new == 0) return true;
-    if (!I.ensure(0, 0, S, err)) return false;
-    // Rows bf16-rounded like the ggml engine's additive injection.
-    std::vector<float> rows((size_t)audio_rows * I.HD);
-    for (size_t i = 0; i < rows.size(); ++i) rows[i] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(audio[i]));
-    Impl::Rec* rec = I.prefill_rec({0, S}, [&](Impl::Rec& r) { return I.record_prefill_rows(S, r, err); });
-    if (!rec) return false;
-    if (!I.ctx->upload(I.aud, 0, rows.data(), rows.size() * 4, err) || !I.upload_prompt_ids(prompt_ids, err))
-        return false;
-    const double t_up = ms_since(t0);
-    int rounds = 0;
-    double t_pre = 0;
-    if (!I.run(*rec->rec, (uint32_t)S, max_new, t0, out_ids, eos, rounds, t_pre, err)) return false;
-    if (env_on("STARLING_FAST_TIMING"))
-        std::fprintf(stderr, "[fast-%s] rows=%.1fms prefill=%.1fms decode=%.1fms (%zu tokens, %d rounds) total=%.1fms (S=%d N=%lld)\n",
-                     tag, t_up, t_pre - t_up, ms_since(t0) - t_pre, out_ids.size(), rounds, ms_since(t0), S,
-                     (long long)audio_rows);
-    return true;
-}
-
-bool AudioLlmEngine::generate_additive_from_mel(const std::vector<int32_t>& prompt_ids, const uint16_t* mel_bf16,
-                                                int64_t mel_T, uint32_t budget, std::vector<int32_t>& out_ids,
-                                                bool& eos, std::string& err) {
-    Impl& I = *impl_;
-    const char* tag = I.sp.tag;
-    out_ids.clear();
-    eos = false;
-    if (!I.sp.voxtral) { err = std::string("fast ") + tag + ": no on-device additive audio encoder"; return false; }
-    const auto t0 = std::chrono::steady_clock::now();
-    const int S = (int)prompt_ids.size();
-    // Two mel frames per encoder frame, `merge` encoder frames per row.
-    if (S == 0 || !mel_bf16 || mel_T <= 0 || mel_T % (2 * (int64_t)I.sp.merge) != 0) {
-        err = std::string("fast ") + tag + ": invalid prompt or mel length";
-        return false;
-    }
-    const int64_t T = mel_T / 2, N = T / I.sp.merge;
-    if (N > (int64_t)I.MAXPOS || T > (int64_t)I.rope_rows) {
-        err = std::string("fast ") + tag + ": audio too long for the KV cache";
-        return false;
-    }
-    const uint32_t max_new = additive_budget(N, prompt_ids.size(), budget);
-    if (max_new == 0) return true;
-    if (!I.ensure((int)mel_T, (int)T, S, err)) return false;
-    // Mel as time-major f16 rows [mel_T + 2][n_mels] after two zero rows
-    // (conv1's causal left pad).
-    const size_t NM = I.sp.n_mels;
-    std::vector<float> mt(((size_t)mel_T + 2) * NM, 0.0f);
-    for (size_t f = 0; f < NM; ++f)
-        for (int64_t t = 0; t < mel_T; ++t) {
-            ggml_bf16_t b;
-            b.bits = mel_bf16[f * (size_t)mel_T + (size_t)t];
-            mt[((size_t)t + 2) * NM + f] = ggml_bf16_to_fp32(b);
-        }
-    const std::vector<uint32_t> mel16 = pack_f16(mt.data(), mt.size());
-    Impl::Rec* rec = I.prefill_rec({(int)mel_T, S},
-                                   [&](Impl::Rec& r) { return I.record_prefill_voxtral((int)mel_T, S, r, err); });
-    if (!rec) return false;
-    if (!I.ctx->upload(I.mel_in, 0, mel16.data(), mel16.size() * 4, err) || !I.upload_prompt_ids(prompt_ids, err))
-        return false;
-    const double t_up = ms_since(t0);
-    int rounds = 0;
-    double t_pre = 0;
-    if (!I.run(*rec->rec, (uint32_t)S, max_new, t0, out_ids, eos, rounds, t_pre, err)) return false;
-    if (env_on("STARLING_FAST_TIMING")) {
-        const double dec = ms_since(t0) - t_pre;
-        std::fprintf(stderr, "[fast-%s] mel_T=%lld upload=%.1fms enc+prefill=%.1fms decode=%.1fms (%zu tokens, %.1f ms/token, %d rounds) total=%.1fms (T=%lld N=%lld S=%d)\n",
-                     tag, (long long)mel_T, t_up, t_pre - t_up, dec, out_ids.size(),
-                     out_ids.empty() ? 0.0 : dec / out_ids.size(), rounds, ms_since(t0), (long long)T, (long long)N, S);
-    }
     return true;
 }
 

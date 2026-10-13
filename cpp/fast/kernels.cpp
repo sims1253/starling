@@ -613,8 +613,8 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // The same for W8: xor 0x80 turns the int8 into a biased byte, and one
     // unpackUnorm4x8 replaces four bitfieldExtracts + int-to-float
     // conversions. Neutral where only the lm_head is W8 (Qwen3/MOSS q4e8),
-    // -10 % decode on Granite and -11 % on Voxtral, whose Q5_K linears are
-    // repacked to W8 (Pixel 10 Pro; RESEARCH_LOG P4-7). STARLING_FAST_W8U
+    // -10 % decode on Granite, whose Q5_K linears are repacked to W8
+    // (Pixel 10 Pro; RESEARCH_LOG P4-7). STARLING_FAST_W8U
     // overrides.
     w8_unpack_ = ctx.info().vendor_id == 0x1010;
     if (const char* e = std::getenv("STARLING_FAST_W8U")) w8_unpack_ = e[0] == '1';

@@ -115,45 +115,6 @@ ggml_tensor* spec_mlp(ggml_context* c, const ModelLoader& ml, ggml_tensor* n,
     return lin(c, ml, z, p + "ffn.down.weight");
 }
 
-// Voxtral's AdaRMSNorm modulation: fc2(gelu(fc0(t_cond))) over the baked
-// llm.t_cond leaf ([hidden] f32), returned bf16 [hidden, 1]. The branch runs
-// only under spec.ada_rms_norm, so other engines build no node here.
-// Oracle order (the Phase-2a linear_bf16_oracle discipline, bias-free):
-// GEMM rounds to bf16, exact GELU rounds to bf16, final GEMM rounds to bf16.
-ggml_tensor* ada_mod(ggml_context* c, const QwenDecodeSpec& s,
-                     const ModelLoader& ml, const std::string& p) {
-    ggml_tensor* t = weight(c, ml, "llm.t_cond");  // [hidden] f32 leaf
-    ggml_tensor* u = lin(c, ml, t, p + s.ada_fc0_suffix);
-    ggml_tensor* g = bf16(c, ggml_gelu_erf(c, f32(c, u)));  // exact (erf) GELU
-    ggml_tensor* m = lin(c, ml, g, p + s.ada_fc2_suffix);  // [hidden]
-    return ggml_reshape_2d(c, m, m->ne[0], 1);  // [hidden, 1] for broadcast
-}
-
-// Apply the ada modulation to the MLP-branch input n ([hidden, S] bf16):
-// n * (1 + mod) with mod [hidden, 1] broadcast over the S columns, f32 math,
-// one bf16 round. The ones are the loader-owned llm.ada_ones leaf (1-D
-// [hidden] f32, synthesized once per model like the mel constants): 1-D
-// keeps it at 12 KiB for the real model, inside the compat context's 1 MiB
-// budget (a [hidden, max_cache] leaf would be 50 MiB). The [hidden, 1] sum
-// repeats over S via a scratch template (repeat overwrites every element,
-// so the template needs no initialization); the leaf itself is stable and
-// device-resident, so captured prefill graphs replay with no host upload.
-ggml_tensor* apply_ada(ggml_context* c, const QwenDecodeSpec& s,
-                       const ModelLoader& ml, ggml_tensor* n,
-                       const std::string& p, int64_t S) {
-    if (!s.ada_rms_norm) return n;
-    ggml_tensor* mod = ada_mod(c, s, ml, p);  // [hidden, 1] bf16
-    const int64_t H = n->ne[0];
-    ggml_tensor* ones = weight(c, ml, "llm.ada_ones");  // [hidden] f32
-    ggml_tensor* sum = ggml_add(c, f32(c, ones), f32(c, mod));  // [hidden, 1]
-    // Stock runs h * (1 + m) as two bf16 stores: round (1 + m) first (it is
-    // [hidden, 1], so the round is free), then round the product.
-    sum = bf16(c, sum);
-    ggml_tensor* tpl = ggml_new_tensor_2d(c, GGML_TYPE_F32, H, S);
-    ggml_tensor* scale = ggml_repeat(c, f32(c, sum), tpl);  // [hidden, S]
-    return bf16(c, ggml_mul(c, f32(c, n), scale));
-}
-
 // Append `add` new rows of k/v (src layout [heads, add, D] f32) to the cache
 // (layout [heads, old+add, D] bf16).
 void append_kv(std::vector<ggml_bf16_t>& dst, const std::vector<float>& src,
@@ -407,7 +368,6 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
         if (st0 && stage.is("xmid")) return ff(c, x);
 
         n = rms(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
-        n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
         ggml_tensor* dn = spec_mlp(c, m.loader, n, p);
         if (st0 && stage.is("down")) return ff(c, dn);
         x = residual_add(c, m.spec, r, dn);
@@ -564,8 +524,8 @@ struct KStepKeyHash { size_t operator()(const KStepKey& k) const noexcept {
 // Captured graphs borrow this model's weights and KV cache.
 struct SpecState {
     std::unique_ptr<DeviceCache> device_cache;
-    // forward_decode's step plans ([1]: voxtral steps carrying an audio row).
-    std::unique_ptr<Backend::StepAlloc> decode_alloc[2];
+    // forward_decode's step plan.
+    std::unique_ptr<Backend::StepAlloc> decode_alloc;
     std::unique_ptr<PrefillCache> prefill_cache;
     std::unordered_map<KStepKey, std::unique_ptr<KStepGraph>, KStepKeyHash> kstep;
 };
@@ -837,10 +797,8 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
             co = ggml_mul_mat(c, vt, pr);
         }
         // heads -> features: [D,S,H] -> [D,H,S] -> [D*H, S]. Spelled
-        // relationally: voxtral's q-width (D*H = 4096) is WIDER than its
-        // hidden (3072); the o_proj weight (ne0 = D*H) takes it from here.
-        // Every existing engine has D*H == hidden, so their graphs are
-        // unchanged by the spelling.
+        // relationally: Qwen3-ASR-0.6B's q-width (D*H = 2048) is WIDER than
+        // its hidden (1024); the o_proj weight (ne0 = D*H) takes it from here.
         joined = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, co, 0, 2, 1, 3)),
                                  (int64_t)D * H, S);                  // [D*H, S]
         joined = bf(c, joined);
@@ -869,7 +827,6 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     r = x;
     n = F ? rmsf(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps)
           : rms(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
-    n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
     ggml_tensor* dn = F ? spec_mlp_f(c, m, n, p) : spec_mlp(c, m.loader, n, p);
     x = F ? residual_add_f(c, m.spec, r, dn) : residual_add(c, m.spec, r, dn);
     return x;  // [hidden, S] bf16 (F32 in F mode)
@@ -1005,15 +962,12 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
 
 // Whole-model decode-step graph (S=1): embed(prev) -> layers -> lm_head.
 // Exact-width KV (one-shot per step). Reads slots [0, past), writes slot
-// `past`, attention over [0, past). Under spec.decode_add with a non-null
-// audio_row, the [hidden] f32 row is added (bf16 round) to the looked-up
-// embedding — voxtral's additive injection. Null row keeps the historical
-// op sequence for every other engine.
+// `past`, attention over [0, past).
 constexpr int64_t kDecodePlanBucket = 256;
 
 bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                     LlmState& state, std::vector<float>& logits,
-                    std::string& e, const float* audio_row = nullptr) {
+                    std::string& e) {
     const auto& lc = m.dims;
     DeviceCache* dc = get_device_cache(m, e);
     if (!dc) return false;
@@ -1045,15 +999,6 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                                                &prev_token, sizeof(int32_t));
         ggml_tensor* x = ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), id_t);
         x = apply_embed_mul(c, m.spec, x);
-        if (m.spec.decode_add && audio_row) {
-            // Voxtral: inputs_embeds = token_embed + audio_row (stock adds in
-            // the model dtype; addb rounds once at the bf16 boundary).
-            int64_t rne[2] = {lc.hidden, 1};
-            ggml_tensor* row_t = graph_input_tensor(
-                c, GGML_TYPE_F32, 2, rne, audio_row,
-                (size_t)lc.hidden * sizeof(float));
-            x = addb(c, x, row_t);
-        }
         ggml_tensor* pos_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
                                                 pos.data(), sizeof(int32_t));
         ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, 1]
@@ -1076,10 +1021,9 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
     // Every step has the same topology; only the attention width grows. Plan
     // the step allocation once per kDecodePlanBucket slots for the bucket's
     // widest step, so the steps in between reuse it instead of re-planning
-    // (and regrowing the compute buffer) on every token. One plan per graph
-    // topology: voxtral's steps with and without an audio row differ.
+    // (and regrowing the compute buffer) on every token.
     std::lock_guard<std::recursive_mutex> lk(runtime_mutex());
-    auto& sa = state_for(m.loader).decode_alloc[(m.spec.decode_add && audio_row) ? 1 : 0];
+    auto& sa = state_for(m.loader).decode_alloc;
     if (!sa) sa = std::make_unique<Backend::StepAlloc>();
     if (!fullcap && K > sa->reserved) {
         const int64_t W = std::min<int64_t>((int64_t)lc.max_cache,
@@ -1512,18 +1456,6 @@ size_t prefill_replay_cache_size(const ModelLoader& loader) {
     return st && st->prefill_cache ? st->prefill_cache->by_S.size() : 0;
 }
 
-int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
-    return spec_argmax_impl(s, x);
-}
-
-bool llm_decode_step(const QwenDecodeCtx& m, int32_t prev_token,
-                     const float* audio_row, LlmState& state,
-                     std::vector<float>& logits, std::string& e) {
-    ensure_weights_realized(m.loader);
-    return forward_decode(m, prev_token, state.length, state, logits, e,
-                          audio_row);
-}
-
 bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,
                  PrefillResult& o, std::string& e) {
     if (i.n_tokens <= 0 || i.width != (int64_t)m.dims.hidden || i.n_tokens > maxc) {
@@ -1723,7 +1655,7 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
     if (!proposer || max_k < 1 || max_k > kMaxSpeculativeK || op.max_new_tokens < 1 ||
         op.max_cache_len > (int32_t)m.dims.max_cache ||
         i.n_tokens + op.max_new_tokens > op.max_cache_len ||
-        m.spec.decode_add || debug_probe_active(m.spec)) {
+        debug_probe_active(m.spec)) {
         e = std::string(m.spec.label) + " invalid speculative generation configuration";
         return false;
     }

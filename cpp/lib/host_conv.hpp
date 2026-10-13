@@ -1,5 +1,5 @@
-// host_conv.hpp — the Whisper-style K=3 Conv1d front-end on the host (ark,
-// voxtral CPU paths), blocked, vectorized and threaded.
+// host_conv.hpp — the Whisper-style K=3 Conv1d front-end on the host (ark
+// CPU path), blocked, vectorized and threaded.
 //
 // Numerics are those of the scalar reference loop it replaces, bit for bit:
 //   acc = (double) bias[oc];

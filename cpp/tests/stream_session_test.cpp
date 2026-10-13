@@ -702,7 +702,7 @@ static void test_model_mapping() {
 
     // Exact equality pins the registry-derived ordering (a reordered or
     // duplicated row would change it).
-    CHECK(supported_models_str() == "parakeet moss ark granite qwen3 s1 ark06 voxtral qwen3_06");
+    CHECK(supported_models_str() == "parakeet moss ark granite qwen3 s1 ark06 qwen3_06");
 }
 
 // ---- ChunkStreamer::rebase -------------------------------------------------

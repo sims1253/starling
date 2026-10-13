@@ -29,15 +29,6 @@
 // are folded into the repacked weights (residual -> o/down projections,
 // embedding -> the input table) and the attention scale; the logit divisor
 // cannot change a greedy argmax and is dropped.
-// Voxtral-Mini-4B-Realtime (Ministral-3-class trunk) runs whole on the
-// device too, with two differences in the data flow: the projector's audio
-// rows are ADDED to the token embedding at every sequence position instead
-// of filling prompt slots (the prefill adds rows 0..P-1, the greedy step
-// adds the row of the position it feeds, read on the device), and decoding
-// runs in lockstep with the audio, so the sequence ends at the last audio
-// row. Its encoder is causal: left-padded conv stem, RMSNorm/SwiGLU layers
-// and sliding-window attention over query blocks. The AdaRMSNorm delay
-// conditioning is a per-layer constant, folded into the MLP-norm weights.
 
 #pragma once
 
@@ -51,7 +42,6 @@ namespace starling::ggml::moss { struct MossModel; }
 namespace starling::ggml::qwen3 { struct Qwen3Model; }
 namespace starling::ggml::ark { struct ArkModel; }
 namespace starling::ggml::granite { struct GraniteModel; }
-namespace starling::ggml::voxtral { struct VoxtralModel; }
 
 namespace starling::fast {
 
@@ -62,7 +52,6 @@ public:
     // Decoder-only engines (the caller keeps running the audio encoder).
     static std::unique_ptr<AudioLlmEngine> create(const ggml::ark::ArkModel& model, std::string& err);
     static std::unique_ptr<AudioLlmEngine> create(const ggml::granite::GraniteModel& model, std::string& err);
-    static std::unique_ptr<AudioLlmEngine> create(const ggml::voxtral::VoxtralModel& model, std::string& err);
     ~AudioLlmEngine();
 
     // Greedy transcription token ids (EOS included when reached, like the
@@ -77,10 +66,9 @@ public:
     bool generate(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
                   const float* audio, int64_t audio_rows, uint32_t budget, std::vector<int32_t>& ids,
                   bool& eos, std::string& err);
-    // Whether the engine runs the audio encoder itself (MOSS, Qwen3; ARK,
-    // Granite and Voxtral unless STARLING_FAST_{ARK,GRANITE,VOXTRAL}_HOST_ENCODER=1,
-    // where they take the ggml encoder's rows through generate() above, or
-    // generate_additive() for Voxtral).
+    // Whether the engine runs the audio encoder itself (MOSS, Qwen3; ARK and
+    // Granite unless STARLING_FAST_{ARK,GRANITE}_HOST_ENCODER=1, where they
+    // take the ggml encoder's rows through generate() above).
     bool encodes_audio() const;
     // ARK / Granite with the encoder on the device. `mel_bf16` holds bf16
     // bits: ARK's log-mel feature-major [n_mels][mel_T]; Granite's stacked
@@ -89,19 +77,6 @@ public:
     bool generate_from_mel(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
                            const uint16_t* mel_bf16, int64_t mel_T, uint32_t budget,
                            std::vector<int32_t>& ids, bool& eos, std::string& err);
-    // Additive-audio engines (Voxtral). Audio row p is added to the input
-    // embedding of sequence position p: the prompt `prompt_ids` takes rows
-    // 0..P-1, each generated token the row of the position it is fed at.
-    // Generation stops at EOS or when the sequence reaches the last audio
-    // row (the offline length cap), or after `budget` new tokens (0 = no
-    // extra limit). From the host's rows ([audio_rows][hidden] f32, the
-    // ggml encoder's output) or, encoder on the device, from the log-mel
-    // (bf16 bits, feature-major [n_mels][mel_T]).
-    bool generate_additive(const std::vector<int32_t>& prompt_ids, const float* audio, int64_t audio_rows,
-                           uint32_t budget, std::vector<int32_t>& ids, bool& eos, std::string& err);
-    bool generate_additive_from_mel(const std::vector<int32_t>& prompt_ids, const uint16_t* mel_bf16,
-                                    int64_t mel_T, uint32_t budget, std::vector<int32_t>& ids, bool& eos,
-                                    std::string& err);
     std::string describe() const;
 
     struct Impl;   // opaque; public only so the factories' helper can build one
