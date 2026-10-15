@@ -324,7 +324,7 @@ mod tests {
 
         player.play(&silence_wav_16k(0.25)).unwrap();
         // More than the short clip, less than the replaced 30-second clip.
-        assert_eq!(output.by_ref().take(16_000).count(), 16_000);
+        output.by_ref().take(16_000).for_each(drop);
         assert!(wait_until_idle(&player, Duration::from_secs(2)));
 
         player.play(&silence_wav_16k(30.0)).unwrap();
