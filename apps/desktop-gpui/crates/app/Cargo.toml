@@ -9,7 +9,7 @@ description = "Starling desktop dictation app built with gpui"
 
 [dependencies]
 gpui = "0.2.2"
-global-hotkey = "0.7"
+global-hotkey = "0.8"
 starling-dictation = { path = "../dictation" }
 starling-processing = { path = "../processing" }
 starling-insertion = { path = "../insertion" }
