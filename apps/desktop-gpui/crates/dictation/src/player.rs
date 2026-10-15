@@ -1,7 +1,7 @@
 //! WAV playback for the transcript drawer.
 //!
-//! One rodio output stream is kept alive for the [`Player`]'s lifetime;
-//! `play` decodes the WAV into a fresh [`rodio::Sink`], replacing any current
+//! One rodio device sink is kept alive for the [`Player`]'s lifetime;
+//! `play` decodes the WAV into a fresh [`rodio::Player`], replacing any current
 //! playback (like assigning a new `src` to the audio element). `is_playing`
 //! is an `AtomicBool` that a single long-lived watcher thread clears once
 //! the current sink drains (R10: one thread for the player's lifetime, not
@@ -28,13 +28,13 @@ pub struct PlayerError(pub String);
 /// bump the epoch first, and watchers exit as soon as their epoch is no
 /// longer the one stored.
 struct PlaybackState {
-    current: Mutex<Option<(u64, rodio::Sink)>>,
+    current: Mutex<Option<(u64, rodio::Player)>>,
     epoch: AtomicU64,
     playing: AtomicBool,
 }
 
 impl PlaybackState {
-    fn lock_current(&self) -> MutexGuard<'_, Option<(u64, rodio::Sink)>> {
+    fn lock_current(&self) -> MutexGuard<'_, Option<(u64, rodio::Player)>> {
         // The lock is only ever held for short, panic-free sections; recover
         // from a poisoned lock rather than poisoning the player forever.
         self.current
@@ -43,21 +43,21 @@ impl PlaybackState {
     }
 }
 
-/// The rodio handle plus the glue that keeps the output device open.
+/// The rodio mixer plus the glue that keeps the output device open.
 ///
 /// The cpal stream behind rodio is `!Send`, so it is created on — and owned
 /// by — a dedicated owner thread in `Player::new`; only the (Send + Sync)
-/// [`rodio::OutputStreamHandle`] crosses back. Everything stored here is
+/// [`rodio::mixer::Mixer`] crosses back. Everything stored here is
 /// Send + Sync, which keeps [`Player`] movable into gpui state.
 struct Inner {
-    handle: rodio::OutputStreamHandle,
+    mixer: rodio::mixer::Mixer,
     state: Arc<PlaybackState>,
     /// Wakes the playback watcher when a new sink is published. The sender
     /// disconnects when the player drops, telling the watcher to exit.
     watcher_wake: mpsc::SyncSender<()>,
     /// Start/stop cues still playing (#221), so a new take can silence
     /// them before its microphone opens.
-    cues: Mutex<Vec<rodio::Sink>>,
+    cues: Mutex<Vec<rodio::Player>>,
     /// Disconnects when the player drops, telling the owner thread to exit
     /// (which ends playback and releases the device).
     _shutdown: mpsc::Sender<()>,
@@ -75,7 +75,7 @@ impl Player {
         std::thread::Builder::new()
             .name("starling-audio-owner".into())
             .spawn(move || {
-                let (stream, handle) = match rodio::OutputStream::try_default() {
+                let stream = match rodio::DeviceSinkBuilder::open_default_sink() {
                     Ok(opened) => opened,
                     Err(err) => {
                         let _ = handle_tx.send(Err(PlayerError(format!(
@@ -84,7 +84,7 @@ impl Player {
                         return;
                     }
                 };
-                if handle_tx.send(Ok(handle)).is_err() {
+                if handle_tx.send(Ok(stream.mixer().clone())).is_err() {
                     return; // the player was dropped before it was used
                 }
                 let _stream = stream; // owned: keeps playback alive
@@ -92,7 +92,7 @@ impl Player {
             })
             .map_err(|err| PlayerError(format!("Could not start the audio thread: {err}")))?;
 
-        let handle = handle_rx
+        let mixer = handle_rx
             .recv()
             .map_err(|_| {
                 PlayerError("Audio thread exited before opening an output device.".to_string())
@@ -116,7 +116,7 @@ impl Player {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                handle,
+                mixer,
                 state,
                 watcher_wake,
                 cues: Mutex::new(Vec::new()),
@@ -141,13 +141,7 @@ impl Player {
         if let Some((_, old)) = current.take() {
             old.stop();
         }
-        let sink = match rodio::Sink::try_new(&self.inner.handle) {
-            Ok(sink) => sink,
-            Err(err) => {
-                self.inner.state.playing.store(false, Ordering::Relaxed);
-                return Err(PlayerError(format!("Could not start playback: {err}")));
-            }
-        };
+        let sink = rodio::Player::connect_new(&self.inner.mixer);
         sink.append(source);
         self.inner.state.playing.store(true, Ordering::Relaxed);
         *current = Some((epoch, sink));
@@ -166,8 +160,7 @@ impl Player {
     pub fn play_cue(&self, wav: &[u8], volume: f32) -> Result<(), PlayerError> {
         let source = rodio::Decoder::new(Cursor::new(wav.to_vec()))
             .map_err(|err| PlayerError(format!("Could not decode WAV: {err}")))?;
-        let sink = rodio::Sink::try_new(&self.inner.handle)
-            .map_err(|err| PlayerError(format!("Could not start playback: {err}")))?;
+        let sink = rodio::Player::connect_new(&self.inner.mixer);
         sink.set_volume(volume);
         sink.append(source);
         let mut cues = self.inner.cues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -214,7 +207,6 @@ fn watch_playback(state: Arc<PlaybackState>, wake: mpsc::Receiver<()>) {
             let drained_epoch = {
                 let current = state.lock_current();
                 match current.as_ref() {
-                    // rodio 0.20: `Sink::empty()` (len() == 0), no `is_empty`.
                     Some((epoch, sink)) if sink.empty() => Some(*epoch),
                     // Still audible: poll again.
                     Some(_) => None,
@@ -296,6 +288,50 @@ mod tests {
         );
         assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16); // bits
         assert_eq!(&wav[36..40], b"data");
+    }
+
+    #[test]
+    fn playback_and_cues_share_the_mixer_without_an_output_device() {
+        // Consume the mix ourselves so this covers the playback API and WAV
+        // decoder in headless CI, where the device tests below skip.
+        let (mixer, mut output) = rodio::mixer::mixer(rodio::nz!(1), rodio::nz!(16_000));
+        let state = Arc::new(PlaybackState {
+            current: Mutex::new(None),
+            epoch: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+        });
+        let (watcher_wake, watcher_rx) = mpsc::sync_channel(1);
+        let watcher_state = Arc::clone(&state);
+        let watcher = std::thread::spawn(move || watch_playback(watcher_state, watcher_rx));
+        let (shutdown, _shutdown_rx) = mpsc::channel();
+        let player = Player {
+            inner: Arc::new(Inner {
+                mixer,
+                state,
+                watcher_wake,
+                cues: Mutex::new(Vec::new()),
+                _shutdown: shutdown,
+            }),
+        };
+
+        player.play(&silence_wav_16k(30.0)).unwrap();
+        player.play_cue(&silence_wav_16k(30.0), 0.5).unwrap();
+        assert!(player.is_playing());
+        assert!(player.play(&[0u8; 16]).is_err());
+        assert!(player.is_playing(), "invalid WAV must preserve playback");
+        player.stop_cues();
+        assert!(player.is_playing(), "stopping cues must preserve playback");
+
+        player.play(&silence_wav_16k(0.25)).unwrap();
+        // More than the short clip, less than the replaced 30-second clip.
+        output.by_ref().take(16_000).for_each(drop);
+        assert!(wait_until_idle(&player, Duration::from_secs(2)));
+
+        player.play(&silence_wav_16k(30.0)).unwrap();
+        player.stop();
+        assert!(!player.is_playing());
+        drop(player);
+        watcher.join().unwrap();
     }
 
     #[test]
