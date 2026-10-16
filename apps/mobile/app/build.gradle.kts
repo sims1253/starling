@@ -12,6 +12,9 @@ fun gradleFlag(name: String): Boolean {
 }
 val starlingExperimental = gradleFlag("starlingExperimental")
 val starlingArm64Only = gradleFlag("starlingArm64Only")
+// CI shares native compilation through ccache; local builds keep the normal
+// compiler invocation unless a launcher is explicitly requested.
+val starlingCompilerLauncher = providers.gradleProperty("starlingCompilerLauncher").orElse("").get()
 // Builds the debug APK's native engine optimized (RelWithDebInfo), so
 // on-device tests of the larger models finish in seconds, not minutes.
 val starlingOptimizedDebugNative = gradleFlag("starlingOptimizedDebugNative")
@@ -150,6 +153,10 @@ android {
             cmake {
                 arguments += "-DSTARLING_ANDROID_ARM_ARCH=$starlingArmArch"
                 arguments += "-DCMAKE_BUILD_TYPE=$starlingNativeBuildType"
+                if (starlingCompilerLauncher.isNotBlank()) {
+                    arguments += "-DCMAKE_C_COMPILER_LAUNCHER=$starlingCompilerLauncher"
+                    arguments += "-DCMAKE_CXX_COMPILER_LAUNCHER=$starlingCompilerLauncher"
+                }
             }
         }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

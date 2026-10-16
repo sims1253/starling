@@ -93,6 +93,17 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+      - name: Read the native dependency revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:third_party/ggml)" >> "$GITHUB_OUTPUT"
+      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          # Shared with android-emulator.yml; compiler/ABI/flags are part
+          # of ccache's object identity, not just this archive key.
+          key: android-ndk28.2.13676358-cmake3.31.1-${{ steps.ggml.outputs.sha }}-${{ hashFiles('third_party/ggml-patches/**', 'apps/mobile/app/build.gradle.kts') }}
+          restore-keys: android-ndk28.2.13676358-cmake3.31.1
+          max-size: 1G
+          save: ${{ github.event_name == 'push' }}
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: temurin
@@ -100,14 +111,14 @@ jobs:
           cache: gradle
       - name: Build and test Android
         working-directory: apps/mobile
-        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+        run: ./gradlew --no-daemon -PstarlingCompilerLauncher=ccache testDebugUnitTest lintDebug assembleDebug
       - name: Check experimental release branding
         # The experimental release overlays the user-visible names; this
         # guards the overlay against colliding with src/main resources.
         working-directory: apps/mobile
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon -PstarlingExperimental=true :app:mergeReleaseResources
+          ./gradlew --no-daemon -PstarlingCompilerLauncher=ccache -PstarlingExperimental=true :app:mergeReleaseResources
           merged=$(find app/build/intermediates -path '*mergeReleaseResources*merged.dir*' -name values.xml)
           if [ "$(printf '%s\n' "$merged" | grep -c .)" != 1 ]; then
             echo "::error::Expected one merged release values.xml, found: $merged"
