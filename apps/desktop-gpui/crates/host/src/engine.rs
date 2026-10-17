@@ -199,15 +199,25 @@ pub enum EngineRequest {
     /// backend, their own server. Applied now. `intent.active_model` only
     /// names the model an engine started by this change loads; switching
     /// models is [`EngineRequest::Activate`].
-    Configure { intent: EngineIntent },
+    Configure {
+        intent: EngineIntent,
+    },
     /// Download if needed, verify, then switch to the model (#363).
-    Activate { model_id: String },
+    Activate {
+        model_id: String,
+    },
     /// Download a model without activating it.
-    Download { model_id: String },
-    CancelDownload { model_id: String },
+    Download {
+        model_id: String,
+    },
+    CancelDownload {
+        model_id: String,
+    },
     /// Remove a model's files (refused while it serves, switches in, or
     /// downloads).
-    Delete { model_id: String },
+    Delete {
+        model_id: String,
+    },
     /// Clear a failed engine and start the last model again.
     Retry,
     /// Answer a pending "finish the current take, then switch?".
@@ -218,7 +228,9 @@ pub enum EngineRequest {
     /// (#475). Started on its own worker; progress and results arrive as
     /// [`EngineStatus::speed_check`] pushes. Read-only: it never touches
     /// the active engine, history, or the insight-event stream.
-    SpeedCheck { model_id: String },
+    SpeedCheck {
+        model_id: String,
+    },
 }
 
 /// What the per-model speed check (#475) last did, as the app renders
@@ -237,6 +249,20 @@ pub enum SpeedCheckStatus {
     },
     /// The check did not produce a figure; `message` says why.
     Failed { model_id: String, message: String },
+}
+
+/// Records the speed check's state and bumps its generation, so the
+/// engine feed pushes the change to every watching window. Both the
+/// starting thread and the worker write through this, which is what
+/// keeps `Running` ordered before any terminal state no matter which
+/// thread gets there first.
+fn record_speed_check(
+    slot: &Mutex<Option<SpeedCheckStatus>>,
+    generation: &AtomicU64,
+    status: SpeedCheckStatus,
+) {
+    *lock(slot) = Some(status);
+    generation.fetch_add(1, Ordering::SeqCst);
 }
 
 impl SpeedCheckStatus {
@@ -344,10 +370,20 @@ pub fn attach_with_paths(
         EngineChoice::Builtin {
             config,
             active_model,
-        } => EngineHost::start_builtin(paths.unwrap_or_else(|| config.clone()), config, active_model),
+        } => EngineHost::start_builtin(
+            paths.unwrap_or_else(|| config.clone()),
+            config,
+            active_model,
+        ),
         EngineChoice::Manual { endpoint, model } => {
             let (provider, label) = manual_slot(&endpoint, &model);
-            EngineHost::new(provider, label, None, EngineState::Manual { endpoint, model }, paths)
+            EngineHost::new(
+                provider,
+                label,
+                None,
+                EngineState::Manual { endpoint, model },
+                paths,
+            )
         }
         EngineChoice::Unavailable { reason } => EngineHost::new(
             Arc::new(UnconfiguredProvider),
@@ -544,7 +580,11 @@ impl Fields {
 fn builtin_engine(
     config: EngineConfig,
     model: Option<String>,
-) -> (EngineState, Arc<dyn TranscriptionProvider>, Arc<AtomicUsize>) {
+) -> (
+    EngineState,
+    Arc<dyn TranscriptionProvider>,
+    Arc<AtomicUsize>,
+) {
     let backend_override = config.backend_override;
     let manager = EngineManager::start(config, model.clone());
     // One counter, shared by the slot (which raises it under its lock per
@@ -713,11 +753,12 @@ impl EngineHost {
         };
         let refused = |message: String| EngineReply::Refused { message };
         match request {
-            EngineRequest::Configure { intent } => match self.transition(&intent, Fields::CONFIGURE)
-            {
-                Ok(()) => done(self),
-                Err(message) => refused(message),
-            },
+            EngineRequest::Configure { intent } => {
+                match self.transition(&intent, Fields::CONFIGURE) {
+                    Ok(()) => done(self),
+                    Err(message) => refused(message),
+                }
+            }
             EngineRequest::Activate { model_id } => {
                 let mut state = lock(&self.state);
                 match &mut *state {
@@ -768,9 +809,7 @@ impl EngineHost {
                     Err(message) => refused(message),
                 }
             }
-            EngineRequest::SpeedCheck { model_id } => {
-                self.start_speed_check(&model_id)
-            }
+            EngineRequest::SpeedCheck { model_id } => self.start_speed_check(&model_id),
             other => {
                 // The rest only need the manager; it is cloned out so a
                 // delete's file work never holds the state lock. A
@@ -821,14 +860,13 @@ impl EngineHost {
                             Some(status) if status.model_id() == model_id
                         ) {
                             *lock(&self.speed_check) = None;
-                            self.speed_check_generation
-                                .fetch_add(1, Ordering::SeqCst);
+                            self.speed_check_generation.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                     EngineRequest::ConfirmDrainSwap => manager.confirm_drain_swap(),
                     EngineRequest::CancelSwitch => manager.cancel_switch(),
-                    EngineRequest::Configure { ..}
-                    | EngineRequest::Activate { ..}
+                    EngineRequest::Configure { .. }
+                    | EngineRequest::Activate { .. }
                     | EngineRequest::Retry
                     | EngineRequest::SpeedCheck { .. } => unreachable!("handled above"),
                 }
@@ -862,9 +900,7 @@ impl EngineHost {
         let (manager, paths) = {
             let state = lock(&self.state);
             match &*state {
-                EngineState::Builtin { manager, .. } => {
-                    (manager.clone(), manager.probe_paths())
-                }
+                EngineState::Builtin { manager, .. } => (manager.clone(), manager.probe_paths()),
                 other => {
                     return EngineReply::Refused {
                         message: not_running(other),
@@ -890,8 +926,7 @@ impl EngineHost {
                 model_id: model_id.to_string(),
                 message: message.clone(),
             });
-            self.speed_check_generation
-                .fetch_add(1, Ordering::SeqCst);
+            self.speed_check_generation.fetch_add(1, Ordering::SeqCst);
             return EngineReply::Refused { message };
         };
         let target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
@@ -899,27 +934,48 @@ impl EngineHost {
         let outcome_slot = Arc::clone(&self.speed_check);
         let generation = Arc::clone(&self.speed_check_generation);
         let reported_id = model_id.to_string();
-        // Spawned *before* the `Running` state is written. A spawn
-        // failure must not panic: `handle()` runs under `catch_unwind`,
-        // so the host would survive and answer `Refused` while leaving
-        // the status stuck at `Running` — no button on any row, and
-        // every retry refused until the host restarts. `handle()` is
-        // serialized on this one worker thread, so nothing else can
-        // observe the half-started state either way.
+        let starting_slot = Arc::clone(&outcome_slot);
+        let starting_generation = Arc::clone(&generation);
+        record_speed_check(
+            &starting_slot,
+            &starting_generation,
+            SpeedCheckStatus::Running {
+                model_id: model_id.to_string(),
+            },
+        );
+
+        // `Running` is written *before* the worker starts, because the
+        // worker can reach a terminal state faster than this thread can
+        // reach the next line: `run_speed_check` refuses a model whose
+        // file has gone missing before it spawns anything, which takes
+        // microseconds. Writing `Running` afterwards would then overwrite
+        // that `Failed` and leave a status no live worker will ever
+        // clear — no button on any row, every retry refused, until the
+        // host restarts. `handle()` is serialized on this one worker
+        // thread, so the window between the write and the spawn is
+        // invisible to a second request either way.
         let worker = std::thread::Builder::new()
             .name("starling-speedcheck".into())
             .spawn(move || {
-                let outcome = starling_dictation::speedcheck::run_speed_check(
-                    &target,
-                    starling_dictation::speedcheck::ALL_PROBES,
-                    &|_| {},
-                    None,
-                );
-                // The check always ends in one of the three states: a
-                // stuck worker would leave "Measuring…" forever, so the
-                // engine's own `--parent-pid` backstop (its process goes
-                // with this host) is what keeps an abandoned sidecar from
-                // outliving the run.
+                // A panic must not leave `Running` behind either, so the
+                // run is unwound over: the resume path records the
+                // failure. `synthetic_probe_wav` can panic, and a worker
+                // that panics silently is the same stuck state.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    starling_dictation::speedcheck::run_speed_check(
+                        &target,
+                        starling_dictation::speedcheck::ALL_PROBES,
+                        &|_| {},
+                        None,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(
+                        starling_dictation::speedcheck::SpeedCheckError::EngineStart {
+                            reason: "the speed check failed unexpectedly".to_string(),
+                        },
+                    )
+                });
                 let status = match outcome {
                     Ok(results) if results.is_empty() => SpeedCheckStatus::Failed {
                         model_id: reported_id,
@@ -934,23 +990,23 @@ impl EngineHost {
                         message: error.to_string(),
                     },
                 };
-                *lock(&outcome_slot) = Some(status);
-                generation.fetch_add(1, Ordering::SeqCst);
+                record_speed_check(&outcome_slot, &generation, status);
             });
-        let Ok(_) = worker else {
-            let Err(error) = worker else {
-                unreachable!()
-            };
+        if let Err(error) = worker {
+            // The spawn failed, so no worker will ever clear the state:
+            // roll it back here, and say so in the reply.
+            record_speed_check(
+                &starting_slot,
+                &starting_generation,
+                SpeedCheckStatus::Failed {
+                    model_id: model_id.to_string(),
+                    message: format!("The speed check could not be started ({error})."),
+                },
+            );
             return EngineReply::Refused {
                 message: format!("The speed check could not be started ({error})."),
             };
-        };
-
-        *lock(&self.speed_check) = Some(SpeedCheckStatus::Running {
-            model_id: model_id.to_string(),
-        });
-        self.speed_check_generation
-            .fetch_add(1, Ordering::SeqCst);
+        }
         done
     }
 
@@ -1068,7 +1124,10 @@ impl EngineHost {
                     EngineState::Manual {
                         endpoint: current,
                         model: current_model,
-                    } => fields.server && (current != &intent.endpoint || current_model != &intent.model),
+                    } => {
+                        fields.server
+                            && (current != &intent.endpoint || current_model != &intent.model)
+                    }
                     EngineState::Builtin { .. } | EngineState::Unavailable { .. } => fields.mode,
                 };
                 if !changed {
@@ -1228,9 +1287,9 @@ impl EngineHost {
                 || Instant::now() >= deadline
             {
                 return Err(match want {
-                    Want::Model(model_id) if !matches!(phase, EnginePhase::NoModel) => format!(
-                        "The built-in engine did not start serving {model_id} in time."
-                    ),
+                    Want::Model(model_id) if !matches!(phase, EnginePhase::NoModel) => {
+                        format!("The built-in engine did not start serving {model_id} in time.")
+                    }
                     _ => not_ready_sentence(),
                 });
             }
@@ -2147,7 +2206,8 @@ mod tests {
     /// Brings `host` to `intent` as a first read of the settings file
     /// would (every field).
     fn apply(host: &EngineHost, intent: EngineIntent) {
-        host.transition(&intent, Fields::ALL).expect("the transition applies");
+        host.transition(&intent, Fields::ALL)
+            .expect("the transition applies");
     }
 
     /// An engine-less config over a temp dir (no engine staged, no
@@ -2360,9 +2420,7 @@ mod tests {
         // The switch to manual: it swaps the slot, then drains.
         let applier = {
             let host = Arc::clone(&host);
-            std::thread::spawn(move || {
-                apply(&host, manual("http://127.0.0.1:9194"))
-            })
+            std::thread::spawn(move || apply(&host, manual("http://127.0.0.1:9194")))
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while host.label() != "manual:http://127.0.0.1:9194" {

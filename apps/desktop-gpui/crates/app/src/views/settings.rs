@@ -742,13 +742,16 @@ fn engine_action(
 /// only for an installed, inactive model with no switch running.
 fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<StarlingApp>) -> Div {
     let switching = snapshot.switch.is_some();
-    // One check at a time (the host refuses a second), so every row
-    // shows the same "Measuring…" instead of a button that would be
-    // refused.
-    let checking = matches!(
-        app.engine_speedcheck_status(),
-        Some(starling_runtime_host::engine::SpeedCheckStatus::Running { .. })
-    );
+    // One check at a time: the host refuses a second while one runs. Only
+    // the row being measured is held — disabling every installed row
+    // while nothing on it says why reads as a glitch, and a row the user
+    // presses anyway gets a precise refusal.
+    let measuring = app.engine_speedcheck_status().and_then(|status| match status {
+        starling_runtime_host::engine::SpeedCheckStatus::Running { model_id } => {
+            Some(model_id.clone())
+        }
+        _ => None,
+    });
     let mut rows = div().flex().flex_col().gap(px(6.));
     for model in &snapshot.models {
         let mut row = div()
@@ -877,9 +880,8 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
                     );
                 }
                 // The speed check measures the model, not the choice:
-                // offered for the installed, active or not (#475). A
-                // check already running for it says so instead.
-                if !checking {
+                // offered for the installed, active or not (#475).
+                if measuring.as_deref() != Some(model.id.as_str()) {
                     buttons = buttons.child(
                         div()
                             .id(SharedString::from(format!(

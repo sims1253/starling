@@ -759,7 +759,16 @@ impl EngineManager {
         Some(ProbePaths {
             engine_path: selection.path.clone(),
             models_dir: self.inner.config.models_dir.clone(),
-            log_path: self.inner.config.state_dir.join("logs/engine.log"),
+            // Its own log, not the live engine's. `Sidecar::spawn`
+            // truncates the file once it passes 5 MB, so sharing would
+            // let a probe that starts while the engine is serving wipe
+            // the engine's history — and both would append to it at
+            // once besides.
+            log_path: self
+                .inner
+                .config
+                .state_dir
+                .join("logs/engine-speedcheck.log"),
         })
     }
 

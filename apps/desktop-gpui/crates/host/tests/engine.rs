@@ -1363,6 +1363,69 @@ fn a_memory_refusal_reaches_the_app() {
     host.shutdown();
 }
 
+/// #475: a check that refuses before it starts any work must land as
+/// `Failed`, not stranding `Running`.
+///
+/// `run_speed_check` refuses a model whose file has gone missing before
+/// it spawns anything, so the worker reaches its terminal state far
+/// faster than the thread starting it can reach its next line. Writing
+/// `Running` *after* the spawn therefore overwrites that `Failed` and
+/// leaves a status no live worker will ever clear: no button on any row,
+/// every retry refused, until the host restarts. With that ordering this
+/// test waits for a `Failed` that never comes and times out.
+#[test]
+fn a_check_that_refuses_before_it_starts_lands_as_failed() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config_with_models(root.path(), Some(&fixture), &[MODEL_ID]);
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    until_engine(&app, "the first model serving", |status| {
+        serving(status, MODEL_ID)
+    });
+
+    // The engine is serving, and only now does the file go away — the
+    // state a delete actually races into. The host has already loaded the
+    // weights, so removing the file takes its engine down with it; the
+    // speed check must not strand the status on the way out.
+    let model_file = root.path().join("models").join(format!("{MODEL_ID}.gguf"));
+    std::fs::remove_file(&model_file).unwrap();
+
+    let reply = app
+        .engine(EngineRequest::SpeedCheck {
+            model_id: MODEL_ID.into(),
+        })
+        .expect("answered");
+    assert!(matches!(reply, EngineReply::Done { .. }), "{reply:?}");
+
+    let settled = until_engine(&app, "the refusal recorded", |status| {
+        matches!(
+            status.speed_check,
+            Some(SpeedCheckStatus::Failed { .. } | SpeedCheckStatus::Reported { .. })
+        )
+    });
+    match settled.speed_check.as_ref().expect("settled") {
+        SpeedCheckStatus::Failed { message, .. } => {
+            assert!(
+                message.contains("not installed") || message.contains("installed"),
+                "{message}"
+            );
+        }
+        other => panic!("expected Failed for a model with no file, got {other:?}"),
+    }
+    // Reaching that assertion through `until_engine` is the proof: a
+    // status stranded at `Running` would have timed the wait out.
+    drop(app);
+    host.shutdown();
+}
+
 /// #475: the app's SpeedCheck reaches the host's engine over the socket,
 /// and the answer comes back as an engine status push — not as the reply,
 /// which only says "started". One line per probe, and the synthetic one

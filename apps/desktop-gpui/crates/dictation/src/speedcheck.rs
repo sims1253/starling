@@ -12,7 +12,8 @@
 //!   fixtures agree on what "a speech stand-in" means). The
 //!   representative number comes from a bundled real-speech clip.
 //! - **Two numbers, everything else derived.** What a probe measures is
-//!   the audio's duration and the time the engine needed. RTFx and the
+//!   the audio's duration and the wall time the answer took (request in
+//!   to answer out, not the engine's compute time alone). RTFx and the
 //!   seconds-per-audio-minute figure are pure functions of those two, so
 //!   they are testable across the whole supported range.
 //! - **Read-only.** A probe never writes to history, never touches
@@ -76,6 +77,12 @@ impl ProbeKind {
 }
 
 /// One completed probe: the two measured numbers and what they derived.
+///
+/// `transcribe_ms` is **wall time on the caller's side**, from just
+/// before the request to just after the answer — request serialization,
+/// the loopback transfer and response parsing included. That is what a
+/// user waits, so it is the right number to compare models with, but it
+/// is not the engine's compute time alone.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpeedCheck {
     /// The model that was measured (catalog id).
@@ -87,7 +94,8 @@ pub struct SpeedCheck {
     pub kind: ProbeKind,
     /// Seconds of audio transcribed.
     pub audio_seconds: f64,
-    /// Milliseconds the engine needed for it.
+    /// Milliseconds of wall time the answer took, request in to answer
+    /// out (see the type's doc).
     pub transcribe_ms: f64,
     /// Realtime factor: audio seconds per wall second (higher is
     /// faster). `None` when it cannot be stated (see [`rtf`]).
@@ -368,32 +376,33 @@ pub fn run_speed_check(
 
     // The engine's own cancellation signal: one flag the sidecar polls.
     let engine_cancel = Arc::new(AtomicBool::new(false));
-    let cancel_flag = Arc::clone(&engine_cancel);
-    // And the watcher's own stop: without it a token that is never
-    // cancelled would keep the watcher polling for the process's life,
-    // and joining it on the way out would hang the caller.
-    let watching = Arc::new(AtomicBool::new(true));
-    let watch_flag = Arc::clone(&watching);
-    let cancel_watcher = cancel.cloned();
-    let watcher = std::thread::Builder::new()
-        .name("starling-speedcheck-cancel".into())
-        .spawn(move || {
-            // Polled rather than waited: the flag is the only channel
-            // the sidecar understands, and a run is short enough that a
-            // 50 ms poll is free.
-            while watch_flag.load(Ordering::Acquire) {
-                let Some(token) = cancel_watcher.as_ref() else {
-                    return;
-                };
-                if token.is_cancelled() {
-                    cancel_flag.store(true, Ordering::Release);
-                    return;
+    // Only a caller that asked for cancellation gets a watcher: a run
+    // nobody can cancel needs no thread, and nothing to report about
+    // one. The flag is the only channel the sidecar understands, so the
+    // watcher polls rather than awaits it.
+    let watcher = cancel.map(|token| {
+        let cancel_flag = Arc::clone(&engine_cancel);
+        // And the watcher's own stop: without it, a token that is never
+        // cancelled would keep it polling for the process's life, and
+        // joining it on the way out would hang the caller.
+        let watching = Arc::new(AtomicBool::new(true));
+        let watch_flag = Arc::clone(&watching);
+        let token = token.clone();
+        let handle = std::thread::Builder::new()
+            .name("starling-speedcheck-cancel".into())
+            .spawn(move || {
+                while watch_flag.load(Ordering::Acquire) {
+                    if token.is_cancelled() {
+                        cancel_flag.store(true, Ordering::Release);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        })
-        .ok();
-    if watcher.is_none() {
+            })
+            .ok();
+        (handle, watching)
+    });
+    if cancel.is_some() && watcher.as_ref().is_some_and(|(handle, _)| handle.is_none()) {
         // Cancellation degrades rather than failing: the probe still
         // measures, it just cannot be stopped. On stderr, like the
         // crate's other "I could not do this thing" notes, so nobody
@@ -402,7 +411,7 @@ pub fn run_speed_check(
             "speed check: the cancel watcher could not be started; this run cannot be cancelled"
         );
     }
-    let _watch_guard = JoinOnDrop(watcher, watching);
+    let _watch_guard = JoinOnDrop(watcher);
 
     let ready = sidecar.wait_ready(target.slug(), Some(&engine_cancel), &|stage| {
         progress(stage)
@@ -479,9 +488,14 @@ pub fn run_speed_check(
 }
 
 /// Stops the sidecar when the function returns, however it returns.
+/// `Sidecar::stop` is idempotent (it takes the child out of the slot
+/// under a mutex), so the explicit stop before the report costs nothing.
 struct StopOnDrop<'a>(&'a Sidecar);
 
 impl StopOnDrop<'_> {
+    /// The engine is stopped now rather than on the way out, so a UI
+    /// showing the result never shares the machine with a half-shut-down
+    /// sidecar.
     fn stop(&self) {
         self.0.stop();
     }
@@ -493,17 +507,20 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
-/// Joins the cancel watcher when the function returns, however it
-/// returns: first it clears the flag the watcher polls, so the join
-/// never waits on a token nobody is going to cancel. Set at the very
-/// start so every early return below also stops the watcher.
-struct JoinOnDrop(Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>);
+/// Stops and joins the cancel watcher when the function returns, however
+/// it returns. `None` when no watcher was started (the caller asked for
+/// a run nobody can cancel). Clearing the flag first is what keeps the
+/// join bounded: a watcher polling a token nobody is going to cancel
+/// would otherwise outlive the run that owns it.
+struct JoinOnDrop(Option<(Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>)>);
 
 impl Drop for JoinOnDrop {
     fn drop(&mut self) {
-        self.1.store(false, Ordering::Release);
-        if let Some(handle) = self.0.take() {
-            let _ = handle.join();
+        if let Some((handle, watching)) = self.0.take() {
+            watching.store(false, Ordering::Release);
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
         }
     }
 }
