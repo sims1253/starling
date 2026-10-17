@@ -256,6 +256,15 @@ pub enum SpeedCheckStatus {
 /// starting thread and the worker write through this, which is what
 /// keeps `Running` ordered before any terminal state no matter which
 /// thread gets there first.
+/// The payload of a `catch_unwind` panic as text.
+fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 fn record_speed_check(
     slot: &Mutex<Option<SpeedCheckStatus>>,
     generation: &AtomicU64,
@@ -655,6 +664,17 @@ impl EngineHost {
         self.provider.label()
     }
 
+    /// Whether the recorded speed check is the one for `model_id`. The
+    /// "one check at a time" guard and the delete path's clear both read
+    /// this, so the invariant lives in one place rather than in two
+    /// inline matches that can drift.
+    fn speed_check_is_for(&self, model_id: &str) -> bool {
+        matches!(
+            &*lock(&self.speed_check),
+            Some(status) if status.model_id() == model_id
+        )
+    }
+
     /// The engine manager this host supervises right now (builtin
     /// mode), for status reporting and tests. `None` otherwise —
     /// including after a live builtin→manual switch.
@@ -855,12 +875,10 @@ impl EngineHost {
                         // from an earlier check of it would keep
                         // rendering under the same row as if it still
                         // held.
-                        if matches!(
-                            &*lock(&self.speed_check),
-                            Some(status) if status.model_id() == model_id
-                        ) {
+                        if self.speed_check_is_for(&model_id) {
                             *lock(&self.speed_check) = None;
-                            self.speed_check_generation.fetch_add(1, Ordering::SeqCst);
+                            self.speed_check_generation
+                                .fetch_add(1, Ordering::SeqCst);
                         }
                     }
                     EngineRequest::ConfirmDrainSwap => manager.confirm_drain_swap(),
@@ -913,20 +931,20 @@ impl EngineHost {
                 message: format!("No model {model_id} is in this host's catalog."),
             };
         };
-        let done = EngineReply::Done {
-            revision: self.revision.load(Ordering::SeqCst),
-        };
         let Some(paths) = paths else {
             let message = "No engine has been selected yet, so there is nothing to run a speed \
                            check with."
                 .to_string();
             // Recorded as well as refused: the refusal clears the button,
             // while the recorded state keeps the reason on the model row.
-            *lock(&self.speed_check) = Some(SpeedCheckStatus::Failed {
-                model_id: model_id.to_string(),
-                message: message.clone(),
-            });
-            self.speed_check_generation.fetch_add(1, Ordering::SeqCst);
+            record_speed_check(
+                &self.speed_check,
+                &self.speed_check_generation,
+                SpeedCheckStatus::Failed {
+                    model_id: model_id.to_string(),
+                    message: message.clone(),
+                },
+            );
             return EngineReply::Refused { message };
         };
         let target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
@@ -944,6 +962,11 @@ impl EngineHost {
             },
         );
 
+        // The only path that answers `Done`, so the revision is read here.
+        let done = EngineReply::Done {
+            revision: self.revision.load(Ordering::SeqCst),
+        };
+
         // `Running` is written *before* the worker starts, because the
         // worker can reach a terminal state faster than this thread can
         // reach the next line: `run_speed_check` refuses a model whose
@@ -954,6 +977,12 @@ impl EngineHost {
         // host restarts. `handle()` is serialized on this one worker
         // thread, so the window between the write and the spawn is
         // invisible to a second request either way.
+        // The worker is detached on purpose: the sidecar it owns is
+        // spawned with `--parent-pid`, so the engine process goes with
+        // this host even if the thread lingers past teardown. That is the
+        // same backstop `EngineManager` relies on. Cancelling a running
+        // check needs a request and a UI affordance of its own (#475
+        // follow-up); the probe's `cancel` seam is ready for one.
         let worker = std::thread::Builder::new()
             .name("starling-speedcheck".into())
             .spawn(move || {
@@ -969,10 +998,16 @@ impl EngineHost {
                         None,
                     )
                 }))
-                .unwrap_or_else(|_| {
+                .unwrap_or_else(|payload| {
+                    // A panic is not an engine-start failure, and the
+                    // payload is the only clue to the real cause: dropping
+                    // it leaves a `Failed` nobody can debug.
                     Err(
                         starling_dictation::speedcheck::SpeedCheckError::EngineStart {
-                            reason: "the speed check failed unexpectedly".to_string(),
+                            reason: format!(
+                                "the speed check failed unexpectedly: {}",
+                                panic_text(&payload)
+                            ),
                         },
                     )
                 });

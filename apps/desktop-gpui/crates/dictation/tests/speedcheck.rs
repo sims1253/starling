@@ -73,12 +73,18 @@ fn assert_sane(check: &starling_dictation::speedcheck::SpeedCheck) {
 /// line; `None` off Linux, where /proc is not the process table.
 fn wait_engine_count(needle: &Path, want: usize) -> bool {
     let Some(mut count) = count_engine_processes(needle.to_str().unwrap()) else {
+        // Off Linux there is no /proc to read: nothing to wait for.
         return true;
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     while count > want && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
-        count = count_engine_processes(needle.to_str().unwrap()).unwrap_or(0);
+        // A re-count that fails keeps the previous count rather than
+        // reading as zero: ending the wait early would let this pass
+        // while the engine process is still alive.
+        if let Some(fresh) = count_engine_processes(needle.to_str().unwrap()) {
+            count = fresh;
+        }
     }
     count <= want
 }
@@ -218,8 +224,9 @@ fn a_completed_check_returns_despite_a_token_nobody_cancels() {
         "the run must not cancel the caller's token"
     );
 
-    // The watcher is joined on the way out, so the thread count is back
-    // to what it was: no 50 ms poller is left spinning.
+    // What this pins is that the run *returns* rather than hanging on the
+    // watcher's join, and that no engine process is left behind. It does
+    // not count threads — the watcher cannot be observed from here.
     assert!(
         wait_engine_count(&engine_dir, 0),
         "a check leaves no engine process behind"

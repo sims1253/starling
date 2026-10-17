@@ -1413,9 +1413,11 @@ fn a_check_that_refuses_before_it_starts_lands_as_failed() {
     });
     match settled.speed_check.as_ref().expect("settled") {
         SpeedCheckStatus::Failed { message, .. } => {
+            // The missing-file refusal, specifically. `contains("installed")`
+            // alone is almost a tautology with the alternative below.
             assert!(
-                message.contains("not installed") || message.contains("installed"),
-                "{message}"
+                message.to_lowercase().contains("not installed"),
+                "expected the missing-model refusal, got: {message}"
             );
         }
         other => panic!("expected Failed for a model with no file, got {other:?}"),

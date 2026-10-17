@@ -209,7 +209,7 @@ pub fn synthetic_probe_wav() -> Vec<u8> {
     for &(kind, seconds) in SMOKE_SEGMENTS.iter() {
         let count = (seconds * f64::from(SAMPLE_RATE)).round() as usize;
         for index in 0..count {
-            let value = if kind == "silence" {
+            let value = if kind == SmokeSegment::Silence {
                 0.0
             } else {
                 let time = index as f64 / f64::from(SAMPLE_RATE);
@@ -229,19 +229,28 @@ pub fn synthetic_probe_wav() -> Vec<u8> {
     encode_wav_16k(&audio).expect("a synthetic probe encodes")
 }
 
+/// What one smoke-probe segment is. Not a `&str`: a typo in the table
+/// below ("slience") would compile and quietly turn a pause into a loud
+/// tone — exactly the boundary this probe is shaped to test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SmokeSegment {
+    Speech,
+    Silence,
+}
+
 /// The smoke probe's segments: four bursts with a pause between each,
 /// 6.0 s in total. Long enough to time, and shaped like dictation so a
 /// model that trims silence still has audio to work on. The figure is
 /// normalized per second of audio, so it does not have to match the
 /// speech clip's length.
-const SMOKE_SEGMENTS: &[(&str, f64); 7] = &[
-    ("speech", 1.2),
-    ("silence", 0.4),
-    ("speech", 1.2),
-    ("silence", 0.4),
-    ("speech", 1.2),
-    ("silence", 0.4),
-    ("speech", 1.2),
+const SMOKE_SEGMENTS: &[(SmokeSegment, f64); 7] = &[
+    (SmokeSegment::Speech, 1.2),
+    (SmokeSegment::Silence, 0.4),
+    (SmokeSegment::Speech, 1.2),
+    (SmokeSegment::Silence, 0.4),
+    (SmokeSegment::Speech, 1.2),
+    (SmokeSegment::Silence, 0.4),
+    (SmokeSegment::Speech, 1.2),
 ];
 
 /// The smoke probe's total duration, straight from [`SMOKE_SEGMENTS`].
@@ -374,7 +383,6 @@ pub fn run_speed_check(
         &target.log_path,
     )
     .map_err(|reason| SpeedCheckError::EngineStart { reason })?;
-    let stopped = StopOnDrop(&sidecar);
 
     // The engine's own cancellation signal: one flag the sidecar polls.
     let engine_cancel = Arc::new(AtomicBool::new(false));
@@ -414,6 +422,11 @@ pub fn run_speed_check(
         );
     }
     let _watch_guard = JoinOnDrop(watcher);
+    // Declared after the watcher's guard on purpose: drop order is reverse
+    // of declaration, so on any return path the sidecar is stopped before
+    // the join waits on the watcher. A half-alive engine must not outlive
+    // the run that measured it, even for a 50 ms poll.
+    let stopped = StopOnDrop(&sidecar);
 
     let ready = sidecar.wait_ready(target.slug(), Some(&engine_cancel), &|stage| {
         progress(stage)
@@ -423,6 +436,14 @@ pub fn run_speed_check(
         Err(error) => {
             if engine_cancel.load(Ordering::Acquire) {
                 return Err(SpeedCheckError::Cancelled);
+            }
+            // The install check before this is check-then-act: the file
+            // can go missing between it and the load, and saying so beats
+            // a generic crash or timeout as the cause.
+            if !target.gguf_path.is_file() {
+                return Err(SpeedCheckError::NotInstalled {
+                    model_id: target.entry.id.clone(),
+                });
             }
             return Err(SpeedCheckError::Warmup {
                 reason: error.to_string(),
