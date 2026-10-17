@@ -307,14 +307,16 @@ pub struct SpeedCheckTarget {
     pub engine_path: PathBuf,
     /// `<models_dir>/<entry.file_name>`.
     pub gguf_path: PathBuf,
-    /// The engine log, shared with the app's own engine.
+    /// The log this run's sidecar writes — its own, never the live
+    /// engine's: `Sidecar::spawn` truncates the file past 5 MB, so
+    /// sharing would let a probe wipe the engine's history.
     pub log_path: PathBuf,
 }
 
 impl SpeedCheckTarget {
     /// The target for `entry` at `paths`: the model's file where this
     /// machine's models dir keeps it, the engine binary this machine
-    /// selected, its log.
+    /// selected, and the probe's own log.
     pub fn at(entry: CatalogEntry, paths: &crate::engine::ProbePaths) -> Self {
         Self {
             gguf_path: paths.models_dir.join(&entry.file_name),
