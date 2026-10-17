@@ -43,7 +43,7 @@ fn target(
         ),
         engine_path: engine_dir.join("starling-serve-cpu"),
         gguf_path: models_dir.join(file),
-        log_path: state_dir.join("logs/engine.log"),
+        log_path: state_dir.join("logs/engine-speedcheck.log"),
     }
 }
 

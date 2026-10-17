@@ -742,11 +742,15 @@ fn engine_action(
 /// only for an installed, inactive model with no switch running.
 fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<StarlingApp>) -> Div {
     let switching = snapshot.switch.is_some();
+    // The speed-check status is read once for the whole list: the
+    // per-row "Measuring…" gate and the per-row result lines share the
+    // same borrow, so the render does not walk it twice per row.
+    let status = app.engine_speedcheck_status();
     // One check at a time: the host refuses a second while one runs. Only
     // the row being measured is held — disabling every installed row
     // while nothing on it says why reads as a glitch, and a row the user
     // presses anyway gets a precise refusal.
-    let measuring = app.engine_speedcheck_status().and_then(|status| match status {
+    let measuring = status.and_then(|status| match status {
         starling_runtime_host::engine::SpeedCheckStatus::Running { model_id } => {
             Some(model_id.clone())
         }
@@ -960,20 +964,16 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
         }
         // The check's outcome lives under the row it measured:
         // one line per probe, plus the failure sentence.
-        if let Some(status) = app.engine_speedcheck_status() {
-            if status.model_id() == model.id {
-                for line in speedcheck_lines(status) {
-                    info = info.child(
-                        div()
-                            .mt(px(4.))
-                            .font(theme::mono_font())
-                            .text_size(px(9.))
-                            .line_height(px(13.))
-                            .text_color(theme::SETTINGS_HELPER)
-                            .child(line),
-                    );
-                }
-            }
+        for line in speedcheck_status_lines(status, &model.id) {
+            info = info.child(
+                div()
+                    .mt(px(4.))
+                    .font(theme::mono_font())
+                    .text_size(px(9.))
+                    .line_height(px(13.))
+                    .text_color(theme::SETTINGS_HELPER)
+                    .child(line),
+            );
         }
         row = row.child(info).child(buttons);
         rows = rows.child(row);
@@ -988,15 +988,28 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
 /// this only renders it. What it must not do is invent a number — an
 /// unmeasurable probe reports unknown, and the synthetic one is always
 /// labelled as the upper bound it is (a tone decodes faster than speech).
-fn speedcheck_lines(status: &starling_runtime_host::engine::SpeedCheckStatus) -> Vec<String> {
-    use starling_runtime_host::engine::SpeedCheckStatus;
+/// The lines `model_id`'s row shows for the host's per-model speed check
+/// (#475). `status` is the whole list's status, shared across the rows:
+/// only the row it belongs to returns anything.
+fn speedcheck_status_lines(
+    status: Option<&starling_runtime_host::engine::SpeedCheckStatus>,
+    model_id: &str,
+) -> Vec<String> {
+    let Some(status) = status else { return Vec::new() };
+    if status.model_id() != model_id {
+        return Vec::new();
+    }
     match status {
-        SpeedCheckStatus::Running { .. } => vec!["Measuring…".to_string()],
-        SpeedCheckStatus::Failed { message, .. } => vec![format!("Speed check: {message}")],
+        starling_runtime_host::engine::SpeedCheckStatus::Running { .. } => {
+            vec!["Measuring…".to_string()]
+        }
+        starling_runtime_host::engine::SpeedCheckStatus::Failed { message, .. } => {
+            vec![format!("Speed check: {message}")]
+        }
         // The wording — including the sentence that keeps a synthetic
         // probe from being read as real-speech speed — comes from the
         // type that measured it, not from a second copy of it here.
-        SpeedCheckStatus::Reported { results, .. } => {
+        starling_runtime_host::engine::SpeedCheckStatus::Reported { results, .. } => {
             results.iter().map(|result| result.describe()).collect()
         }
     }

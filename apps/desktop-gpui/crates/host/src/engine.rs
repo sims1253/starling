@@ -268,9 +268,9 @@ fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
 fn record_speed_check(
     slot: &Mutex<Option<SpeedCheckStatus>>,
     generation: &AtomicU64,
-    status: SpeedCheckStatus,
+    status: Option<SpeedCheckStatus>,
 ) {
-    *lock(slot) = Some(status);
+    *lock(slot) = status;
     generation.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -675,6 +675,18 @@ impl EngineHost {
         )
     }
 
+    /// Whether a speed check is running for `model_id`. Both the "one
+    /// check at a time" guard and the delete refusal read this, so the
+    /// two rules cannot drift apart.
+    fn speed_check_running_for(&self, model_id: &str) -> bool {
+        matches!(
+            &*lock(&self.speed_check),
+            Some(SpeedCheckStatus::Running {
+                model_id: running
+            }) if running == model_id
+        )
+    }
+
     /// The engine manager this host supervises right now (builtin
     /// mode), for status reporting and tests. `None` otherwise —
     /// including after a live builtin→manual switch.
@@ -855,12 +867,7 @@ impl EngineHost {
                         // to do with the user's request. Refuse, the way
                         // an active, switching or downloading model is
                         // refused.
-                        if matches!(
-                            &*lock(&self.speed_check),
-                            Some(SpeedCheckStatus::Running {
-                                model_id: running
-                            }) if running == &model_id
-                        ) {
+                        if self.speed_check_running_for(&model_id) {
                             return EngineReply::Refused {
                                 message: format!(
                                     "A speed check is measuring {model_id}; wait for it to \
@@ -876,9 +883,11 @@ impl EngineHost {
                         // rendering under the same row as if it still
                         // held.
                         if self.speed_check_is_for(&model_id) {
-                            *lock(&self.speed_check) = None;
-                            self.speed_check_generation
-                                .fetch_add(1, Ordering::SeqCst);
+                            record_speed_check(
+                                &self.speed_check,
+                                &self.speed_check_generation,
+                                None,
+                            );
                         }
                     }
                     EngineRequest::ConfirmDrainSwap => manager.confirm_drain_swap(),
@@ -908,11 +917,10 @@ impl EngineHost {
     /// exactly one progress line, and two probes fighting over the CPU
     /// would measure each other rather than the model.
     fn start_speed_check(&self, model_id: &str) -> EngineReply {
-        let running = matches!(
-            &*lock(&self.speed_check),
-            Some(SpeedCheckStatus::Running { .. })
-        );
-        if running {
+        if lock(&self.speed_check)
+            .as_ref()
+            .is_some_and(|status| matches!(status, SpeedCheckStatus::Running { .. }))
+        {
             return EngineReply::Refused {
                 message: "A speed check is already running; wait for it to finish.".to_string(),
             };
@@ -945,10 +953,10 @@ impl EngineHost {
             record_speed_check(
                 &self.speed_check,
                 &self.speed_check_generation,
-                SpeedCheckStatus::Failed {
+                Some(SpeedCheckStatus::Failed {
                     model_id: model_id.to_string(),
                     message: message.clone(),
-                },
+                }),
             );
             return EngineReply::Refused { message };
         };
@@ -962,9 +970,9 @@ impl EngineHost {
         record_speed_check(
             &starting_slot,
             &starting_generation,
-            SpeedCheckStatus::Running {
+            Some(SpeedCheckStatus::Running {
                 model_id: model_id.to_string(),
-            },
+            }),
         );
 
         // The only path that answers `Done`, so the revision is read here.
@@ -1030,7 +1038,7 @@ impl EngineHost {
                         message: error.to_string(),
                     },
                 };
-                record_speed_check(&outcome_slot, &generation, status);
+                record_speed_check(&outcome_slot, &generation, Some(status));
             });
         if let Err(error) = worker {
             // The spawn failed, so no worker will ever clear the state:
@@ -1038,10 +1046,10 @@ impl EngineHost {
             record_speed_check(
                 &starting_slot,
                 &starting_generation,
-                SpeedCheckStatus::Failed {
+                Some(SpeedCheckStatus::Failed {
                     model_id: model_id.to_string(),
                     message: format!("The speed check could not be started ({error})."),
-                },
+                }),
             );
             return EngineReply::Refused {
                 message: format!("The speed check could not be started ({error})."),
