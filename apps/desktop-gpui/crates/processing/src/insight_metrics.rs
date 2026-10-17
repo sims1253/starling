@@ -553,11 +553,34 @@ fn dedupe_and_tombstone<'a>(events: &'a [InsightEvent]) -> Result<Grouped<'a>, I
     Ok(grouped)
 }
 
+/// The identity a sequenced event reports in a conflict error.
+trait SequencedEvent: PartialEq {
+    fn event_id(&self) -> &str;
+}
+
+impl SequencedEvent for RecognitionSelected {
+    fn event_id(&self) -> &str {
+        &self.event_id
+    }
+}
+
+impl SequencedEvent for TransformationCompleted {
+    fn event_id(&self) -> &str {
+        &self.event_id
+    }
+}
+
+impl SequencedEvent for DeliveryRecorded {
+    fn event_id(&self) -> &str {
+        &self.event_id
+    }
+}
+
 /// The latest item by a monotone sequence number. Equal sequence numbers
 /// carrying different payloads are a conflict, not an arbitrary pick. The
 /// caller extracts `(sequence, item)` pairs, so an item of the wrong kind
 /// is unrepresentable rather than a panic inside this helper.
-fn latest_by_sequence<'a, T: PartialEq>(
+fn latest_by_sequence<'a, T: SequencedEvent>(
     items: impl IntoIterator<Item = (u64, &'a T)>,
 ) -> Result<Option<&'a T>, InsightError> {
     let mut seen: BTreeMap<u64, &'a T> = BTreeMap::new();
@@ -565,7 +588,9 @@ fn latest_by_sequence<'a, T: PartialEq>(
         match seen.get(&seq) {
             Some(existing) if *existing != item => {
                 return Err(InsightError::new(format!(
-                    "conflicting sequence values at {seq}"
+                    "event_id '{}' and '{}' conflict at sequence {seq}",
+                    existing.event_id(),
+                    item.event_id()
                 )));
             }
             Some(_) => {}
