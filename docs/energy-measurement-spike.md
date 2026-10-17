@@ -14,15 +14,17 @@ not feasible in v1; report time + peak RSS and label energy as unknown.**
 - Scope: package energy includes uncore/DRAM on some SKUs; PP0 is cores
   only. Neither isolates "this transcription" from background load, so a
   rail-grade number needs a quiescent machine and repeated runs.
-- Variance: ~2–5 % run-to-run on a quiet laptop; thermal state dominates.
+- Variance: run-to-run variance is dominated by thermal state; a quiescent
+  machine and repeated runs are required. (No measured figure available.)
 - Cost: permission/setup friction is real (group membership, reboot). Not
   shippable as a zero-config feature.
 
 ### Android (Pixel 10 Pro primary target)
 
 - `BatteryManager` exposes `BATTERY_PROPERTY_CURRENT_NOW` (µA) on some
-  devices, but Pixel firmware typically returns `-1` (unknown) or a coarse
-  estimate. `BATTERY_PROPERTY_ENERGY_COUNTER` (µWh) is even less
+  devices; Pixel firmware typically returns a coarse estimate or does not
+  support it (the property reports `0`/unsupported per the API contract).
+  `BATTERY_PROPERTY_ENERGY_COUNTER` (nanowatt-hours) is even less
   consistently populated.
 - `batterystats` is a *model*, not a rail measurement: it attributes
   estimated energy to apps/packages from CPU time + screen + radio models.
