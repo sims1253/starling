@@ -42,6 +42,8 @@ pub struct EventHeader {
     pub schema_version: u32,
     pub event_id: String,
     pub capture_id: String,
+    /// Opaque in v1: no metric consumes it yet, so it is not validated.
+    /// Local-calendar grouping (not ported here) is what would read it.
     pub occurred_at: String,
 }
 
@@ -289,14 +291,17 @@ pub struct Aggregate {
 ///
 /// `typing_wpm` is the user's typing baseline; without it the time-saved
 /// proxy is `None`. Structurally impossible input (a conflicting event id
-/// or sequence, a count that cannot exist, a non-positive sample rate)
-/// returns [`InsightError`], so a bug cannot silently degrade into
-/// plausible numbers.
+/// or sequence, a count that cannot exist, a zero sample rate) returns
+/// [`InsightError`], so a bug cannot silently degrade into plausible
+/// numbers.
 ///
-/// Only the winning event of each sequence is validated. A superseded
-/// recognition, revision or delivery is replaced by the latest one before
-/// its counts and waits are read, exactly as the oracle's latest-wins
-/// semantics do, so a stale retry cannot fail an otherwise valid log.
+/// Schema compatibility and event-id/sequence conflicts are checked on
+/// every event, including stale replays and tombstoned captures. The
+/// count and wait invariants are checked only on the winning event of each
+/// sequence: a superseded recognition, revision or delivery is replaced by
+/// the latest one before its counts and waits are read, exactly as the
+/// oracle's latest-wins semantics do, so a stale retry cannot fail an
+/// otherwise valid log.
 pub fn aggregate(
     events: &[InsightEvent],
     typing_wpm: Option<f64>,
@@ -477,6 +482,10 @@ type Grouped<'a> = BTreeMap<&'a str, Vec<&'a InsightEvent>>;
 /// entirely. Tombstones dominate stale replays; v1 has no restore.
 fn dedupe_and_tombstone<'a>(events: &'a [InsightEvent]) -> Result<Grouped<'a>, InsightError> {
     let mut unique: HashMap<&str, &InsightEvent> = HashMap::new();
+    // First occurrence order, like the oracle's insertion-ordered dict, so
+    // iteration below is deterministic and per-capture accumulation never
+    // depends on hash order.
+    let mut ordered: Vec<&InsightEvent> = Vec::new();
     for event in events {
         if event.schema_version() != SUPPORTED_SCHEMA_VERSION {
             return Err(InsightError::new("Unsupported event schema_version"));
@@ -488,16 +497,17 @@ fn dedupe_and_tombstone<'a>(events: &'a [InsightEvent]) -> Result<Grouped<'a>, I
             Some(_) => {}
             None => {
                 unique.insert(event.event_id(), event);
+                ordered.push(event);
             }
         }
     }
-    let deleted: HashSet<&str> = unique
-        .values()
+    let deleted: HashSet<&str> = ordered
+        .iter()
         .filter(|event| matches!(event, InsightEvent::CaptureDeleted(_)))
         .map(|event| event.capture_id())
         .collect();
     let mut grouped: Grouped<'a> = BTreeMap::new();
-    for &event in unique.values() {
+    for &event in &ordered {
         if !deleted.contains(event.capture_id()) {
             grouped.entry(event.capture_id()).or_default().push(event);
         }
