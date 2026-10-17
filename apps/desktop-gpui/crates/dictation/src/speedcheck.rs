@@ -505,7 +505,10 @@ pub fn run_speed_check(
         }
     }
     // Explicit stop before the report, so a UI that shows the result
-    // never shares the machine with a half-shut-down engine.
+    // never shares the machine with a half-shut-down engine. The guard
+    // below stops it again on the way out: `Sidecar::stop` is idempotent
+    // (it takes the child out of the slot under a mutex), so that second
+    // call is a no-op rather than a second kill.
     stopped.stop();
     Ok(results)
 }

@@ -894,10 +894,15 @@ impl EngineHost {
     }
 
     /// Starts the per-model speed check (#475) for `model_id` on its own
-    /// worker and answers at once. The check spawns and stops its *own*
-    /// sidecar, so it is deliberately not serialized behind the engine
-    /// worker's other requests: it must not delay a `Configure` or an
-    /// `Activate`, and neither of those can touch its process.
+    /// worker and answers at once.
+    ///
+    /// The *measurement* runs on its own thread, so it is never serialized
+    /// behind the engine worker's other work: it must not delay a
+    /// `Configure` or an `Activate`, and neither of those can touch the
+    /// sidecar it owns. The request itself is still answered from the
+    /// engine worker like every other request, so it occupies that worker
+    /// only for as long as it takes to resolve the target and spawn the
+    /// thread — not for the duration of the probe.
     ///
     /// A check already running refuses a second one — the feed carries
     /// exactly one progress line, and two probes fighting over the CPU
