@@ -271,6 +271,16 @@ pub struct EngineSnapshot {
     pub activations_handled: u64,
 }
 
+/// The paths a read-only out-of-band run needs to start its own
+/// sidecar: the selected engine binary, the models directory, the
+/// engine log. See [`EngineManager::probe_paths`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbePaths {
+    pub engine_path: PathBuf,
+    pub models_dir: PathBuf,
+    pub log_path: PathBuf,
+}
+
 /// A take's hold on the engine that serves it (#363 step 3): requests
 /// use `endpoint` + `slug`; dropping the lease lets a draining engine
 /// stop.
@@ -732,6 +742,46 @@ impl EngineManager {
             slug: engine.slug.clone(),
             model_id: engine.model_id.clone(),
         })
+    }
+
+    /// What a read-only out-of-band run needs to start its *own*
+    /// sidecar (#475's speed check): the selected engine binary, the
+    /// models directory and the engine log. `None` when no backend has
+    /// been selected yet — a probe then has nothing to run, which the
+    /// caller reports rather than discovering a no-op.
+    ///
+    /// This is deliberately the only engine handle a probe gets: it
+    /// spawns and stops its own process, never touching this manager's
+    /// active engine, its switch, or an in-flight take.
+    pub fn probe_paths(&self) -> Option<ProbePaths> {
+        let state = self.inner.lock();
+        let selection = state.selection.as_ref()?;
+        Some(ProbePaths {
+            engine_path: selection.path.clone(),
+            models_dir: self.inner.config.models_dir.clone(),
+            // Its own log, not the live engine's. `Sidecar::spawn`
+            // truncates the file once it passes 5 MB, so sharing would
+            // let a probe that starts while the engine is serving wipe
+            // the engine's history — and both would append to it at
+            // once besides.
+            log_path: self
+                .inner
+                .config
+                .state_dir
+                .join("logs/engine-speedcheck.log"),
+        })
+    }
+
+    /// The catalog entry for `model_id`, for a run that needs the model's
+    /// file name and server slug (`crate::speedcheck`). `None` when the
+    /// id is not in this manager's catalog.
+    pub fn catalog_entry(&self, model_id: &str) -> Option<CatalogEntry> {
+        self.inner
+            .config
+            .catalog
+            .iter()
+            .find(|entry| entry.id == model_id)
+            .cloned()
     }
 
     /// Stops every sidecar (blocking, at most a few seconds).

@@ -34,6 +34,36 @@ build/starling-bench --model parakeet --gguf models/parakeet-tdt-0.6b-v3-bf16-ex
 
 RTFx = audio_seconds / transcribe_seconds (higher is faster).
 
+## Per-model speed check in the app (#475)
+
+`starling-bench` answers "how fast is this model on this machine?" on the
+command line. Settings → Engine asks the same question from inside the app:
+**Speed check** on any installed model measures it offline, in about the
+time the model needs to load.
+
+- Two probes, both local. The *synthetic tone* is generated on the spot (a
+  modulated tone, the same speech stand-in `tests/fidelity_audio.py`
+  builds) and is a smoke test: silence and short outputs decode fast, so its
+  number is an **upper bound**, never real-speech speed. The *speech clip*
+  is the bundled LibriSpeech fixture and is the representative figure.
+- The engine backend is named with every result, so a comparison never
+  silently mixes Vulkan and CPU.
+- Read-only. A check spawns and stops its own sidecar; it never touches the
+  active engine, an in-flight take, history audio, or the insight-event
+  counts. Its transcript is discarded — this is a throughput probe, not a
+  quality check.
+- Seconds per minute of audio is `60 / RTFx`, the way a user asks the
+  question. Unmeasurable probes report unknown, never zero.
+- Warm before measured. The check drives its sidecar to warm first, so a
+  model's load time is excluded from the reported figure — which is what
+  makes two models comparable on one machine. A cold model is therefore
+  slower to answer the *first* time than the number implies, and faster
+  the second; compare runs of the same model by their later numbers.
+
+Related: the energy-measurement spike (#476) decides whether an "energy per
+minute" card can be answered honestly; wall time and peak RSS
+(`starling-bench`) already are.
+
 ## Experiment records and comparisons
 
 A candidate may only be called a win when the paired-improvement CI clears
