@@ -36,23 +36,23 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 pub const TIME_COMPARISON_CAVEAT: &str = "Estimate excludes unobserved correction time; \
      generated words are not speech and never enter this estimate.";
 
-/// The fields every event carries.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventHeader {
-    pub schema_version: u32,
-    pub event_id: String,
-    pub capture_id: String,
-    /// Opaque in v1: no metric consumes it yet, so it is not validated.
-    /// Local-calendar grouping (not ported here) is what would read it.
-    pub occurred_at: String,
-}
+// Every event carries `schema_version`, `event_id`, `capture_id` and
+// `occurred_at`; each struct repeats those fields rather than flattening a
+// shared header, because serde cannot combine `flatten` with
+// `deny_unknown_fields`, and the schema's `additionalProperties: false` is
+// part of the privacy contract. `occurred_at` is opaque in v1: no metric
+// consumes it yet, so it is not validated (local-calendar grouping is not
+// ported here).
 
 /// One retained take of source audio: the only event that makes a take
 /// exist for metrics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureFinalized {
-    #[serde(flatten)]
-    pub header: EventHeader,
+    pub schema_version: u32,
+    pub event_id: String,
+    pub capture_id: String,
+    pub occurred_at: String,
     pub sample_count: u64,
     pub sample_rate: u64,
     pub complete_audio: bool,
@@ -63,9 +63,12 @@ pub struct CaptureFinalized {
 /// A recognition attempt selected as final for its capture. Retries carry
 /// a new `attempt_id` and a higher `selection_seq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecognitionSelected {
-    #[serde(flatten)]
-    pub header: EventHeader,
+    pub schema_version: u32,
+    pub event_id: String,
+    pub capture_id: String,
+    pub occurred_at: String,
     pub attempt_id: String,
     pub selection_seq: u64,
     pub lexical_words: u64,
@@ -88,9 +91,12 @@ pub struct ChangeCounts {
 
 /// One authored revision of the output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransformationCompleted {
-    #[serde(flatten)]
-    pub header: EventHeader,
+    pub schema_version: u32,
+    pub event_id: String,
+    pub capture_id: String,
+    pub occurred_at: String,
     pub revision_id: String,
     pub revision_seq: u64,
     pub transformation_kind: TransformationKind,
@@ -123,9 +129,12 @@ pub enum DeliveryStatus {
 /// `generated_words` are model-authored or snippet-expanded words and
 /// never enter the speech metrics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryRecorded {
-    #[serde(flatten)]
-    pub header: EventHeader,
+    pub schema_version: u32,
+    pub event_id: String,
+    pub capture_id: String,
+    pub occurred_at: String,
     pub delivery_id: String,
     pub delivery_seq: u64,
     pub status: DeliveryStatus,
@@ -136,9 +145,12 @@ pub struct DeliveryRecorded {
 /// One processing job's latency and outcome (#294). Recorded for #308 and
 /// #226; no metric consumes it here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessingRecorded {
-    #[serde(flatten)]
-    pub header: EventHeader,
+    pub schema_version: u32,
+    pub event_id: String,
+    pub capture_id: String,
+    pub occurred_at: String,
     pub job_id: String,
     pub mode_id: String,
     pub mode_version: u64,
@@ -157,7 +169,14 @@ pub struct ProcessingRecorded {
 
 /// A tombstone: every event attributable to the capture is removed,
 /// whatever order it arrived in.
-pub type CaptureDeleted = EventHeader;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureDeleted {
+    pub schema_version: u32,
+    pub event_id: String,
+    pub capture_id: String,
+    pub occurred_at: String,
+}
 
 /// One local Insight event, tagged by `type` as in
 /// `packages/contracts/insight-events/schema.json`.
@@ -173,27 +192,37 @@ pub enum InsightEvent {
 }
 
 impl InsightEvent {
-    pub fn header(&self) -> &EventHeader {
+    pub fn event_id(&self) -> &str {
         match self {
-            InsightEvent::CaptureFinalized(event) => &event.header,
-            InsightEvent::RecognitionSelected(event) => &event.header,
-            InsightEvent::TransformationCompleted(event) => &event.header,
-            InsightEvent::DeliveryRecorded(event) => &event.header,
-            InsightEvent::ProcessingRecorded(event) => &event.header,
-            InsightEvent::CaptureDeleted(header) => header,
+            InsightEvent::CaptureFinalized(event) => &event.event_id,
+            InsightEvent::RecognitionSelected(event) => &event.event_id,
+            InsightEvent::TransformationCompleted(event) => &event.event_id,
+            InsightEvent::DeliveryRecorded(event) => &event.event_id,
+            InsightEvent::ProcessingRecorded(event) => &event.event_id,
+            InsightEvent::CaptureDeleted(event) => &event.event_id,
         }
     }
 
-    pub fn event_id(&self) -> &str {
-        &self.header().event_id
-    }
-
     pub fn capture_id(&self) -> &str {
-        &self.header().capture_id
+        match self {
+            InsightEvent::CaptureFinalized(event) => &event.capture_id,
+            InsightEvent::RecognitionSelected(event) => &event.capture_id,
+            InsightEvent::TransformationCompleted(event) => &event.capture_id,
+            InsightEvent::DeliveryRecorded(event) => &event.capture_id,
+            InsightEvent::ProcessingRecorded(event) => &event.capture_id,
+            InsightEvent::CaptureDeleted(event) => &event.capture_id,
+        }
     }
 
     pub fn schema_version(&self) -> u32 {
-        self.header().schema_version
+        match self {
+            InsightEvent::CaptureFinalized(event) => event.schema_version,
+            InsightEvent::RecognitionSelected(event) => event.schema_version,
+            InsightEvent::TransformationCompleted(event) => event.schema_version,
+            InsightEvent::DeliveryRecorded(event) => event.schema_version,
+            InsightEvent::ProcessingRecorded(event) => event.schema_version,
+            InsightEvent::CaptureDeleted(event) => event.schema_version,
+        }
     }
 }
 
@@ -344,7 +373,7 @@ pub fn aggregate(
         }
         if captures.len() != 1 {
             return Err(InsightError::new(
-                "Multiple canonical capture finalizations",
+                "multiple canonical capture finalizations",
             ));
         }
         let capture = captures[0];
@@ -369,7 +398,7 @@ pub fn aggregate(
             let raw = selected.raw_words;
             if lexical > raw {
                 return Err(InsightError::new(
-                    "Lexical count cannot exceed raw ASR count",
+                    "lexical count cannot exceed raw ASR count",
                 ));
             }
             recognized_words += lexical;
@@ -433,7 +462,7 @@ pub fn aggregate(
             let generated = delivery.generated_words;
             if generated > output {
                 return Err(InsightError::new(
-                    "Generated words cannot exceed output words",
+                    "generated words cannot exceed output words",
                 ));
             }
             *delivery_counts.slot(delivery.status) += 1;
@@ -488,11 +517,18 @@ fn dedupe_and_tombstone<'a>(events: &'a [InsightEvent]) -> Result<Grouped<'a>, I
     let mut ordered: Vec<&InsightEvent> = Vec::new();
     for event in events {
         if event.schema_version() != SUPPORTED_SCHEMA_VERSION {
-            return Err(InsightError::new("Unsupported event schema_version"));
+            return Err(InsightError::new(format!(
+                "unsupported event schema_version {} (supported: {})",
+                event.schema_version(),
+                SUPPORTED_SCHEMA_VERSION
+            )));
         }
         match unique.get(event.event_id()) {
             Some(seen) if *seen != event => {
-                return Err(InsightError::new("Same event ID has conflicting payloads"));
+                return Err(InsightError::new(format!(
+                    "event_id '{}' has conflicting payloads",
+                    event.event_id()
+                )));
             }
             Some(_) => {}
             None => {
@@ -526,7 +562,9 @@ fn latest_by_sequence<'a, T: PartialEq>(
     for (seq, item) in items {
         match seen.get(&seq) {
             Some(existing) if *existing != item => {
-                return Err(InsightError::new("Conflicting sequence values"));
+                return Err(InsightError::new(format!(
+                    "conflicting sequence values at {seq}"
+                )));
             }
             Some(_) => {}
             None => {
@@ -624,6 +662,9 @@ mod tests {
                 // must fail; only floating-point fields get the tolerance.
                 match (actual.as_u64(), expected.as_u64()) {
                     (Some(actual), Some(expected)) => actual == expected,
+                    // Captured/wait seconds are sums of f64 divisions, which
+                    // are not promised bit-exact across the Python oracle and
+                    // this port; integer counts must match exactly.
                     _ => match (actual.as_f64(), expected.as_f64()) {
                         (Some(actual), Some(expected)) => (actual - expected).abs() <= 1e-9,
                         _ => actual == expected,
@@ -764,7 +805,7 @@ mod tests {
 
         let mut events = basic();
         let mut conflict = recognition(&event("a1")).clone();
-        conflict.header.event_id = "conflict".to_string();
+        conflict.event_id = "conflict".to_string();
         conflict.lexical_words = 20;
         events.push(InsightEvent::RecognitionSelected(conflict));
         assert!(aggregate(&events, None)
@@ -774,7 +815,7 @@ mod tests {
 
         let mut events = basic();
         let mut twin = capture(&event("c1")).clone();
-        twin.header.event_id = "c1-twin".to_string();
+        twin.event_id = "c1-twin".to_string();
         events.push(InsightEvent::CaptureFinalized(twin));
         assert!(aggregate(&events, None)
             .unwrap_err()
@@ -786,7 +827,7 @@ mod tests {
     fn structurally_impossible_counts_are_refused() {
         let mut events = basic();
         let mut over_raw = recognition(&event("a1")).clone();
-        over_raw.header.event_id = "impossible-1".to_string();
+        over_raw.event_id = "impossible-1".to_string();
         over_raw.attempt_id = "attempt-x".to_string();
         over_raw.selection_seq = 3;
         over_raw.lexical_words = 500;
@@ -794,23 +835,23 @@ mod tests {
         assert!(aggregate(&events, None)
             .unwrap_err()
             .to_string()
-            .contains("Lexical"));
+            .contains("lexical"));
 
         let mut events = basic();
         let mut over_output = delivery(&event("d1")).clone();
-        over_output.header.event_id = "impossible-2".to_string();
+        over_output.event_id = "impossible-2".to_string();
         over_output.delivery_id = "delivery-x".to_string();
         over_output.generated_words = 999;
         events.push(InsightEvent::DeliveryRecorded(over_output));
         assert!(aggregate(&events, None)
             .unwrap_err()
             .to_string()
-            .contains("Generated"));
+            .contains("generated"));
 
         let mut events = basic();
         let mut zero_rate = capture(&event("c1")).clone();
-        zero_rate.header.event_id = "impossible-3".to_string();
-        zero_rate.header.capture_id = "take-x".to_string();
+        zero_rate.event_id = "impossible-3".to_string();
+        zero_rate.capture_id = "take-x".to_string();
         zero_rate.sample_rate = 0;
         events.push(InsightEvent::CaptureFinalized(zero_rate));
         assert!(aggregate(&events, None).is_err());
@@ -820,7 +861,7 @@ mod tests {
     fn nonfinite_inputs_never_become_numbers() {
         let mut events = basic();
         let mut infinite_wait = recognition(&event("a1")).clone();
-        infinite_wait.header.event_id = "inf-wait".to_string();
+        infinite_wait.event_id = "inf-wait".to_string();
         infinite_wait.attempt_id = "attempt-inf".to_string();
         infinite_wait.selection_seq = 4;
         infinite_wait.post_stop_ready_ms = Some(f64::INFINITY);
@@ -949,6 +990,32 @@ mod tests {
         let round_tripped: Aggregate = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, aggregate);
         assert_eq!(round_tripped.time_comparison_caveat, TIME_COMPARISON_CAVEAT);
+    }
+
+    #[test]
+    fn unknown_and_misspelled_fields_are_rejected() {
+        // The schema's `additionalProperties: false` is structural: a field
+        // added for debugging (or a secret) must not parse, and a
+        // misspelling must not silently become a different event.
+        let mut raw = serde_json::to_value(event("a1")).expect("event serializes");
+        raw["text"] = serde_json::json!("never share this");
+        assert!(serde_json::from_value::<InsightEvent>(raw).is_err());
+
+        let mut raw = serde_json::to_value(event("a1")).expect("event serializes");
+        raw["lexical_word"] = raw["lexical_words"].clone();
+        assert!(serde_json::from_value::<InsightEvent>(raw).is_err());
+
+        let mut raw = serde_json::to_value(event("c1")).expect("capture serializes");
+        raw["event"] = serde_json::json!("extra");
+        assert!(serde_json::from_value::<InsightEvent>(raw).is_err());
+
+        let mut tombstone: serde_json::Value = serde_json::from_str(
+            r#"{"schema_version":1,"event_id":"del","capture_id":"take-1",
+                "occurred_at":"2026-09-20T13:00:00Z","type":"capture_deleted"}"#,
+        )
+        .expect("tombstone");
+        tombstone["reason"] = serde_json::json!("because");
+        assert!(serde_json::from_value::<InsightEvent>(tombstone).is_err());
     }
 
     #[test]
