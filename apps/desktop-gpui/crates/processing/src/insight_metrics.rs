@@ -292,6 +292,11 @@ pub struct Aggregate {
 /// or sequence, a count that cannot exist, a non-positive sample rate)
 /// returns [`InsightError`], so a bug cannot silently degrade into
 /// plausible numbers.
+///
+/// Only the winning event of each sequence is validated. A superseded
+/// recognition, revision or delivery is replaced by the latest one before
+/// its counts and waits are read, exactly as the oracle's latest-wins
+/// semantics do, so a stale retry cannot fail an otherwise valid log.
 pub fn aggregate(
     events: &[InsightEvent],
     typing_wpm: Option<f64>,
