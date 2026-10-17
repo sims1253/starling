@@ -354,17 +354,11 @@ pub fn aggregate(
             incomplete_captures += 1;
         }
 
-        let selected = latest_by_sequence(
-            items
-                .iter()
-                .copied()
-                .filter(|event| matches!(event, InsightEvent::RecognitionSelected(_))),
-            |event| match event {
-                InsightEvent::RecognitionSelected(selected) => selected.selection_seq,
-                _ => unreachable!("filtered to recognition selections"),
-            },
-        )?;
-        if let Some(InsightEvent::RecognitionSelected(selected)) = selected {
+        let selected = latest_by_sequence(items.iter().filter_map(|event| match event {
+            InsightEvent::RecognitionSelected(selected) => Some((selected.selection_seq, selected)),
+            _ => None,
+        }))?;
+        if let Some(selected) = selected {
             selected_recognitions += 1;
             let lexical = selected.lexical_words;
             let raw = selected.raw_words;
@@ -386,23 +380,23 @@ pub fn aggregate(
         // Transformation revisions: the latest `revision_seq` per
         // `revision_id` wins; distinct revisions are distinct passes and
         // both count.
-        let mut revisions: HashMap<&str, Vec<&InsightEvent>> = HashMap::new();
+        let mut revisions: BTreeMap<&str, Vec<&TransformationCompleted>> = BTreeMap::new();
         for &event in items {
             if let InsightEvent::TransformationCompleted(revision) = event {
                 revisions
                     .entry(&revision.revision_id)
                     .or_default()
-                    .push(event);
+                    .push(revision);
             }
         }
         for revision_items in revisions.values() {
-            let Some(InsightEvent::TransformationCompleted(revision)) =
-                latest_by_sequence(revision_items.iter().copied(), |event| match event {
-                    InsightEvent::TransformationCompleted(revision) => revision.revision_seq,
-                    _ => unreachable!("grouped to transformation completions"),
-                })?
+            let Some(revision) = latest_by_sequence(
+                revision_items
+                    .iter()
+                    .map(|revision| (revision.revision_seq, *revision)),
+            )?
             else {
-                unreachable!("a non-empty revision group has a latest revision");
+                continue;
             };
             *transformation_counts.slot(revision.transformation_kind) += 1;
             change_counts.structural += revision.change_counts.structural;
@@ -412,23 +406,23 @@ pub fn aggregate(
             change_counts.style += revision.change_counts.style;
         }
 
-        let mut deliveries: HashMap<&str, Vec<&InsightEvent>> = HashMap::new();
+        let mut deliveries: BTreeMap<&str, Vec<&DeliveryRecorded>> = BTreeMap::new();
         for &event in items {
             if let InsightEvent::DeliveryRecorded(delivery) = event {
                 deliveries
                     .entry(&delivery.delivery_id)
                     .or_default()
-                    .push(event);
+                    .push(delivery);
             }
         }
         for delivery_items in deliveries.values() {
-            let Some(InsightEvent::DeliveryRecorded(delivery)) =
-                latest_by_sequence(delivery_items.iter().copied(), |event| match event {
-                    InsightEvent::DeliveryRecorded(delivery) => delivery.delivery_seq,
-                    _ => unreachable!("grouped to deliveries"),
-                })?
+            let Some(delivery) = latest_by_sequence(
+                delivery_items
+                    .iter()
+                    .map(|delivery| (delivery.delivery_seq, *delivery)),
+            )?
             else {
-                unreachable!("a non-empty delivery group has a latest delivery");
+                continue;
             };
             let output = delivery.output_words;
             let generated = delivery.generated_words;
@@ -511,15 +505,15 @@ fn dedupe_and_tombstone<'a>(events: &'a [InsightEvent]) -> Result<Grouped<'a>, I
     Ok(grouped)
 }
 
-/// The latest event by a monotone sequence field. Equal sequence numbers
-/// with different payloads are a conflict, not an arbitrary pick.
-fn latest_by_sequence<'a>(
-    items: impl IntoIterator<Item = &'a InsightEvent>,
-    sequence: impl Fn(&InsightEvent) -> u64,
-) -> Result<Option<&'a InsightEvent>, InsightError> {
-    let mut seen: HashMap<u64, &'a InsightEvent> = HashMap::new();
-    for item in items {
-        let seq = sequence(item);
+/// The latest item by a monotone sequence number. Equal sequence numbers
+/// carrying different payloads are a conflict, not an arbitrary pick. The
+/// caller extracts `(sequence, item)` pairs, so an item of the wrong kind
+/// is unrepresentable rather than a panic inside this helper.
+fn latest_by_sequence<'a, T: PartialEq>(
+    items: impl IntoIterator<Item = (u64, &'a T)>,
+) -> Result<Option<&'a T>, InsightError> {
+    let mut seen: BTreeMap<u64, &'a T> = BTreeMap::new();
+    for (seq, item) in items {
         match seen.get(&seq) {
             Some(existing) if *existing != item => {
                 return Err(InsightError::new("Conflicting sequence values"));
@@ -530,10 +524,7 @@ fn latest_by_sequence<'a>(
             }
         }
     }
-    Ok(seen
-        .into_iter()
-        .max_by_key(|(seq, _)| *seq)
-        .map(|(_, item)| item))
+    Ok(seen.into_values().next_back())
 }
 
 /// Reject values the contract calls impossible: anything not a finite,
@@ -558,7 +549,14 @@ mod tests {
     use super::*;
 
     fn contract_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../packages/contracts/insight-events")
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../packages/contracts/insight-events");
+        assert!(
+            dir.is_dir(),
+            "contract fixtures not found at {}; this suite expects the standard workspace layout",
+            dir.display()
+        );
+        dir
     }
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -612,9 +610,14 @@ mod tests {
     fn numbers_match(actual: &Value, expected: &Value) -> bool {
         match (actual, expected) {
             (Value::Number(actual), Value::Number(expected)) => {
-                match (actual.as_f64(), expected.as_f64()) {
-                    (Some(actual), Some(expected)) => (actual - expected).abs() <= 1e-9,
-                    _ => actual == expected,
+                // Counts are integers in the contract, so an off-by-one
+                // must fail; only floating-point fields get the tolerance.
+                match (actual.as_u64(), expected.as_u64()) {
+                    (Some(actual), Some(expected)) => actual == expected,
+                    _ => match (actual.as_f64(), expected.as_f64()) {
+                        (Some(actual), Some(expected)) => (actual - expected).abs() <= 1e-9,
+                        _ => actual == expected,
+                    },
                 }
             }
             (Value::Array(actual), Value::Array(expected)) => {
