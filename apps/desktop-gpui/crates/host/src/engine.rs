@@ -214,6 +214,68 @@ pub enum EngineRequest {
     ConfirmDrainSwap,
     /// Cancel a running switch; the current model keeps serving.
     CancelSwitch,
+    /// Measure one installed model's throughput on this machine, offline
+    /// (#475). Started on its own worker; progress and results arrive as
+    /// [`EngineStatus::speed_check`] pushes. Read-only: it never touches
+    /// the active engine, history, or the insight-event stream.
+    SpeedCheck { model_id: String },
+}
+
+/// What the per-model speed check (#475) last did, as the app renders
+/// it. `None` until one is asked for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SpeedCheckStatus {
+    /// A check for `model_id` is running.
+    Running { model_id: String },
+    /// One line per probe, in the order they ran.
+    Reported {
+        model_id: String,
+        results: Vec<SpeedCheckResult>,
+    },
+    /// The check did not produce a figure; `message` says why.
+    Failed { model_id: String, message: String },
+}
+
+impl SpeedCheckStatus {
+    /// The model this state is about, whichever variant it is.
+    pub fn model_id(&self) -> &str {
+        match self {
+            SpeedCheckStatus::Running { model_id }
+            | SpeedCheckStatus::Reported { model_id, .. }
+            | SpeedCheckStatus::Failed { model_id, .. } => model_id,
+        }
+    }
+}
+
+/// One probe's outcome: the two measured numbers, what they derived,
+/// and which engine backend ran it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedCheckResult {
+    /// `smoke` for the synthetic tone (an upper bound), `speech` for the
+    /// bundled clip (the representative number).
+    pub kind: starling_dictation::speedcheck::ProbeKind,
+    pub backend: String,
+    pub audio_seconds: f64,
+    pub transcribe_ms: f64,
+    /// `None` when the measurement could not support a ratio — the UI
+    /// then says so rather than showing a number.
+    pub rtf: Option<f64>,
+    pub seconds_per_audio_minute: Option<f64>,
+}
+
+impl From<&starling_dictation::speedcheck::SpeedCheck> for SpeedCheckResult {
+    fn from(check: &starling_dictation::speedcheck::SpeedCheck) -> Self {
+        Self {
+            kind: check.kind,
+            backend: check.backend.clone(),
+            audio_seconds: check.audio_seconds,
+            transcribe_ms: check.transcribe_ms,
+            rtf: check.rtf,
+            seconds_per_audio_minute: check.seconds_per_audio_minute,
+        }
+    }
 }
 
 /// The host's answer to an [`EngineRequest`]
@@ -253,6 +315,9 @@ pub struct EngineStatus {
     pub snapshot: Option<EngineSnapshot>,
     /// Why no built-in engine runs although it was chosen.
     pub unavailable: Option<String>,
+    /// The per-model speed check (#475) this host is running, or its
+    /// last result. `None` until one is asked for; a restart clears it.
+    pub speed_check: Option<SpeedCheckStatus>,
     /// Bumped whenever the engine settings this host runs change (mode,
     /// backend, server): an app ignores the settings of a status older
     /// than the change it just made.
@@ -271,6 +336,7 @@ impl EngineStatus {
             unavailable: Some(
                 "This Starling recording service runs without a transcription engine.".to_string(),
             ),
+            speed_check: None,
             revision: 0,
         }
     }
@@ -441,6 +507,12 @@ pub struct EngineHost {
     file: Mutex<Option<EngineIntent>>,
     /// See [`EngineStatus::revision`].
     revision: AtomicU64,
+    /// The per-model speed check (#475) state, shared with the worker
+    /// that runs it — it lives across the request that started it.
+    speed_check: Arc<Mutex<Option<SpeedCheckStatus>>>,
+    /// Bumped whenever `speed_check` would read differently, so the
+    /// engine feed carries a running check's progress out.
+    speed_check_generation: Arc<AtomicU64>,
 }
 
 /// What the host runs right now.
@@ -538,6 +610,8 @@ impl EngineHost {
             transitions: Mutex::new(()),
             file: Mutex::new(None),
             revision: AtomicU64::new(0),
+            speed_check: Arc::new(Mutex::new(None)),
+            speed_check_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -584,6 +658,7 @@ impl EngineHost {
         let state = lock(&self.state);
         let revision = self.revision.load(Ordering::SeqCst);
         let label = self.label();
+        let speed_check = lock(&self.speed_check).clone();
         match &*state {
             EngineState::Builtin {
                 manager,
@@ -596,6 +671,7 @@ impl EngineHost {
                 label,
                 snapshot: Some(manager.snapshot()),
                 unavailable: None,
+                speed_check,
                 revision,
             },
             EngineState::Manual { endpoint, model } => EngineStatus {
@@ -605,6 +681,7 @@ impl EngineHost {
                 label,
                 snapshot: None,
                 unavailable: None,
+                speed_check,
                 revision,
             },
             EngineState::Unavailable {
@@ -618,20 +695,27 @@ impl EngineHost {
                 label,
                 snapshot: None,
                 unavailable: Some(reason.clone()),
+                speed_check,
                 revision,
             },
         }
     }
 
     /// Changes whenever [`Self::status`] would read differently: the
-    /// settings revision, and the running manager's generation.
-    pub fn generation(&self) -> (u64, u64) {
+    /// settings revision, the running manager's generation, and the
+    /// per-model speed check's (#475) — which advances while one runs,
+    /// so the feed carries its progress to every watching window.
+    pub fn generation(&self) -> (u64, u64, u64) {
         let state = lock(&self.state);
         let manager = match &*state {
             EngineState::Builtin { manager, .. } => manager.generation(),
             EngineState::Manual { .. } | EngineState::Unavailable { .. } => 0,
         };
-        (self.revision.load(Ordering::SeqCst), manager)
+        (
+            self.revision.load(Ordering::SeqCst),
+            manager,
+            self.speed_check_generation.load(Ordering::SeqCst),
+        )
     }
 
     fn bump(&self) -> u64 {
@@ -712,6 +796,9 @@ impl EngineHost {
                     Err(message) => refused(message),
                 }
             }
+            EngineRequest::SpeedCheck { model_id } => {
+                self.start_speed_check(&model_id)
+            }
             other => {
                 // The rest only need the manager; it is cloned out so a
                 // delete's file work never holds the state lock. A
@@ -734,13 +821,117 @@ impl EngineHost {
                     }
                     EngineRequest::ConfirmDrainSwap => manager.confirm_drain_swap(),
                     EngineRequest::CancelSwitch => manager.cancel_switch(),
-                    EngineRequest::Configure { .. }
-                    | EngineRequest::Activate { .. }
-                    | EngineRequest::Retry => unreachable!("handled above"),
+                    EngineRequest::Configure { ..}
+                    | EngineRequest::Activate { ..}
+                    | EngineRequest::Retry
+                    | EngineRequest::SpeedCheck { .. } => unreachable!("handled above"),
                 }
                 done(self)
             }
         }
+    }
+
+    /// Starts the per-model speed check (#475) for `model_id` on its own
+    /// worker and answers at once. The check spawns and stops its *own*
+    /// sidecar, so it is deliberately not serialized behind the engine
+    /// worker's other requests: it must not delay a `Configure` or an
+    /// `Activate`, and neither of those can touch its process.
+    ///
+    /// A check already running refuses a second one — the feed carries
+    /// exactly one progress line, and two probes fighting over the CPU
+    /// would measure each other rather than the model.
+    fn start_speed_check(&self, model_id: &str) -> EngineReply {
+        let running = matches!(
+            &*lock(&self.speed_check),
+            Some(SpeedCheckStatus::Running { .. })
+        );
+        if running {
+            return EngineReply::Refused {
+                message: "A speed check is already running; wait for it to finish.".to_string(),
+            };
+        }
+        // Everything the worker needs, read now: the state lock is not
+        // held across the run, so a mode switch or an activation can
+        // happen while the check measures.
+        let (manager, paths) = {
+            let state = lock(&self.state);
+            match &*state {
+                EngineState::Builtin { manager, .. } => {
+                    (manager.clone(), manager.probe_paths())
+                }
+                other => {
+                    return EngineReply::Refused {
+                        message: not_running(other),
+                    }
+                }
+            }
+        };
+        let Some(entry) = manager.catalog_entry(model_id) else {
+            return EngineReply::Refused {
+                message: format!("No model {model_id} is in this host's catalog."),
+            };
+        };
+        let done = EngineReply::Done {
+            revision: self.revision.load(Ordering::SeqCst),
+        };
+        let Some(paths) = paths else {
+            // Recorded, not silently dropped: the UI shows the same
+            // sentence a failed run would, so "nothing happened" reads
+            // as an answer rather than a stuck button.
+            *lock(&self.speed_check) = Some(SpeedCheckStatus::Failed {
+                model_id: model_id.to_string(),
+                message: "No engine has been selected yet, so there is nothing to run a speed \
+                          check with."
+                    .to_string(),
+            });
+            self.speed_check_generation
+                .fetch_add(1, Ordering::SeqCst);
+            return done;
+        };
+        let target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
+
+        *lock(&self.speed_check) = Some(SpeedCheckStatus::Running {
+            model_id: model_id.to_string(),
+        });
+        self.speed_check_generation
+            .fetch_add(1, Ordering::SeqCst);
+
+        let outcome_slot = Arc::clone(&self.speed_check);
+        let generation = Arc::clone(&self.speed_check_generation);
+        let reported_id = model_id.to_string();
+        std::thread::Builder::new()
+            .name("starling-speedcheck".into())
+            .spawn(move || {
+                let outcome = starling_dictation::speedcheck::run_speed_check(
+                    &target,
+                    starling_dictation::speedcheck::ALL_PROBES,
+                    &|_| {},
+                    None,
+                );
+                // The check always ends in one of the three states: a
+                // stuck worker would leave "Measuring…" forever, so the
+                // engine's own `--parent-pid` backstop (its process goes
+                // with this host) is what keeps an abandoned sidecar from
+                // outliving the run.
+                let status = match outcome {
+                    Ok(results) if results.is_empty() => SpeedCheckStatus::Failed {
+                        model_id: reported_id,
+                        message: "The speed check measured nothing.".to_string(),
+                    },
+                    Ok(results) => SpeedCheckStatus::Reported {
+                        model_id: reported_id,
+                        results: results.iter().map(SpeedCheckResult::from).collect(),
+                    },
+                    Err(error) => SpeedCheckStatus::Failed {
+                        model_id: reported_id,
+                        message: error.to_string(),
+                    },
+                };
+                *lock(&outcome_slot) = Some(status);
+                generation.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("the speed-check worker spawns");
+        done
     }
 
     /// Follows the settings file: `intent` is what it says now. The first

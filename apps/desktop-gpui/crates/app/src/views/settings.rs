@@ -588,7 +588,7 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
     }
 
     // The model list.
-    section = section.child(model_list(&snapshot, cx));
+    section = section.child(model_list(app, &snapshot, cx));
 
     // The switch progress line and its report.
     if let Some(switch) = &snapshot.switch {
@@ -740,8 +740,15 @@ fn engine_action(
 /// One catalog row (#363): label (recommended marked), size, note,
 /// install state — and the button that state allows. Delete is offered
 /// only for an installed, inactive model with no switch running.
-fn model_list(snapshot: &EngineSnapshot, cx: &mut Context<StarlingApp>) -> Div {
+fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<StarlingApp>) -> Div {
     let switching = snapshot.switch.is_some();
+    // One check at a time (the host refuses a second), so every row
+    // shows the same "Measuring…" instead of a button that would be
+    // refused.
+    let checking = matches!(
+        app.engine_speedcheck_status(),
+        Some(starling_runtime_host::engine::SpeedCheckStatus::Running { .. })
+    );
     let mut rows = div().flex().flex_col().gap(px(6.));
     for model in &snapshot.models {
         let mut row = div()
@@ -869,6 +876,35 @@ fn model_list(snapshot: &EngineSnapshot, cx: &mut Context<StarlingApp>) -> Div {
                         .child("Activate"),
                     );
                 }
+                // The speed check measures the model, not the choice:
+                // offered for the installed, active or not (#475). A
+                // check already running for it says so instead.
+                if !checking {
+                    buttons = buttons.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "model-speedcheck-{}",
+                                model.id
+                            )))
+                            .flex_none()
+                            .px(px(10.))
+                            .py(px(7.))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(theme::SETTINGS_FOOT_LINE)
+                            .text_size(px(10.))
+                            .text_color(theme::SETTINGS_INK)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::PAPER_HOVER))
+                            .on_click({
+                                let id = model.id.clone();
+                                cx.listener(move |this, _, _window, cx| {
+                                    this.engine_speedcheck(&id, cx);
+                                })
+                            })
+                            .child("Speed check"),
+                    );
+                }
             }
             InstallState::Failed(message) => {
                 info = info.child(
@@ -920,10 +956,70 @@ fn model_list(snapshot: &EngineSnapshot, cx: &mut Context<StarlingApp>) -> Div {
                     .child("Delete"),
             );
         }
+        // The check's outcome lives under the row it measured:
+        // one line per probe, plus the failure sentence.
+        if let Some(status) = app.engine_speedcheck_status() {
+            if status.model_id() == model.id {
+                for line in speedcheck_lines(status) {
+                    info = info.child(
+                        div()
+                            .mt(px(4.))
+                            .font(theme::mono_font())
+                            .text_size(px(9.))
+                            .line_height(px(13.))
+                            .text_color(theme::SETTINGS_HELPER)
+                            .child(line),
+                    );
+                }
+            }
+        }
         row = row.child(info).child(buttons);
         rows = rows.child(row);
     }
     rows
+}
+
+/// The lines a model row shows for the host's per-model speed check
+/// (#475), in the order the probes ran.
+///
+/// The arithmetic is the shared one (`starling_dictation::speedcheck`):
+/// this only renders it. What it must not do is invent a number — an
+/// unmeasurable probe reports unknown, and the synthetic one is always
+/// labelled as the upper bound it is (a tone decodes faster than speech).
+fn speedcheck_lines(
+    status: &starling_runtime_host::engine::SpeedCheckStatus,
+) -> Vec<String> {
+    use starling_runtime_host::engine::SpeedCheckStatus;
+    use starling_dictation::speedcheck::ProbeKind;
+    match status {
+        SpeedCheckStatus::Running { .. } => vec!["Measuring…".to_string()],
+        SpeedCheckStatus::Failed { message, .. } => vec![format!("Speed check: {message}")],
+        SpeedCheckStatus::Reported { results, .. } => results
+            .iter()
+            .map(|result| {
+                let kind = match result.kind {
+                    ProbeKind::Smoke => "synthetic tone",
+                    ProbeKind::Speech => "speech clip",
+                };
+                let upper_bound = if result.kind.is_upper_bound() {
+                    " (upper bound: a synthetic tone decodes faster than speech)"
+                } else {
+                    ""
+                };
+                match (result.rtf, result.seconds_per_audio_minute) {
+                    (Some(rtf), Some(per_minute)) => format!(
+                        "{}: {rtf:.3}x realtime — {per_minute:.1} s per minute of audio \
+                         ({}){upper_bound}",
+                        kind, result.backend
+                    ),
+                    _ => format!(
+                        "{}: could not measure a speed on {} — unknown, not zero",
+                        kind, result.backend
+                    ),
+                }
+            })
+            .collect(),
+    }
 }
 
 /// Processing after transcription (#295): one row per built-in mode, the

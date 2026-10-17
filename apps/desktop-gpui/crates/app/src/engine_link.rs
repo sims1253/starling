@@ -292,6 +292,18 @@ impl StarlingApp {
         }
     }
 
+    /// The per-model speed check (#475) as the host last reported it:
+    /// `None` until one is asked for. The status travels with every
+    /// engine push, so it survives a window reconnect rather than being
+    /// a window-local guess.
+    pub fn engine_speedcheck_status(
+        &self,
+    ) -> Option<&starling_runtime_host::engine::SpeedCheckStatus> {
+        self.engine_status
+            .as_ref()
+            .and_then(|status| status.speed_check.as_ref())
+    }
+
     /// Retires any in-flight manual health probe (the latest-wins rule a
     /// saved endpoint uses, #207): the built-in engine's status owns the
     /// indicator now, and a slow probe landing afterwards would overwrite
@@ -356,6 +368,20 @@ impl StarlingApp {
         if self.engine_activating.as_deref() == Some(model_id) {
             self.engine_activating = None;
         }
+    }
+
+    /// Measure how fast `id` transcribes on this machine, offline
+    /// (#475). The host runs it on its own worker against a sidecar of
+    /// its own — the active model and any in-flight take are not
+    /// disturbed — and pushes the result, which the model row shows.
+    /// It writes no history and adds nothing to the Insights counts.
+    pub fn engine_speedcheck(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.engine_request(
+            EngineRequest::SpeedCheck {
+                model_id: id.to_string(),
+            },
+            cx,
+        );
     }
 
     /// Delete a model's files; the engine refuses active/switching/
