@@ -324,13 +324,13 @@ pub struct Aggregate {
 /// [`InsightError`], so a bug cannot silently degrade into plausible
 /// numbers.
 ///
-/// Schema compatibility and event-id/sequence conflicts are checked on
-/// every event, including stale replays and tombstoned captures. The
-/// count and wait invariants are checked only on the winning event of each
-/// sequence: a superseded recognition, revision or delivery is replaced by
-/// the latest one before its counts and waits are read, exactly as the
-/// oracle's latest-wins semantics do, so a stale retry cannot fail an
-/// otherwise valid log.
+/// Schema compatibility and event-id conflicts are checked on every event,
+/// including stale replays and events of tombstoned captures. Sequence
+/// conflicts and the count/wait invariants are checked only among each
+/// surviving capture's events: a superseded recognition, revision or
+/// delivery is replaced by the latest one before its counts and waits are
+/// read, exactly as the oracle's latest-wins semantics do, so a stale retry
+/// cannot fail an otherwise valid log.
 pub fn aggregate(
     events: &[InsightEvent],
     typing_wpm: Option<f64>,
