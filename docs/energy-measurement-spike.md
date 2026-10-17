@@ -49,12 +49,12 @@ probe (package domain) and a phone probe via `phone_energy.sh` (charge
 counter primary, batterystats cross-check) are still to be executed and
 their raw points filed before any in-app energy card is reconsidered.
 
-- Notebook RAPL: expected ~2–5 % run-to-run variance on a quiescent
-  machine; thermal state dominates. Permission/setup friction (group
-  membership) makes it unsuitable as a default.
-- Phone: batterystats deltas are expected to track CPU time more than
-  audio length and to be irreproducible to better than ~20 %; they are a
-  model, not a rail measurement.
+- Notebook RAPL: run-to-run variance is dominated by thermal state; even a
+  quiescent machine needs repeated runs and a screen-off protocol.
+  Permission/setup friction (group membership) makes it unsuitable as a
+  default.
+- Phone: batterystats deltas track CPU time more than audio length and are
+  a model, not a rail measurement; their reproducibility is unverified.
 
 Neither supports a trustworthy "joules per audio-minute" card without the
 pending measurements, and the survey alone is enough to decline v1.
