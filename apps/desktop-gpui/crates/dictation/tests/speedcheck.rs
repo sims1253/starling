@@ -186,6 +186,45 @@ fn the_check_does_not_disturb_the_live_engine_manager() {
     assert!(!pid_alive(live_pid));
 }
 
+/// A completed check must not outlive its own cancel watcher. The
+/// watcher polls the caller's token, so a token nobody cancels would
+/// keep it polling for the life of the process — and joining it on the
+/// way out would hang the caller forever, not merely leak a thread.
+/// With the stop flag missing this test hangs rather than fails, which
+/// is precisely the regression it is for.
+#[test]
+fn a_completed_check_returns_despite_a_token_nobody_cancels() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().expect("tempdir");
+    let engine_dir = stage_engine_dir(root.path(), &fixture);
+    let models_dir = root.path().join("models");
+    let state_dir = root.path().join("state");
+    std::fs::create_dir_all(&models_dir).expect("models dir");
+    std::fs::write(models_dir.join("probe.gguf"), model_bytes(11, 4_096)).expect("model file");
+    let target = target(&engine_dir, &models_dir, &state_dir, "probe", "probe.gguf");
+
+    let token = starling_dictation::client::CancelToken::new();
+    let results = starling_dictation::speedcheck::run_speed_check(
+        &target,
+        speedcheck::ALL_PROBES,
+        &|_| {},
+        Some(&token),
+    )
+    .expect("the check finishes with a live, never-cancelled token");
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        !token.is_cancelled(),
+        "the run must not cancel the caller's token"
+    );
+
+    // The watcher is joined on the way out, so the thread count is back
+    // to what it was: no 50 ms poller is left spinning.
+    assert!(
+        wait_engine_count(&engine_dir, 0),
+        "a check leaves no engine process behind"
+    );
+}
+
 #[test]
 fn an_already_cancelled_check_starts_nothing() {
     let Some(fixture) = fixture() else { return };

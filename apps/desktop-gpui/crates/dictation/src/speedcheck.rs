@@ -370,14 +370,22 @@ pub fn run_speed_check(
     // The engine's own cancellation signal: one flag the sidecar polls.
     let engine_cancel = Arc::new(AtomicBool::new(false));
     let cancel_flag = Arc::clone(&engine_cancel);
+    // And the watcher's own stop: without it a token that is never
+    // cancelled would keep the watcher polling for the process's life,
+    // and joining it on the way out would hang the caller.
+    let watching = Arc::new(AtomicBool::new(true));
+    let watch_flag = Arc::clone(&watching);
     let cancel_watcher = cancel.cloned();
     let watcher = std::thread::Builder::new()
         .name("starling-speedcheck-cancel".into())
         .spawn(move || {
             // Polled rather than waited: the flag is the only channel
-            // the sidecar understands, and a probe is short enough that
-            // a 50 ms poll is free.
-            while let Some(token) = cancel_watcher.as_ref() {
+            // the sidecar understands, and a run is short enough that a
+            // 50 ms poll is free.
+            while watch_flag.load(Ordering::Acquire) {
+                let Some(token) = cancel_watcher.as_ref() else {
+                    return;
+                };
                 if token.is_cancelled() {
                     cancel_flag.store(true, Ordering::Release);
                     return;
@@ -386,7 +394,7 @@ pub fn run_speed_check(
             }
         })
         .ok();
-    let _watch_guard = JoinOnDrop(watcher);
+    let _watch_guard = JoinOnDrop(watcher, watching);
 
     let ready = sidecar.wait_ready(target.slug(), Some(&engine_cancel), &|stage| {
         progress(stage)
@@ -477,22 +485,18 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
-/// Joins a thread when the function returns: the cancel watcher outlives
-/// every path below it, and abandoning it would leak a 50 ms poller per
-/// cancelled probe.
-struct JoinOnDrop(Option<std::thread::JoinHandle<()>>);
-
-impl JoinOnDrop {
-    fn join(&mut self) {
-        if let Some(handle) = self.0.take() {
-            let _ = handle.join();
-        }
-    }
-}
+/// Joins the cancel watcher when the function returns, however it
+/// returns: first it clears the flag the watcher polls, so the join
+/// never waits on a token nobody is going to cancel. Set at the very
+/// start so every early return below also stops the watcher.
+struct JoinOnDrop(Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>);
 
 impl Drop for JoinOnDrop {
     fn drop(&mut self) {
-        self.join();
+        self.1.store(false, Ordering::Release);
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
     }
 }
 

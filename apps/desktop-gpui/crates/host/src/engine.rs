@@ -875,18 +875,18 @@ impl EngineHost {
             revision: self.revision.load(Ordering::SeqCst),
         };
         let Some(paths) = paths else {
-            // Recorded, not silently dropped: the UI shows the same
-            // sentence a failed run would, so "nothing happened" reads
-            // as an answer rather than a stuck button.
+            let message = "No engine has been selected yet, so there is nothing to run a speed \
+                           check with."
+                .to_string();
+            // Recorded as well as refused: the refusal clears the button,
+            // while the recorded state keeps the reason on the model row.
             *lock(&self.speed_check) = Some(SpeedCheckStatus::Failed {
                 model_id: model_id.to_string(),
-                message: "No engine has been selected yet, so there is nothing to run a speed \
-                          check with."
-                    .to_string(),
+                message: message.clone(),
             });
             self.speed_check_generation
                 .fetch_add(1, Ordering::SeqCst);
-            return done;
+            return EngineReply::Refused { message };
         };
         let target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
 
