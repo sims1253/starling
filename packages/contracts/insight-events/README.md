@@ -6,6 +6,9 @@ Local-first telemetry events and metric semantics for Starling Insights
 repo root test suite — it is the *contract*, not the production aggregator:
 the production implementation is the native runtime owned by E17 and must
 reproduce the semantics frozen here and in `tests/test_insight_events.py`.
+The native port is `apps/desktop-gpui/crates/processing/src/insight_metrics.rs`
+(#308); `aggregates/` holds the oracle's aggregate for every fixture, which
+the Rust tests compare against and a Python test keeps in sync.
 
 ## Event kinds and identity
 
