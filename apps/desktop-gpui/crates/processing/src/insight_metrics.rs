@@ -868,7 +868,9 @@ mod tests {
 
     #[test]
     fn negative_time_saved_is_reported_not_clamped() {
-        // 100 words at 50 typing-wpm = 120 s; 40 s capture + 1030 s wait.
+        // 100 words at 50 typing-wpm = 120 s; 40 s capture + 1000 s
+        // post-stop wait => -920 s. The fixture freezes that this is
+        // displayed, not clamped.
         let result = aggregate(&load("negative-proxy.json"), Some(50.0)).expect("aggregates");
         assert_eq!(result.typing_time_comparison_seconds, Some(-920.0));
         assert_eq!(result.incomplete_captures, 1);
