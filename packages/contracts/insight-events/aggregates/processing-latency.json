@@ -1,0 +1,48 @@
+{
+  "formula_version": 1,
+  "unique_takes": 1,
+  "selected_recognitions": 0,
+  "incomplete_captures": 0,
+  "recognized_words": 0,
+  "raw_recognized_words": 0,
+  "captured_seconds": 10.0,
+  "eligible_capture_seconds": 0.0,
+  "recognized_words_per_captured_minute": null,
+  "tokenizers": [],
+  "delivery_counts": {
+    "confirmed": 0,
+    "submitted_unconfirmed": 0,
+    "failed": 0,
+    "conflict": 0,
+    "cancelled": 0
+  },
+  "output_words_by_status": {
+    "confirmed": 0,
+    "submitted_unconfirmed": 0,
+    "failed": 0,
+    "conflict": 0,
+    "cancelled": 0
+  },
+  "generated_words_by_status": {
+    "confirmed": 0,
+    "submitted_unconfirmed": 0,
+    "failed": 0,
+    "conflict": 0,
+    "cancelled": 0
+  },
+  "change_counts": {
+    "structural": 0,
+    "user": 0,
+    "dictionary": 0,
+    "snippet": 0,
+    "style": 0
+  },
+  "transformation_counts": {
+    "model_authoring": 0,
+    "snippet_expansion": 0,
+    "user_edit": 0,
+    "dictionary_substitution": 0
+  },
+  "typing_time_comparison_seconds": null,
+  "time_comparison_caveat": "Estimate excludes unobserved correction time; generated words are not speech and never enter this estimate."
+}
