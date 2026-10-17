@@ -1042,18 +1042,19 @@ impl EngineHost {
             });
         if let Err(error) = worker {
             // The spawn failed, so no worker will ever clear the state:
-            // roll it back here, and say so in the reply.
+            // roll it back here, and say so in the reply. One sentence for
+            // both, so the recorded status and what the caller reads can
+            // never disagree.
+            let message = format!("The speed check could not be started ({error}).");
             record_speed_check(
                 &starting_slot,
                 &starting_generation,
                 Some(SpeedCheckStatus::Failed {
                     model_id: model_id.to_string(),
-                    message: format!("The speed check could not be started ({error})."),
+                    message: message.clone(),
                 }),
             );
-            return EngineReply::Refused {
-                message: format!("The speed check could not be started ({error})."),
-            };
+            return EngineReply::Refused { message };
         }
         done
     }
