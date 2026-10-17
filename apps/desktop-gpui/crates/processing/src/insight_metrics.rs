@@ -60,8 +60,10 @@ pub struct CaptureFinalized {
     pub reporting_timezone: String,
 }
 
-/// A recognition attempt selected as final for its capture. Retries carry
-/// a new `attempt_id` and a higher `selection_seq`.
+/// A recognition attempt selected as final for its capture. Producers give
+/// a retry a new `attempt_id` and a higher `selection_seq`; the metric
+/// layer selects by `selection_seq` (the oracle does not check attempt-id
+/// reuse), so uniqueness is a producer contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecognitionSelected {
@@ -671,6 +673,8 @@ mod tests {
                     },
                 }
             }
+            // Arrays are positional on purpose: `tokenizers` is sorted by
+            // both implementations (BTreeSet here, `sorted()` in the oracle).
             (Value::Array(actual), Value::Array(expected)) => {
                 actual.len() == expected.len()
                     && actual
