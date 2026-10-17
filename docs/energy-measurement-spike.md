@@ -30,8 +30,9 @@ not feasible in v1; report time + peak RSS and label energy as unknown.**
   joules.
 - Rail measurement requires external hardware (Monsoon/ Otii) or a
   device-specific kernel debugfs path; not available to a shipped app.
-- `benchmarks/fast_engine/android_bench.sh` can collect `batterystats`
-  deltas for research, but they stay labeled as model estimates.
+- `benchmarks/fast_engine/phone_energy.sh` collects a charge-counter-based
+  energy per transcription on the phone (primary), with the batterystats
+  power model reported alongside as an explicitly estimated cross-check.
 
 ### iOS
 
@@ -42,12 +43,21 @@ not feasible in v1; report time + peak RSS and label energy as unknown.**
 
 ## Prototype outcome
 
-A probe was run around the existing `starling-bench` / bundled-engine
-sidecar transcribe path on a notebook (RAPL, package domain) and a Pixel
-(batterystats model). Notebook runs showed ~2–5 % variance; Pixel
-batterystats deltas were not reproducible to better than ~20 % and tracked
-CPU time more than audio length. Neither supports a trustworthy
-"joules per audio-minute" card.
+No rail-grade probe has been run yet; the figures below are the expected
+characteristics from the survey, not measured results. A notebook RAPL
+probe (package domain) and a phone probe via `phone_energy.sh` (charge
+counter primary, batterystats cross-check) are still to be executed and
+their raw points filed before any in-app energy card is reconsidered.
+
+- Notebook RAPL: expected ~2–5 % run-to-run variance on a quiescent
+  machine; thermal state dominates. Permission/setup friction (group
+  membership) makes it unsuitable as a default.
+- Phone: batterystats deltas are expected to track CPU time more than
+  audio length and to be irreproducible to better than ~20 %; they are a
+  model, not a rail measurement.
+
+Neither supports a trustworthy "joules per audio-minute" card without the
+pending measurements, and the survey alone is enough to decline v1.
 
 ## Recommendation
 
