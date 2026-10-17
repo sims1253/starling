@@ -1367,6 +1367,12 @@ fn a_memory_refusal_reaches_the_app() {
 /// and the answer comes back as an engine status push — not as the reply,
 /// which only says "started". One line per probe, and the synthetic one
 /// marked as the upper bound it is.
+///
+/// Unix-only because it needs the staged start delay to see the transient
+/// `Running` push: a `sh` wrapper cannot slow a Windows engine, and the
+/// host feed polls every 200 ms while the contract fixture finishes a
+/// probe faster than that. The refusal test below runs everywhere.
+#[cfg(unix)]
 #[test]
 fn a_speed_check_over_the_socket_reports_through_the_engine_feed() {
     let Some(fixture) = fixture() else { return };
@@ -1467,6 +1473,7 @@ fn a_speed_check_over_the_socket_reports_through_the_engine_feed() {
 /// #475: a second check while one runs is refused, not queued — two
 /// probes fighting over the CPU would measure each other, and the feed
 /// carries exactly one progress line.
+#[cfg(unix)]
 #[test]
 fn a_second_speed_check_is_refused_while_one_runs() {
     let Some(fixture) = fixture() else { return };
