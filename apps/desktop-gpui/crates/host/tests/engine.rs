@@ -23,7 +23,7 @@ use starling_runtime::provider::FakeProvider;
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime_host::client::{EventWire, HostClient};
 use starling_runtime_host::engine::{
-    self, EngineChoice, EngineIntent, EngineReply, EngineRequest, EngineStatus,
+    self, EngineChoice, EngineIntent, EngineReply, EngineRequest, EngineStatus, SpeedCheckStatus,
 };
 use starling_runtime_host::{serve, HostConfig, HostError};
 
@@ -879,6 +879,98 @@ fn a_retry_with_another_model_runs_once_the_host_s_engine_serves_it() {
     host.shutdown();
 }
 
+/// Stages the engine dir with a wrapper that sleeps `delay_secs` before
+/// the real fixture whenever its arguments mention `slow_arg`, then
+/// re-hashes it. A speed check against it holds `Running` long enough
+/// for the engine feed (which polls every 200 ms) to push it — the
+/// contract fixture finishes a probe faster than that otherwise.
+#[cfg(unix)]
+fn stage_delayed_engine_dir(root: &Path, fixture: &Path, slow_arg: &str, delay_secs: u32) {
+    use std::io::Write;
+
+    let engines = root.join("engines");
+    std::fs::create_dir_all(&engines).unwrap();
+    let staged = engines.join("starling-serve-cpu");
+    let quoted = format!("'{}'", fixture.display().to_string().replace('\'', r"'\''"));
+    let script = format!(
+        "#!/bin/sh\ncase \"$*\" in *{slow_arg}*) sleep {delay_secs} ;; esac\nexec {quoted} \"$@\"\n"
+    );
+    // Written by a `sh` child rather than in this process: a sibling
+    // test spawning while such a descriptor is open copies it into a
+    // child that holds it until exec, which fails with ETXTBSY ("Text
+    // file busy") under any name the file is later renamed to.
+    let mut writer = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(&staged)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(writer.wait().unwrap().success(), "stage the delayed engine");
+
+    let sha = sha256_file(&staged).unwrap();
+    std::fs::write(
+        engines.join("SHA256SUMS.txt"),
+        format!("{sha}  starling-serve-cpu\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        engines.join("engines.json"),
+        format!(
+            r#"{{"version":"0.1.0","abi":{EXPECTED_ENGINE_ABI},"engines":[{{"backend":"cpu","file":"starling-serve-cpu"}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// [`engine_config_with_models`] with a start-delayed engine: the model
+/// is installed, but its sidecar takes `delay_secs` to become ready, so
+/// a check is observably `Running` while it loads.
+#[cfg(unix)]
+fn engine_config_with_delayed_models(
+    root: &Path,
+    fixture: &Path,
+    models: &[&str],
+    delay_secs: u32,
+) -> EngineConfig {
+    stage_delayed_engine_dir(root, fixture, ".gguf", delay_secs);
+    let models_dir = root.join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let mut catalog = Vec::new();
+    for (index, id) in models.iter().enumerate() {
+        let file_name = format!("{id}.gguf");
+        let model_file = models_dir.join(&file_name);
+        std::fs::write(&model_file, vec![(7 + index * 13) as u8; 4096]).unwrap();
+        let sha = sha256_file(&model_file).unwrap();
+        std::fs::write(models_dir.join(format!("{file_name}.verified")), &sha).unwrap();
+        catalog.push(CatalogEntry::new(
+            id,
+            "Fixture",
+            "parakeet",
+            &format!("http://127.0.0.1:9/{file_name}"),
+            4096,
+            &sha,
+            false,
+            "host engine test model",
+        ));
+    }
+    EngineConfig {
+        engine_dir: Some(root.join("engines")),
+        models_dir,
+        state_dir: root.join("engine-state"),
+        catalog,
+        backend_override: None,
+        icd_dirs: Some(Vec::new()),
+        available_memory_override: Some(None),
+        backoff_schedule: Some(vec![Duration::from_millis(100)]),
+    }
+}
+
 /// A connection following the take feed — and with it the engine's
 /// status pushes.
 fn watching(path: &Path) -> HostClient {
@@ -1267,6 +1359,202 @@ fn a_memory_refusal_reaches_the_app() {
     });
     let snapshot = refused.snapshot.unwrap();
     assert_eq!(snapshot.active.unwrap().model_id, MODEL_ID, "the current model keeps serving");
+    drop(app);
+    host.shutdown();
+}
+
+/// #475: the app's SpeedCheck reaches the host's engine over the socket,
+/// and the answer comes back as an engine status push — not as the reply,
+/// which only says "started". One line per probe, and the synthetic one
+/// marked as the upper bound it is.
+#[test]
+fn a_speed_check_over_the_socket_reports_through_the_engine_feed() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    // The start is slowed so `Running` outlives the feed's 200 ms poll.
+    let config = engine_config_with_delayed_models(root.path(), &fixture, &[MODEL_ID], 3);
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    let second_window = watching(host.socket_path());
+    until_engine(&app, "the first model serving", |status| {
+        serving(status, MODEL_ID)
+    });
+
+    let reply = app
+        .engine(EngineRequest::SpeedCheck {
+            model_id: MODEL_ID.into(),
+        })
+        .expect("answered");
+    assert!(
+        matches!(reply, EngineReply::Done { .. }),
+        "the reply only acknowledges the start; the numbers arrive as pushes: {reply:?}"
+    );
+
+    // Both watching windows hear it, in the same order.
+    let running = until_engine(&app, "the check running", |status| {
+        matches!(status.speed_check, Some(SpeedCheckStatus::Running { .. }))
+    });
+    assert_eq!(
+        running.speed_check.as_ref().and_then(|s| match s {
+            SpeedCheckStatus::Running { model_id } => Some(model_id.as_str()),
+            _ => None,
+        }),
+        Some(MODEL_ID)
+    );
+    // The live engine before the probe's own sidecar exists.
+    let live_pid = |status: &EngineStatus| {
+        status
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.active.as_ref())
+            .map(|active| active.pid)
+    };
+    let pid_before = live_pid(&running);
+
+    let reported = until_engine(&app, "the check reported", |status| {
+        matches!(status.speed_check, Some(SpeedCheckStatus::Reported { .. }))
+    });
+    let results = match reported.speed_check.as_ref().expect("reported") {
+        SpeedCheckStatus::Reported { results, .. } => results.clone(),
+        other => panic!("expected Reported, got {other:?}"),
+    };
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].kind.is_upper_bound(),
+        "the synthetic tone is the upper bound it is labelled as: {results:?}"
+    );
+    assert!(!results[1].kind.is_upper_bound(), "{results:?}");
+    let line = results[1].describe();
+    assert!(line.contains("speech clip"), "{line}");
+    assert!(line.contains("realtime"), "{line}");
+    assert!(!line.contains("upper bound"), "{line}");
+
+    let also_reported =
+        until_engine(&second_window, "the second window's report", |status| {
+            matches!(status.speed_check, Some(SpeedCheckStatus::Reported { .. }))
+        });
+    assert_eq!(also_reported.speed_check, reported.speed_check);
+
+    // The live engine is the one before, still serving the same model:
+    // a probe runs its own sidecar and leaves it stopped. Read from the
+    // pushes already in hand — a check that changed nothing pushes
+    // nothing new — and from the host's own manager, not from a wait for
+    // a push that would not come.
+    assert_eq!(live_pid(&reported), pid_before, "the live engine's process never changed");
+    let manager = host.engine().expect("builtin");
+    let snapshot = manager.snapshot();
+    assert_eq!(
+        snapshot.active.as_ref().map(|active| active.pid),
+        pid_before,
+        "the host's engine is still the one it was"
+    );
+    assert_eq!(
+        snapshot.active.map(|active| active.model_id),
+        Some(MODEL_ID.to_string()),
+        "and it still serves the same model"
+    );
+    drop((app, second_window));
+    host.shutdown();
+}
+
+/// #475: a second check while one runs is refused, not queued — two
+/// probes fighting over the CPU would measure each other, and the feed
+/// carries exactly one progress line.
+#[test]
+fn a_second_speed_check_is_refused_while_one_runs() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config_with_delayed_models(root.path(), &fixture, &[MODEL_ID], 3);
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    until_engine(&app, "the first model serving", |status| {
+        serving(status, MODEL_ID)
+    });
+
+    // Nothing running yet: the first request is taken.
+    assert!(matches!(
+        app.engine(EngineRequest::SpeedCheck {
+            model_id: MODEL_ID.into()
+        })
+        .expect("answered"),
+        EngineReply::Done { .. }
+    ));
+    let _running = until_engine(&app, "the check running", |status| {
+        matches!(status.speed_check, Some(SpeedCheckStatus::Running { .. }))
+    });
+    let refused = app
+        .engine(EngineRequest::SpeedCheck {
+            model_id: MODEL_ID.into(),
+        })
+        .expect("answered");
+    match refused {
+        EngineReply::Refused { message } => {
+            assert!(message.contains("already running"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // The first check still finishes and reports.
+    let _reported = until_engine(&app, "the first check reported", |status| {
+        matches!(status.speed_check, Some(SpeedCheckStatus::Reported { .. }))
+    });
+    drop(app);
+    host.shutdown();
+}
+
+/// #475: a check for a model that is not in the catalog is refused with
+/// the model named, and nothing is pushed.
+#[test]
+fn a_speed_check_for_an_unknown_model_is_refused() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config_with_models(root.path(), Some(&fixture), &[MODEL_ID]);
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    until_engine(&app, "the first model serving", |status| {
+        serving(status, MODEL_ID)
+    });
+
+    let reply = app
+        .engine(EngineRequest::SpeedCheck {
+            model_id: "not-a-model".into(),
+        })
+        .expect("answered");
+    match reply {
+        EngineReply::Refused { message } => {
+            assert!(message.contains("not-a-model"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // Nothing was left running behind the refusal — a stuck `Running`
+    // would hide the button on every row and refuse this retry.
+    assert!(matches!(
+        app.engine(EngineRequest::SpeedCheck {
+            model_id: MODEL_ID.into(),
+        })
+        .expect("answered"),
+        EngineReply::Done { .. }
+    ));
     drop(app);
     host.shutdown();
 }

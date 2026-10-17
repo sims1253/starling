@@ -986,39 +986,17 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
 /// this only renders it. What it must not do is invent a number — an
 /// unmeasurable probe reports unknown, and the synthetic one is always
 /// labelled as the upper bound it is (a tone decodes faster than speech).
-fn speedcheck_lines(
-    status: &starling_runtime_host::engine::SpeedCheckStatus,
-) -> Vec<String> {
+fn speedcheck_lines(status: &starling_runtime_host::engine::SpeedCheckStatus) -> Vec<String> {
     use starling_runtime_host::engine::SpeedCheckStatus;
-    use starling_dictation::speedcheck::ProbeKind;
     match status {
         SpeedCheckStatus::Running { .. } => vec!["Measuring…".to_string()],
         SpeedCheckStatus::Failed { message, .. } => vec![format!("Speed check: {message}")],
-        SpeedCheckStatus::Reported { results, .. } => results
-            .iter()
-            .map(|result| {
-                let kind = match result.kind {
-                    ProbeKind::Smoke => "synthetic tone",
-                    ProbeKind::Speech => "speech clip",
-                };
-                let upper_bound = if result.kind.is_upper_bound() {
-                    " (upper bound: a synthetic tone decodes faster than speech)"
-                } else {
-                    ""
-                };
-                match (result.rtf, result.seconds_per_audio_minute) {
-                    (Some(rtf), Some(per_minute)) => format!(
-                        "{}: {rtf:.3}x realtime — {per_minute:.1} s per minute of audio \
-                         ({}){upper_bound}",
-                        kind, result.backend
-                    ),
-                    _ => format!(
-                        "{}: could not measure a speed on {} — unknown, not zero",
-                        kind, result.backend
-                    ),
-                }
-            })
-            .collect(),
+        // The wording — including the sentence that keeps a synthetic
+        // probe from being read as real-speech speed — comes from the
+        // type that measured it, not from a second copy of it here.
+        SpeedCheckStatus::Reported { results, .. } => {
+            results.iter().map(|result| result.describe()).collect()
+        }
     }
 }
 

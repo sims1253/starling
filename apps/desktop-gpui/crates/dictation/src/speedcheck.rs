@@ -58,8 +58,10 @@ pub enum ProbeKind {
 }
 
 impl ProbeKind {
-    /// The UI's name for this probe.
-    pub fn label(self) -> &'static str {
+    /// This probe's name. Private because [`SpeedCheck::describe`] is the
+    /// one place a probe is named for a user: broadcasting it invited a
+    /// second wording to drift from the first.
+    fn label(self) -> &'static str {
         match self {
             ProbeKind::Smoke => "synthetic tone",
             ProbeKind::Speech => "speech clip",
@@ -118,24 +120,27 @@ impl SpeedCheck {
         }
     }
 
-    /// The line the settings UI shows: RTFx and the per-minute figure,
-    /// with the backend named and a synthetic probe marked as the upper
-    /// bound it is.
+    /// The one line a probe renders as, everywhere it is shown.
+    ///
+    /// This is the *only* formatter for a result — the host carries this
+    /// type over the wire and the settings row maps over it. Two
+    /// formatters (or a client re-deriving the probe's name) drift, and
+    /// the first thing to drift is the sentence that keeps a synthetic
+    /// probe from being read as real-speech speed.
     pub fn describe(&self) -> String {
         let Some(rtf) = self.rtf else {
             return format!(
-                "{} ({}): could not measure a speed for {} — the engine answered too fast or \
-                 too slowly to time.",
-                self.model_id,
-                self.backend,
-                self.kind.label()
+                "{} ({}): could not measure a speed — the engine answered too fast or too \
+                 slowly to time.",
+                self.kind.label(),
+                self.backend
             );
         };
         let mut line = format!(
-            "{} ({}): {}x realtime — {:.1} s per minute of audio",
-            self.model_id,
+            "{} ({}): {:.3}x realtime — {:.1} s per minute of audio",
+            self.kind.label(),
             self.backend,
-            fmt_rtf(rtf),
+            rtf,
             self.seconds_per_audio_minute.unwrap_or(f64::NAN),
         );
         if self.kind.is_upper_bound() {
@@ -168,12 +173,6 @@ pub fn seconds_per_audio_minute(rtf: f64) -> f64 {
         return f64::NAN;
     }
     60.0 / rtf
-}
-
-/// RTFx with the precision that is meaningful on a phone: three digits
-/// covers 0.12x to 999x, which spans every model and device we support.
-fn fmt_rtf(rtf: f64) -> String {
-    format!("{rtf:.3}")
 }
 
 /// The synthetic smoke probe as WAV bytes: a 220 Hz tone under a 10 Hz
@@ -394,6 +393,15 @@ pub fn run_speed_check(
             }
         })
         .ok();
+    if watcher.is_none() {
+        // Cancellation degrades rather than failing: the probe still
+        // measures, it just cannot be stopped. On stderr, like the
+        // crate's other "I could not do this thing" notes, so nobody
+        // has to wonder later why a cancel did nothing.
+        eprintln!(
+            "speed check: the cancel watcher could not be started; this run cannot be cancelled"
+        );
+    }
     let _watch_guard = JoinOnDrop(watcher, watching);
 
     let ready = sidecar.wait_ready(target.slug(), Some(&engine_cancel), &|stage| {
@@ -570,6 +578,7 @@ mod tests {
         assert_close(speech.seconds_per_audio_minute.expect("measurable"), 6.0);
         assert!(!speech.kind.is_upper_bound());
         let line = speech.describe();
+        assert!(line.contains("speech clip"), "{line}");
         assert!(line.contains("10.000x realtime"), "{line}");
         assert!(line.contains("6.0 s per minute of audio"), "{line}");
         assert!(line.contains("Vulkan0"), "{line}");
@@ -597,7 +606,9 @@ mod tests {
         assert_eq!(unknown.rtf, None);
         assert_eq!(unknown.seconds_per_audio_minute, None);
         let line = unknown.describe();
+        assert!(line.starts_with("speech clip"), "{line}");
         assert!(line.contains("could not measure"), "{line}");
+        // Unknown, not a number: a row must never read "0x realtime".
         assert!(!line.contains("x realtime"), "{line}");
     }
 

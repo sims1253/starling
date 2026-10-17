@@ -228,10 +228,12 @@ pub enum EngineRequest {
 pub enum SpeedCheckStatus {
     /// A check for `model_id` is running.
     Running { model_id: String },
-    /// One line per probe, in the order they ran.
+    /// One line per probe, in the order they ran. The results are the
+    /// shared `speedcheck::SpeedCheck`, so the app formats with the same
+    /// code that computed them rather than a second copy of the words.
     Reported {
         model_id: String,
-        results: Vec<SpeedCheckResult>,
+        results: Vec<starling_dictation::speedcheck::SpeedCheck>,
     },
     /// The check did not produce a figure; `message` says why.
     Failed { model_id: String, message: String },
@@ -244,36 +246,6 @@ impl SpeedCheckStatus {
             SpeedCheckStatus::Running { model_id }
             | SpeedCheckStatus::Reported { model_id, .. }
             | SpeedCheckStatus::Failed { model_id, .. } => model_id,
-        }
-    }
-}
-
-/// One probe's outcome: the two measured numbers, what they derived,
-/// and which engine backend ran it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpeedCheckResult {
-    /// `smoke` for the synthetic tone (an upper bound), `speech` for the
-    /// bundled clip (the representative number).
-    pub kind: starling_dictation::speedcheck::ProbeKind,
-    pub backend: String,
-    pub audio_seconds: f64,
-    pub transcribe_ms: f64,
-    /// `None` when the measurement could not support a ratio — the UI
-    /// then says so rather than showing a number.
-    pub rtf: Option<f64>,
-    pub seconds_per_audio_minute: Option<f64>,
-}
-
-impl From<&starling_dictation::speedcheck::SpeedCheck> for SpeedCheckResult {
-    fn from(check: &starling_dictation::speedcheck::SpeedCheck) -> Self {
-        Self {
-            kind: check.kind,
-            backend: check.backend.clone(),
-            audio_seconds: check.audio_seconds,
-            transcribe_ms: check.transcribe_ms,
-            rtf: check.rtf,
-            seconds_per_audio_minute: check.seconds_per_audio_minute,
         }
     }
 }
@@ -815,8 +787,42 @@ impl EngineHost {
                         manager.cancel_download(&model_id)
                     }
                     EngineRequest::Delete { model_id } => {
+                        // A speed check for this very model is measuring
+                        // it out of band, and it takes none of the locks
+                        // a delete waits on. On Linux the probe would
+                        // keep running against the unlinked file and
+                        // report a number for a model the user just took
+                        // away; on Windows the delete fails with nothing
+                        // to do with the user's request. Refuse, the way
+                        // an active, switching or downloading model is
+                        // refused.
+                        if matches!(
+                            &*lock(&self.speed_check),
+                            Some(SpeedCheckStatus::Running {
+                                model_id: running
+                            }) if running == &model_id
+                        ) {
+                            return EngineReply::Refused {
+                                message: format!(
+                                    "A speed check is measuring {model_id}; wait for it to \
+                                     finish before deleting the model."
+                                ),
+                            };
+                        }
                         if let Err(err) = manager.delete_model(&model_id) {
                             return refused(err.to_string());
+                        }
+                        // The measured model is gone, so a report left
+                        // from an earlier check of it would keep
+                        // rendering under the same row as if it still
+                        // held.
+                        if matches!(
+                            &*lock(&self.speed_check),
+                            Some(status) if status.model_id() == model_id
+                        ) {
+                            *lock(&self.speed_check) = None;
+                            self.speed_check_generation
+                                .fetch_add(1, Ordering::SeqCst);
                         }
                     }
                     EngineRequest::ConfirmDrainSwap => manager.confirm_drain_swap(),
@@ -890,16 +896,17 @@ impl EngineHost {
         };
         let target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
 
-        *lock(&self.speed_check) = Some(SpeedCheckStatus::Running {
-            model_id: model_id.to_string(),
-        });
-        self.speed_check_generation
-            .fetch_add(1, Ordering::SeqCst);
-
         let outcome_slot = Arc::clone(&self.speed_check);
         let generation = Arc::clone(&self.speed_check_generation);
         let reported_id = model_id.to_string();
-        std::thread::Builder::new()
+        // Spawned *before* the `Running` state is written. A spawn
+        // failure must not panic: `handle()` runs under `catch_unwind`,
+        // so the host would survive and answer `Refused` while leaving
+        // the status stuck at `Running` — no button on any row, and
+        // every retry refused until the host restarts. `handle()` is
+        // serialized on this one worker thread, so nothing else can
+        // observe the half-started state either way.
+        let worker = std::thread::Builder::new()
             .name("starling-speedcheck".into())
             .spawn(move || {
                 let outcome = starling_dictation::speedcheck::run_speed_check(
@@ -920,7 +927,7 @@ impl EngineHost {
                     },
                     Ok(results) => SpeedCheckStatus::Reported {
                         model_id: reported_id,
-                        results: results.iter().map(SpeedCheckResult::from).collect(),
+                        results,
                     },
                     Err(error) => SpeedCheckStatus::Failed {
                         model_id: reported_id,
@@ -929,8 +936,21 @@ impl EngineHost {
                 };
                 *lock(&outcome_slot) = Some(status);
                 generation.fetch_add(1, Ordering::SeqCst);
-            })
-            .expect("the speed-check worker spawns");
+            });
+        let Ok(_) = worker else {
+            let Err(error) = worker else {
+                unreachable!()
+            };
+            return EngineReply::Refused {
+                message: format!("The speed check could not be started ({error})."),
+            };
+        };
+
+        *lock(&self.speed_check) = Some(SpeedCheckStatus::Running {
+            model_id: model_id.to_string(),
+        });
+        self.speed_check_generation
+            .fetch_add(1, Ordering::SeqCst);
         done
     }
 

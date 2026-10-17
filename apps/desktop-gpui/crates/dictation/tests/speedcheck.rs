@@ -147,11 +147,12 @@ fn the_check_does_not_disturb_the_live_engine_manager() {
     assert_eq!(live_engine.model_id, "live");
     let live_endpoint = live_engine.endpoint.clone();
     let live_pid = live_engine.pid;
-    // One engine process: the live one, before any check.
-    assert_eq!(
-        count_engine_processes(engine_dir.to_str().unwrap()),
-        Some(1)
-    );
+    // One engine process: the live one, before any check. The count is
+    // /proc-only, so it is guarded rather than asserted — a `Some(1)`
+    // cannot be answered off Linux.
+    if let Some(count) = count_engine_processes(engine_dir.to_str().unwrap()) {
+        assert_eq!(count, 1, "only the live engine runs before a check");
+    }
 
     // An installed model of another id, checked while the live engine
     // keeps serving.
@@ -174,7 +175,7 @@ fn the_check_does_not_disturb_the_live_engine_manager() {
     assert_eq!(active.endpoint, live_endpoint, "the endpoint never moved");
     assert_eq!(active.pid, live_pid, "the live process was never replaced");
     assert!(
-        count_engine_processes(engine_dir.to_str().unwrap()) == Some(1),
+        wait_engine_count(&engine_dir, 1),
         "only the live engine is left"
     );
 
@@ -246,9 +247,8 @@ fn an_already_cancelled_check_starts_nothing() {
         starling_dictation::speedcheck::SpeedCheckError::Cancelled
     );
     // Nothing was started, so there is nothing to stop either.
-    assert_eq!(
-        count_engine_processes(engine_dir.to_str().unwrap()),
-        Some(0),
+    assert!(
+        wait_engine_count(&engine_dir, 0),
         "a cancelled check spawns no engine"
     );
 }
