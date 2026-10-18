@@ -747,10 +747,12 @@ class MainActivity : Activity() {
                             liveTranscript.visibility = View.GONE
                             showMessage(when (result.kind) {
                                 TakeRecorder.Failure.FINALIZATION -> getString(R.string.recording_finalize_error)
+                                TakeRecorder.Failure.TRANSCRIPTION -> getString(R.string.transcription_failed_retry)
                                 TakeRecorder.Failure.ALREADY_STOPPED -> getString(R.string.recording_already_stopped)
                                 TakeRecorder.Failure.CAPTURE -> result.message.orEmpty()
                             })
                         }
+                        TakeRecorder.Stopped.Discarded -> Unit
                     }
                 }
             },

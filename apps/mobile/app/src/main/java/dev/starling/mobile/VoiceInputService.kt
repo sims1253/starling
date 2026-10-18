@@ -579,10 +579,15 @@ class VoiceInputService : InputMethodService() {
                         })
                     }
                     is TakeRecorder.Stopped.Failed -> when (result.kind) {
+                        TakeRecorder.Failure.TRANSCRIPTION -> failCapture(current,
+                            if (current.sensitive) R.string.keyboard_transcription_failed_private
+                            else R.string.keyboard_transcription_failed,
+                        )
                         TakeRecorder.Failure.FINALIZATION -> failCapture(current, R.string.recording_finalize_error)
                         TakeRecorder.Failure.ALREADY_STOPPED -> failCapture(current, R.string.recording_already_stopped)
                         TakeRecorder.Failure.CAPTURE -> failCapture(current, null, result.message)
                     }
+                    TakeRecorder.Stopped.Discarded -> Unit
                 }
             },
             onTranscribed = { onTranscriptionSettled(current, it) },

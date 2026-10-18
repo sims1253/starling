@@ -159,6 +159,7 @@ class StarlingRecognitionService : RecognitionService() {
                     is TakeRecorder.Stopped.Failed -> if (finalize) {
                         sessions.deliver(ending.session.owner) { it.error(SpeechRecognizer.ERROR_CLIENT) }
                     }
+                    TakeRecorder.Stopped.Discarded -> Unit
                 }
             },
             onTranscribed = { deliverSettled(ending, it) },

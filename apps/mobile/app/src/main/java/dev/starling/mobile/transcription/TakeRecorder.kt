@@ -51,10 +51,12 @@ class TakeRecorder internal constructor(
 
     sealed interface Stopped {
         data class Saved(val recording: Recording, val capture: CaptureResult.Completed) : Stopped
+        /** A cancelled private take whose audio has been deleted. */
+        data object Discarded : Stopped
         data class Failed(val kind: Failure, val message: String? = null) : Stopped
     }
 
-    enum class Failure { CAPTURE, FINALIZATION, ALREADY_STOPPED }
+    enum class Failure { CAPTURE, FINALIZATION, TRANSCRIPTION, ALREADY_STOPPED }
 
     private var active: Take? = null
 
@@ -128,18 +130,28 @@ class TakeRecorder internal constructor(
                             onStopped(Stopped.Failed(Failure.FINALIZATION))
                             return@settle
                         }
-                        if (!transcribe && ephemeral) delete()
+                        if (!transcribe && ephemeral) {
+                            delete()
+                            onStopped(Stopped.Discarded)
+                            return@settle
+                        }
                         if (transcribe) {
+                            var rejected = false
                             val done: (Recording) -> Unit = { completed ->
-                                if (ephemeral) delete()
-                                onTranscribed(completed)
+                                if (!rejected) {
+                                    if (ephemeral) delete()
+                                    onTranscribed(completed)
+                                }
                             }
                             val queued = if (stream != null) transcription.finish(stream, saved, done)
                             else transcription.transcribe(saved, done)
                             // A rejected stream was not transferred to a worker.
                             if (!queued) {
+                                rejected = true
                                 stream?.close()
                                 if (ephemeral) delete()
+                                onStopped(Stopped.Failed(Failure.TRANSCRIPTION))
+                                return@settle
                             }
                         }
                         onStopped(Stopped.Saved(saved, result))
@@ -173,6 +185,7 @@ class TakeRecorder internal constructor(
         fun delete(recording: Recording)
     }
 
+    /** Terminal callbacks are posted to main after admission returns; rejection may also post one. */
     internal interface Transcriber {
         fun begin(audio: File, events: (StreamEvent) -> Unit): StreamSession?
         fun finish(session: StreamSession, recording: Recording, done: (Recording) -> Unit): Boolean

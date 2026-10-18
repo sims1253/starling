@@ -216,12 +216,15 @@ class RecognizeSpeechActivity : Activity() {
                     }
                     is TakeRecorder.Stopped.Failed -> deliver(
                         RecognizeSpeechOutcome.Outcome(
-                            if (result.kind == TakeRecorder.Failure.FINALIZATION) RecognizerIntent.RESULT_CLIENT_ERROR
-                            else RecognizerIntent.RESULT_AUDIO_ERROR,
+                            when (result.kind) {
+                                TakeRecorder.Failure.FINALIZATION, TakeRecorder.Failure.TRANSCRIPTION -> RecognizerIntent.RESULT_CLIENT_ERROR
+                                else -> RecognizerIntent.RESULT_AUDIO_ERROR
+                            },
                         ),
                         if (result.kind == TakeRecorder.Failure.FINALIZATION) R.string.recording_finalize_error else R.string.recognize_failed,
                         result.message,
                     )
+                    TakeRecorder.Stopped.Discarded -> Unit
                 }
             },
             onTranscribed = { done ->

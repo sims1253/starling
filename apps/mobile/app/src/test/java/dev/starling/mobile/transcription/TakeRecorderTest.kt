@@ -52,6 +52,7 @@ class TakeRecorderTest {
         val events = mutableListOf<(StreamEvent) -> Unit>()
         val requests = mutableListOf<Pair<String, Boolean>>()
         val completions = mutableListOf<() -> Unit>()
+        val rejectedCompletions = mutableListOf<() -> Unit>()
         override fun begin(audio: File, events: (StreamEvent) -> Unit): StreamSession? {
             this.events += events
             return if (live) Session().also { sessions += it } else null
@@ -66,6 +67,8 @@ class TakeRecorderTest {
                 val result = recording.copy(status = RecordingStatus.TRANSCRIBED, rawTranscript = "verbatim ${recording.id}")
                 store.rows[recording.id] = result
                 done(result)
+            } else rejectedCompletions += {
+                done(recording.copy(status = RecordingStatus.FAILED, errorMessage = "queue failed"))
             }
             return queued
         }
@@ -164,9 +167,11 @@ class TakeRecorderTest {
         for (result in listOf(CaptureResult.Completed(1.0), CaptureResult.Failed("mic failed"), CaptureResult.AlreadyStopped)) {
             val f = Fixture()
             val take = f.start(ephemeral = true)
-            take.stop(transcribe = false)
+            var stopped: TakeRecorder.Stopped? = null
+            take.stop(transcribe = false, onStopped = { stopped = it })
             f.audio.stops.single()(result)
             assertTrue(f.store.rows.isEmpty())
+            if (result is CaptureResult.Completed) assertEquals(TakeRecorder.Stopped.Discarded, stopped)
         }
         val f = Fixture()
         val take = f.start(ephemeral = true)
@@ -193,17 +198,24 @@ class TakeRecorderTest {
     }
 
     @Test
-    fun rejectedPrivateTranscriptionDeletesAudioWithoutWaitingForACallback() {
-        for (live in listOf(false, true)) {
+    fun rejectedTranscriptionReportsFailureWithoutWaitingForACallback() {
+        for ((live, ephemeral) in listOf(false to false, false to true, true to false, true to true)) {
             val f = Fixture()
             f.transcriber.live = live
             f.transcriber.queued = false
-            val take = f.start(ephemeral = true)
-            take.stop()
+            val take = f.start(ephemeral = ephemeral)
+            val stopped = mutableListOf<TakeRecorder.Stopped>()
+            var transcribed = 0
+            take.stop(onStopped = { stopped += it }, onTranscribed = { transcribed++ })
             f.audio.stops.single()(CaptureResult.Completed(1.0))
+            assertEquals(listOf(TakeRecorder.Stopped.Failed(TakeRecorder.Failure.TRANSCRIPTION)), stopped)
             assertTrue(f.transcriber.completions.isEmpty())
-            assertTrue("a rejected private take must leave no saved audio", f.store.rows.isEmpty())
+            assertEquals("only a private take should be deleted", ephemeral, f.store.rows.isEmpty())
             assertTrue(f.transcriber.sessions.all { it.closed })
+            // A storage rejection may also post a failure callback later.
+            f.transcriber.rejectedCompletions.single()()
+            assertEquals(0, transcribed)
+            assertEquals(1, stopped.size)
         }
     }
 
