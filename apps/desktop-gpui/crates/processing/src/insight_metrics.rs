@@ -54,6 +54,11 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 pub const TIME_COMPARISON_CAVEAT: &str = "Estimate excludes unobserved correction time; \
      generated words are not speech and never enter this estimate.";
 
+/// 2^64, exactly representable as f64: the first float no u64 can hold.
+/// Shared by the integer parser, the count normalization, and the parity
+/// comparator so the boundary cannot drift between them.
+const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+
 /// How JSON Schema (and the Python oracle) read an `integer` field: a
 /// numeral with a zero fractional part, so `1.0` is the integer `1`.
 /// serde's plain `u64`/`u32` reject `1.0`, which would make this port
@@ -86,8 +91,8 @@ impl Visitor<'_> for IntegralU64 {
     where
         E: serde::de::Error,
     {
-        // 2^64 as f64 is exact; anything at or above it cannot fit.
-        if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value < 18_446_744_073_709_551_616.0 {
+        // Anything at or above 2^64 cannot fit.
+        if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value < TWO_POW_64 {
             Ok(value as u64)
         } else {
             Err(E::custom("number is not an in-range nonnegative integer"))
@@ -592,8 +597,16 @@ pub fn aggregate(
                     "lexical count cannot exceed raw ASR count",
                 ));
             }
-            add_total(&mut recognized_words, lexical as u64, "recognized words")?;
-            add_total(&mut raw_recognized_words, raw as u64, "raw recognized words")?;
+            add_total(
+                &mut recognized_words,
+                normalized_count(lexical, "lexical_words")?,
+                "recognized words",
+            )?;
+            add_total(
+                &mut raw_recognized_words,
+                normalized_count(raw, "raw_words")?,
+                "raw recognized words",
+            )?;
             eligible_seconds += duration;
             tokenizers.insert(selected.tokenizer.clone());
             match selected.post_stop_ready_ms {
@@ -627,27 +640,27 @@ pub fn aggregate(
             let changes = revision.change_counts;
             add_total(
                 &mut change_counts.structural,
-                changes.structural as f64 as u64,
+                normalized_count(changes.structural as f64, "change_counts.structural")?,
                 "structural changes",
             )?;
             add_total(
                 &mut change_counts.user,
-                changes.user as f64 as u64,
+                normalized_count(changes.user as f64, "change_counts.user")?,
                 "user changes",
             )?;
             add_total(
                 &mut change_counts.dictionary,
-                changes.dictionary as f64 as u64,
+                normalized_count(changes.dictionary as f64, "change_counts.dictionary")?,
                 "dictionary changes",
             )?;
             add_total(
                 &mut change_counts.snippet,
-                changes.snippet as f64 as u64,
+                normalized_count(changes.snippet as f64, "change_counts.snippet")?,
                 "snippet changes",
             )?;
             add_total(
                 &mut change_counts.style,
-                changes.style as f64 as u64,
+                normalized_count(changes.style as f64, "change_counts.style")?,
                 "style changes",
             )?;
         }
@@ -677,9 +690,17 @@ pub fn aggregate(
             }
             *delivery_counts.slot(delivery.status) += 1;
             let slot = output_words_by_status.slot(delivery.status);
-            add_total(slot, output as u64, "output words")?;
+            add_total(
+                slot,
+                normalized_count(output, "output_words")?,
+                "output words",
+            )?;
             let slot = generated_words_by_status.slot(delivery.status);
-            add_total(slot, generated as u64, "generated words")?;
+            add_total(
+                slot,
+                normalized_count(generated, "generated_words")?,
+                "generated words",
+            )?;
         }
     }
 
@@ -817,6 +838,22 @@ fn latest_by_sequence<'a, T: SequencedEvent>(
     Ok(seen.into_values().next_back())
 }
 
+/// `int(nonnegative(x))` for a count already read as a float, bounded
+/// like every count here: the topmost integers round *up* to 2^64 in
+/// f64 (`u64::MAX as f64` is exactly 2^64), where the oracle's bigint
+/// total would leave u64 entirely. Casting there saturates silently to
+/// `u64::MAX` — off by one from the oracle with no error anywhere — so
+/// a normalized count at or above 2^64 refuses instead, keeping the
+/// module's refuse-rather-than-diverge promise.
+fn normalized_count(value: f64, label: &str) -> Result<u64, InsightError> {
+    if value >= TWO_POW_64 {
+        return Err(InsightError::new(format!(
+            "{label} exceeds the supported range"
+        )));
+    }
+    Ok(value as u64)
+}
+
 /// Adds `by` to a running total, refusing past `u64`: the oracle's
 /// integers are unbounded, so an overflowing total is outside this
 /// port's representable range — an error, never a panic in debug or a
@@ -947,7 +984,7 @@ mod tests {
         }
         // The float must convert back losslessly: in range for the
         // saturating `as` cast, and landing exactly on the integer.
-        float >= i128::MIN as f64 && float < 18_446_744_073_709_551_616.0 && float as i128 == int
+        float >= i128::MIN as f64 && float < TWO_POW_64 && float as i128 == int
     }
 
     fn numbers_match(actual: &Value, expected: &Value) -> bool {
@@ -1419,6 +1456,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("supported range"));
+    }
+
+    #[test]
+    fn counts_whose_normalization_leaves_u64_are_refused_not_saturated() {
+        // The topmost integers round *up* to 2^64 as f64: the oracle's
+        // int(float(u64::MAX)) is 2^64 exactly, a count this port
+        // cannot hold. A saturating cast would total 2^64 − 1 with no
+        // error anywhere — refuse instead (the first such value is
+        // 2^64 − 1024, where f64 spacing reaches the boundary).
+        for words in [u64::MAX, 18_446_744_073_709_550_592] {
+            let mut selected = recognition(&event("a2")).clone();
+            selected.lexical_words = words;
+            selected.raw_words = words;
+            let events = vec![
+                event("c1"),
+                InsightEvent::RecognitionSelected(selected),
+            ];
+            assert!(
+                aggregate(&events, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("supported range"),
+                "{words} must refuse, not saturate"
+            );
+        }
     }
 
     #[test]
