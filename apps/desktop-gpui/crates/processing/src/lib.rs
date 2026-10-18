@@ -20,6 +20,9 @@
 //! - [`pipeline`]: plan → request → run, one [`contract::TransformResult`]
 //!   per job with its timing; [`insight`] turns it into the
 //!   `processing_recorded` event.
+//! - [`insight_metrics`]: the production port of the frozen Insight
+//!   metric oracle (`tests/insight_metrics.py`), checked against the
+//!   contract fixtures and their oracle-generated aggregates (#308).
 //! - [`live`]: a `/stream` take (running text + stable word count) as
 //!   draft operations, for the live staging editor (#297).
 //!
@@ -31,6 +34,7 @@ pub mod boundary;
 pub mod contract;
 pub mod http;
 pub mod insight;
+pub mod insight_metrics;
 pub mod instructions;
 pub mod live;
 pub mod pipeline;

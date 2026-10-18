@@ -375,6 +375,32 @@ def test_reset_yields_zero_state_and_export_round_trips() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Native port parity (#308)
+# --------------------------------------------------------------------------- #
+AGGREGATES = CONTRACT / "aggregates"
+
+
+def test_rust_aggregate_expectations_match_the_oracle() -> None:
+    """The Rust port (`crates/processing/src/insight_metrics.rs`) reads these
+    oracle-generated aggregates as its parity contract. Regenerate them here
+    rather than by hand when a fixture or the frozen semantics change.
+    """
+    expected = sorted(path.name for path in AGGREGATES.glob("*.json"))
+    assert expected == sorted(
+        [f"{fixture.stem}.json" for fixture in FIXTURES]
+        + ["basic-session-typing-50.json"]
+    ), "an aggregate is missing or stale; regenerate aggregates/"
+    for fixture in FIXTURES:
+        events = json.loads(fixture.read_text())
+        actual = json.loads((AGGREGATES / f"{fixture.stem}.json").read_text())
+        assert actual == aggregate(events), fixture.name
+    basic = json.loads((CONTRACT / "fixtures" / "basic-session.json").read_text())
+    assert json.loads((AGGREGATES / "basic-session-typing-50.json").read_text()) == aggregate(
+        basic, 50
+    )
+
+
+# --------------------------------------------------------------------------- #
 # processing_recorded (#294): recorded for #308/#226, consumed by no metric
 # --------------------------------------------------------------------------- #
 PROCESSING = json.loads((CONTRACT / "fixtures" / "processing-latency.json").read_text())
