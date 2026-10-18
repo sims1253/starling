@@ -62,8 +62,8 @@ try {
   adb('shell', 'run-as', packageId, 'cp', '/data/local/tmp/starling-e2e/model.gguf', `files/models/${model.name}`);
   assert.equal(adb('shell', 'run-as', packageId, 'sha256sum', `files/models/${model.name}`).toString().split(/\s+/)[0], model.sha256);
   adb('shell', 'run-as', packageId, 'touch', 'files/debug/fail-transcription');
-  // Disable repeated live inference for this batch-retry journey on CPU CI.
-  adb('shell', 'run-as', packageId, 'sh', '-c', "'echo 3600 3600 > files/debug/stream-cadence'");
+  // Defer previews to the 12 s window boundary; this take stops after 8 s.
+  adb('shell', 'run-as', packageId, 'sh', '-c', "'echo 12 12 > files/debug/stream-cadence'");
   staged = true;
   adb('logcat', '-c');
   manifest.status = 'running';

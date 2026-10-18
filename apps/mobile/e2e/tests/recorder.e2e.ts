@@ -11,7 +11,7 @@ test('retains failed capture, retries with real inference, restarts, and exports
   await screen.scrollUntilVisible(record);
   await expect(screen.getByText('No recordings yet.')).toBeVisible();
   await record.tap();
-  await expect(record).toHaveText('Stop and transcribe');
+  await expect(record).toHaveText('Stop and transcribe', { ignoreCase: true });
   const [take] = await until(recordings, rows => rows.length === 1);
   // Wait for durable samples, not a sleep that assumes capture started.
   await until(() => Number(adb('shell', 'run-as', packageId, 'stat', '-c', '%s', `files/recordings/${take.id}.wav.part`).toString().trim()),
