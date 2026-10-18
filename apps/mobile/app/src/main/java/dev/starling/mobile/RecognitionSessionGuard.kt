@@ -1,16 +1,13 @@
 package dev.starling.mobile
 
 import android.speech.SpeechRecognizer
-import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
+import dev.starling.mobile.transcription.TakeRecorder
 
 /**
- * Session-state decisions for [StarlingRecognitionService]: which client owns
- * the live session, what ends it, how its stopped capture settles (committed
- * for transcription, kept locally without transcription, or marked failed), and whether a
- * terminal error is delivered. Pure Kotlin in the guard-class shape of
- * InputTargetGuard so every transition is unit-testable on the JVM; the service applies the returned decisions
- * against the recordings store and the host keyboard's callback.
+ * Tracks the recognition client that owns the live take. [TakeRecorder]
+ * owns audio settlement; this guard decides whether an ending transcribes
+ * and protects binder deliveries to a client that may have died.
  */
 class RecognitionSessionGuard<T : Any> {
     /** The single live session: its durable recording and owning client. */
@@ -25,30 +22,6 @@ class RecognitionSessionGuard<T : Any> {
 
         /** Keep the audio; no transcription and no delivery. */
         data class Abandon<out T : Any>(override val session: Session<T>) : Ending<T>
-    }
-
-    /** How the stopped capture of an ended session settles. */
-    sealed interface Settlement {
-        /**
-         * Commit the WAV and transcribe it; deliver the transcript when it
-         * returns. [stoppedForLowDisk]: the take ended itself because storage
-         * ran nearly full (#342). It is still complete and still delivered
-         * as the result, never as an error; the service says why it stopped.
-         */
-        data class Transcribe(
-            val recording: Recording,
-            val durationSeconds: Double,
-            val stoppedForLowDisk: Boolean = false,
-        ) : Settlement
-
-        /** Commit the WAV locally; the audio stays and nothing further happens. */
-        data class Keep(val recording: Recording, val durationSeconds: Double) : Settlement
-
-        /** Mark the recording failed; deliver the code when one is set. */
-        data class Fail(val recordingId: String, val message: String, val errorCode: Int?) : Settlement
-
-        /** Nothing was captured to settle; deliver the code when one is set. */
-        data class Empty(val errorCode: Int?) : Settlement
     }
 
     private var session: Session<T>? = null
@@ -75,23 +48,6 @@ class RecognitionSessionGuard<T : Any> {
 
     /** Service teardown: keep the audio like a cancel. */
     fun teardown(): Ending<T>? = endLive { Ending.Abandon(it) }
-
-    fun settle(ending: Ending<T>, result: CaptureResult): Settlement = when (ending) {
-        is Ending.Finalize -> when (result) {
-            is CaptureResult.Completed ->
-                Settlement.Transcribe(ending.session.recording, result.durationSeconds, result.stoppedForLowDisk)
-            is CaptureResult.Failed ->
-                Settlement.Fail(ending.session.recording.id, result.message, SpeechRecognizer.ERROR_CLIENT)
-            CaptureResult.AlreadyStopped -> Settlement.Empty(SpeechRecognizer.ERROR_CLIENT)
-        }
-        is Ending.Abandon -> when (result) {
-            is CaptureResult.Completed ->
-                Settlement.Keep(ending.session.recording, result.durationSeconds)
-            is CaptureResult.Failed ->
-                Settlement.Fail(ending.session.recording.id, result.message, errorCode = null)
-            CaptureResult.AlreadyStopped -> Settlement.Empty(errorCode = null)
-        }
-    }
 
     /**
      * Terminal deliveries are binder calls into the host keyboard's process.

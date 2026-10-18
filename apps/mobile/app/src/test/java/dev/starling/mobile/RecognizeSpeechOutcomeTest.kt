@@ -2,7 +2,6 @@ package dev.starling.mobile
 
 import android.app.Activity
 import android.speech.RecognizerIntent
-import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import org.junit.Assert.assertEquals
@@ -53,16 +52,4 @@ class RecognizeSpeechOutcomeTest {
         assertEquals(RecognizerIntent.RESULT_CLIENT_ERROR, outcome.resultCode)
     }
 
-    @Test
-    fun onlyACompletedCaptureProceedsToTranscription() {
-        assertNull(RecognizeSpeechOutcome.captureEnded(CaptureResult.Completed(1.0)))
-        assertEquals(
-            RecognizerIntent.RESULT_AUDIO_ERROR,
-            RecognizeSpeechOutcome.captureEnded(CaptureResult.Failed("mic gone"))?.resultCode,
-        )
-        assertEquals(
-            RecognizerIntent.RESULT_AUDIO_ERROR,
-            RecognizeSpeechOutcome.captureEnded(CaptureResult.AlreadyStopped)?.resultCode,
-        )
-    }
 }

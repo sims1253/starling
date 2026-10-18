@@ -2,7 +2,6 @@ package dev.starling.mobile
 
 import android.app.Activity
 import android.speech.RecognizerIntent
-import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 
@@ -28,10 +27,4 @@ object RecognizeSpeechOutcome {
         }
     }
 
-    /** A capture that ended without a finalized recording to transcribe. */
-    fun captureEnded(result: CaptureResult): Outcome? = when (result) {
-        is CaptureResult.Completed -> null
-        is CaptureResult.Failed -> Outcome(RecognizerIntent.RESULT_AUDIO_ERROR)
-        CaptureResult.AlreadyStopped -> Outcome(RecognizerIntent.RESULT_AUDIO_ERROR)
-    }
 }
