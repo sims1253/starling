@@ -271,6 +271,16 @@ pub struct EngineSnapshot {
     pub activations_handled: u64,
 }
 
+/// The paths a read-only out-of-band run needs to start its own
+/// sidecar: the selected engine binary, the models directory, the
+/// engine log. See [`EngineManager::probe_paths`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbePaths {
+    pub engine_path: PathBuf,
+    pub models_dir: PathBuf,
+    pub log_path: PathBuf,
+}
+
 /// A take's hold on the engine that serves it (#363 step 3): requests
 /// use `endpoint` + `slug`; dropping the lease lets a draining engine
 /// stop.
@@ -522,6 +532,59 @@ struct Inner {
     shutdown: Arc<AtomicBool>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
     config: EngineConfig,
+    /// Resident-estimate bytes of model loads admitted but not yet
+    /// resident (a switch's incoming engine, a speed check's probe).
+    /// Admission decisions subtract this from the OS reading under the
+    /// same lock that registers a new load, so two loads starting
+    /// together cannot each spend the whole free-memory budget a
+    /// snapshot showed before either allocated. Conservative on
+    /// purpose: bytes already allocated by a loading engine are also
+    /// missing from the OS reading, so a load in flight is counted
+    /// slightly twice until its reservation drops — refusing a
+    /// retryable load beats OOMing the serving engine.
+    load_reserved: Arc<Mutex<u64>>,
+}
+
+/// One admitted load's claim on free memory, released on drop. The
+/// host holds a speed check's reservation for the whole run (through
+/// warmup and measurement, until just before the result is recorded);
+/// a switch holds its own until the switch ends.
+pub struct LoadReservation {
+    reserved: Arc<Mutex<u64>>,
+    bytes: u64,
+    reading: Option<u64>,
+}
+
+impl LoadReservation {
+    /// The raw free-memory reading this admission was decided against
+    /// (before subtracting other loads' reservations); `None` where no
+    /// reading exists. A caller re-checking admission downstream (the
+    /// probe's library guard) replays this snapshot instead of racing
+    /// a fresh OS reading against its own reservation.
+    pub fn reading(&self) -> Option<u64> {
+        self.reading
+    }
+
+    /// The resident-estimate bytes this reservation claims. Recovery
+    /// coordination needs it: a switch's own claim must be excluded
+    /// when asking whether its recovery load fits beside *other* loads.
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for LoadReservation {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Paired add/release under the same lock must never underflow;
+        // saturate in release so a bug degrades accounting, not the
+        // process — and say so loudly in debug builds.
+        debug_assert!(*reserved >= self.bytes, "load reservation counter underflow");
+        *reserved = reserved.saturating_sub(self.bytes);
+    }
 }
 
 impl Inner {
@@ -533,6 +596,166 @@ impl Inner {
 
     fn entry(&self, id: &str) -> Option<CatalogEntry> {
         self.catalog.iter().find(|entry| entry.id == id).cloned()
+    }
+
+    /// This manager's free-memory reading: the configured override
+    /// when present (tests), the OS's otherwise.
+    fn memory_reading(&self) -> Option<u64> {
+        self.config
+            .available_memory_override
+            .unwrap_or_else(available_memory)
+    }
+
+    /// Says so on stderr when an admission wait stops being momentary:
+    /// first after 30 s, then every five minutes with the elapsed
+    /// time, so a long contention wait is diagnosable from logs
+    /// instead of silent.
+    fn note_long_wait(waited_from: Instant, last_logged: &mut Option<Instant>) {
+        let due = match *last_logged {
+            None => waited_from.elapsed() >= Duration::from_secs(30),
+            Some(at) => at.elapsed() >= Duration::from_secs(5 * 60),
+        };
+        if due {
+            *last_logged = Some(Instant::now());
+            eprintln!(
+                "starling engine: a load has waited {:?} for memory held by another \
+                 admitted load (e.g. a speed check); it starts when that load releases it",
+                waited_from.elapsed()
+            );
+        }
+    }
+
+    fn lock_reserved(&self) -> MutexGuard<'_, u64> {
+        self.load_reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Waits until a load of `incoming_est` fits beside *other* loads'
+    /// reservations (`own_bytes` is the caller's own claim, already
+    /// registered — excluded, since the load being waited for runs
+    /// under that claim, not in addition to it). Registers nothing:
+    /// for a recovery load whose bytes the caller's reservation
+    /// already covers, where spawning immediately could still
+    /// overspend beside a probe admitted after the caller's claim was
+    /// sized. Only contention waits; with nothing else reserved the
+    /// load proceeds as it always did. `false` means cancelled.
+    ///
+    /// The fit-then-spawn gap after this returns is covered by that
+    /// same standing claim: a load admitted in the gap is decided net
+    /// of the caller's registered bytes, so it cannot spend the memory
+    /// this spawn is about to use.
+    fn wait_for_load_fit(
+        &self,
+        incoming_est: u64,
+        own_bytes: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> bool {
+        let waited_from = Instant::now();
+        let mut last_logged = None;
+        loop {
+            if cancelled() {
+                return false;
+            }
+            // The reading is an OS snapshot; take it before the lock
+            // so the critical section stays ledger arithmetic.
+            let reading = self.memory_reading();
+            {
+                let reserved = self.lock_reserved();
+                let others = reserved.saturating_sub(own_bytes);
+                let effective = reading.map(|available| available.saturating_sub(others));
+                let plan = swap_plan(effective, incoming_est, None, SWAP_MARGIN_BYTES);
+                if others == 0 || matches!(plan, SwapPlan::Rolling | SwapPlan::Unknown) {
+                    return true;
+                }
+            }
+            Self::note_long_wait(waited_from, &mut last_logged);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits until a load of `incoming_est` fits beside the loads
+    /// already admitted, then registers it — for the loads that must
+    /// eventually run (startup, crash restart, backend reload) rather
+    /// than be refused. Only *contention* waits: with no other
+    /// reservation held, the load proceeds exactly as it did before
+    /// reservations existed, even when the machine is simply low on
+    /// memory (the crash machinery handles a load that then fails).
+    /// Polls `cancelled` between attempts; `None` means the wait was
+    /// cancelled before anything registered.
+    fn wait_admit_load(
+        &self,
+        incoming_est: u64,
+        outgoing_est: Option<u64>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<LoadReservation> {
+        let waited_from = Instant::now();
+        let mut last_logged = None;
+        loop {
+            if cancelled() {
+                return None;
+            }
+            // The reading is an OS snapshot; take it before the lock
+            // so the critical section stays ledger arithmetic.
+            let reading = self.memory_reading();
+            {
+                let mut reserved = self.lock_reserved();
+                let others = *reserved;
+                let effective = reading.map(|available| available.saturating_sub(others));
+                let plan = swap_plan(effective, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
+                if others == 0 || matches!(plan, SwapPlan::Rolling | SwapPlan::Unknown) {
+                    *reserved = reserved.saturating_add(incoming_est);
+                    return Some(LoadReservation {
+                        reserved: Arc::clone(&self.load_reserved),
+                        bytes: incoming_est,
+                        reading,
+                    });
+                }
+            }
+            Self::note_long_wait(waited_from, &mut last_logged);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The swap policy's decision for an incoming load, computed
+    /// against free memory net of already-admitted loads and — unless
+    /// refused — registered in the same critical section, so a second
+    /// admission (a probe, another switch) sees this load's claim
+    /// immediately instead of after it allocates. Returns the plan,
+    /// the effective available bytes it was decided against, and the
+    /// reservation to hold while loading.
+    fn admit_switch_load(
+        &self,
+        incoming_est: u64,
+        outgoing_est: Option<u64>,
+        recovery_est: Option<u64>,
+    ) -> (SwapPlan, Option<u64>, Option<LoadReservation>) {
+        let reading = self.memory_reading();
+        let mut reserved = self.lock_reserved();
+        let effective = reading.map(|available| available.saturating_sub(*reserved));
+        let plan = swap_plan(effective, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
+        let reservation = match plan {
+            SwapPlan::Refuse { .. } => None,
+            _ => {
+                // Reserve the largest load this switch may still make:
+                // the incoming model, or — if it fails and recovery
+                // reloads the previous one under this same reservation
+                // (the outgoing engine, or the last active model when
+                // nothing serves) — that bigger load instead. A probe
+                // admitted in between must already have accounted for
+                // it, not just for the small target's estimate.
+                let bytes = incoming_est
+                    .max(outgoing_est.unwrap_or(0))
+                    .max(recovery_est.unwrap_or(0));
+                *reserved = reserved.saturating_add(bytes);
+                Some(LoadReservation {
+                    reserved: Arc::clone(&self.load_reserved),
+                    bytes,
+                    reading,
+                })
+            }
+        };
+        (plan, effective, reservation)
     }
 }
 
@@ -557,6 +780,7 @@ impl EngineManager {
             shutdown: Arc::new(AtomicBool::new(false)),
             supervisor: Mutex::new(None),
             config: config.clone(),
+            load_reserved: Arc::new(Mutex::new(0)),
         });
         let supervisor = Supervisor {
             rx: cmd_rx,
@@ -732,6 +956,69 @@ impl EngineManager {
             slug: engine.slug.clone(),
             model_id: engine.model_id.clone(),
         })
+    }
+
+    /// What a read-only out-of-band run needs to start its *own*
+    /// sidecar (#475's speed check): the selected engine binary, the
+    /// models directory and the engine log. `None` when no backend has
+    /// been selected yet — a probe then has nothing to run, which the
+    /// caller reports rather than discovering a no-op.
+    ///
+    /// This is deliberately the only engine handle a probe gets: it
+    /// spawns and stops its own process, never touching this manager's
+    /// active engine, its switch, or an in-flight take.
+    pub fn probe_paths(&self) -> Option<ProbePaths> {
+        let state = self.inner.lock();
+        let selection = state.selection.as_ref()?;
+        Some(ProbePaths {
+            engine_path: selection.path.clone(),
+            models_dir: self.inner.config.models_dir.clone(),
+            // Its own log, not the live engine's. `Sidecar::spawn`
+            // truncates the file once it passes 5 MB, so sharing would
+            // let a probe that starts while the engine is serving wipe
+            // the engine's history — and both would append to it at
+            // once besides.
+            log_path: self
+                .inner
+                .config
+                .state_dir
+                .join("logs/engine-speedcheck.log"),
+        })
+    }
+
+    /// Admits (and reserves) a probe's load of `entry`'s model as a
+    /// second resident copy alongside whatever this manager keeps
+    /// serving (#475): the swap policy's decision
+    /// ([`crate::speedcheck::check_memory_admission`]) over this
+    /// manager's reading net of loads already admitted, registered in
+    /// the same critical section — a switch admitted a moment later
+    /// (or earlier) cannot spend the same free bytes twice. The
+    /// caller holds the reservation while the probe runs; a probe
+    /// never drains the live engine to make room. `Err` is the
+    /// sentence for the user.
+    pub fn reserve_probe(&self, entry: &CatalogEntry) -> Result<LoadReservation, String> {
+        // The OS reading is a snapshot either way; take it before the
+        // lock so the critical section is only the ledger arithmetic.
+        // Atomicity lives in the count check-and-register under it.
+        let reading = self.inner.memory_reading();
+        let mut reserved = self.inner.lock_reserved();
+        let effective = reading.map(|available| available.saturating_sub(*reserved));
+        crate::speedcheck::check_memory_admission(effective, entry)
+            .map_err(|error| error.to_string())?;
+        let bytes = estimate_resident(entry.size_bytes);
+        *reserved = reserved.saturating_add(bytes);
+        Ok(LoadReservation {
+            reserved: Arc::clone(&self.inner.load_reserved),
+            bytes,
+            reading,
+        })
+    }
+
+    /// The catalog entry for `model_id`, for a run that needs the model's
+    /// file name and server slug (`crate::speedcheck`). `None` when the
+    /// id is not in this manager's catalog.
+    pub fn catalog_entry(&self, model_id: &str) -> Option<CatalogEntry> {
+        self.inner.entry(model_id)
     }
 
     /// Stops every sidecar (blocking, at most a few seconds).
@@ -1210,6 +1497,21 @@ impl Supervisor {
             state.last_active_model = Some(model_id.to_string());
             state.bump();
         }
+        // Coordinate with loads already admitted (a speed check's
+        // probe) for the whole bring-up, verification included: wait
+        // until this launch fits beside them instead of each spending
+        // the same snapshot. Uncontended — the startup common case —
+        // this registers and proceeds at once, and a probe admitted
+        // during the load now sees this claim. The reservation drops
+        // when the launch ends (success installs the engine, whose
+        // bytes the reading then shows).
+        let Some(_launch_reservation) = self.inner.wait_admit_load(
+            estimate_resident(entry.size_bytes),
+            None,
+            &|| self.inner.shutdown.load(Ordering::Acquire),
+        ) else {
+            return;
+        };
         // A hand-placed file is verified (and marked) before first use.
         if matches!(
             self.inner.lock().install.get(model_id),
@@ -1404,6 +1706,7 @@ impl Supervisor {
             confirm,
             superseded,
             inner: Arc::clone(&self.inner),
+            reserved_bytes: 0,
         };
         let inner = Arc::clone(&self.inner);
         let thread = match std::thread::Builder::new()
@@ -1617,6 +1920,10 @@ struct SwitchCtx {
     /// after a cancel (restoring the previous engine) keys off it.
     superseded: Arc<AtomicBool>,
     inner: Arc<Inner>,
+    /// Bytes this switch's own load reservation claims (0 until
+    /// admission). Recovery excludes it when asking whether restoring
+    /// the previous model fits beside *other* loads.
+    reserved_bytes: u64,
 }
 
 impl SwitchCtx {
@@ -1640,6 +1947,7 @@ impl SwitchCtx {
             confirm: Arc::clone(&self.confirm),
             superseded: Arc::clone(&self.superseded),
             inner: Arc::clone(&self.inner),
+            reserved_bytes: self.reserved_bytes,
         }
     }
 
@@ -1699,14 +2007,14 @@ impl SwitchCtx {
     }
 }
 
-fn run_switch(ctx: SwitchCtx) {
+fn run_switch(mut ctx: SwitchCtx) {
     let Some(entry) = ctx.inner.entry(&ctx.target) else {
         ctx.set_last_error(format!("unknown model {}", ctx.target));
         ctx.end_switch();
         return;
     };
     if ctx.kind == SwitchKind::Reload {
-        run_reload(&ctx, &entry);
+        run_reload(&mut ctx, &entry);
         return;
     }
 
@@ -1731,22 +2039,37 @@ fn run_switch(ctx: SwitchCtx) {
         return;
     }
 
-    // 2. Memory policy.
+    // 2. Memory policy. The decision is taken against free memory net
+    //    of loads already admitted (a speed check's probe) and this
+    //    load's own claim is registered in the same critical section,
+    //    held via `_load_reservation` until this switch ends — a probe
+    //    admitted meanwhile sees the claim instead of the pre-load
+    //    snapshot.
     let incoming_est = estimate_resident(entry.size_bytes);
-    let outgoing_est = {
+    let (outgoing_est, recovery_est) = {
         let state = ctx.lock();
-        state
+        let outgoing = state
             .active
             .as_ref()
             .and_then(|engine| ctx.inner.entry(&engine.model_id))
-            .map(|outgoing| estimate_resident(outgoing.size_bytes))
+            .map(|outgoing| estimate_resident(outgoing.size_bytes));
+        // The model recovery would reload if this switch fails with
+        // nothing serving (`recover_if_idle` reads the same field).
+        let recovery = state
+            .last_active_model
+            .as_deref()
+            .filter(|id| *id != ctx.target)
+            .and_then(|id| ctx.inner.entry(id))
+            .map(|previous| estimate_resident(previous.size_bytes));
+        (outgoing, recovery)
     };
-    let available = ctx
-        .inner
-        .config
-        .available_memory_override
-        .unwrap_or_else(available_memory);
-    let plan = swap_plan(available, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
+    let (plan, available, _load_reservation) =
+        ctx.inner
+            .admit_switch_load(incoming_est, outgoing_est, recovery_est);
+    ctx.reserved_bytes = _load_reservation
+        .as_ref()
+        .map(|reservation| reservation.bytes())
+        .unwrap_or(0);
 
     match plan {
         SwapPlan::Refuse { needed, available } => {
@@ -2253,6 +2576,23 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
         return;
     };
     let recovery = ctx.recovery();
+    // This switch's reservation already covers the previous model's
+    // bytes (admission reserved the largest load it may still make),
+    // but a probe admitted *after* that admission may have been sized
+    // against a moment when the recovery claim was still just the
+    // target's estimate in a reader's snapshot — so coordinate the
+    // spawn itself: wait until the recovery load fits beside other
+    // loads' claims (this switch's own excluded), rather than spawning
+    // into memory another admitted load is about to spend. Cancelled
+    // here means superseded or shutting down: a newer intent decides
+    // what serves, exactly as a cancelled spawn would end.
+    if !ctx.inner.wait_for_load_fit(
+        estimate_resident(entry.size_bytes),
+        ctx.reserved_bytes,
+        &|| recovery.cancelled(),
+    ) {
+        return;
+    }
     recovery.set_stage(SwitchStage::Loading);
     match spawn_incoming(&recovery, &entry, false) {
         Ok(engine) => {
@@ -2289,7 +2629,24 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
 /// Restarts the active model on the newly selected backend (the CPU
 /// toggle). The old engine keeps serving until the cutover and then
 /// drains. A newer activation cancels this like any switch.
-fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
+fn run_reload(ctx: &mut SwitchCtx, entry: &CatalogEntry) {
+    // A backend reload loads a second copy beside the serving one, so
+    // it waits until that copy fits beside loads already admitted (a
+    // speed check's probe) instead of overspending behind them. With
+    // nothing else admitted it proceeds exactly as before — a reload
+    // never asked the memory policy whether the machine, uncontended,
+    // can hold it. Cancelled while waiting, the previous engine simply
+    // keeps serving on the old backend.
+    let est = estimate_resident(entry.size_bytes);
+    let Some(_load_reservation) = ctx.inner.wait_admit_load(est, Some(est), &|| ctx.cancelled())
+    else {
+        ctx.end_switch();
+        return;
+    };
+    // Keep the context's accounting truthful for any recovery path
+    // ever reached from here (today: none — a failed reload keeps the
+    // old engine serving instead of recovering).
+    ctx.reserved_bytes = _load_reservation.bytes();
     ctx.set_stage(SwitchStage::Loading);
     match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {
@@ -2550,6 +2907,7 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             supervisor: Mutex::new(None),
             config: config.clone(),
+            load_reserved: Arc::new(Mutex::new(0)),
         });
         Supervisor {
             rx,

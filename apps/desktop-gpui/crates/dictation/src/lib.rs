@@ -17,3 +17,4 @@ pub mod recorder;
 pub mod settings;
 pub mod storage;
 pub mod store_v2;
+pub mod speedcheck;

@@ -19,6 +19,20 @@ pub const SWAP_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 /// activations, and the audio/journal pipeline around the weights.
 pub const RESIDENT_OVERHEAD_BYTES: u64 = 384 * 1024 * 1024;
 
+/// A byte size spelled for a person: one decimal place, MB below a
+/// thousand and GB above. The one spelling, shared by every memory
+/// sentence the app or a probe refusal produces, so the numbers read
+/// the same whichever path produced them.
+pub fn fmt_size(bytes: u64) -> String {
+    const MB: f64 = 1_000_000.;
+    let mb = bytes as f64 / MB;
+    if mb >= 1000. {
+        format!("{:.1} GB", mb / 1000.)
+    } else {
+        format!("{:.1} MB", mb)
+    }
+}
+
 /// Conservative system-RAM estimate for a loaded model of `file_size`
 /// bytes: weights + 1/8 of the weights (quantization scratch, KV-ish
 /// state) + a fixed pipeline overhead. Prefer over-asking to OOM: when
