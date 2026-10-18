@@ -772,6 +772,22 @@ impl EngineManager {
         })
     }
 
+    /// Whether a probe may load `entry`'s model as a second resident
+    /// copy alongside whatever this manager keeps serving (#475): the
+    /// swap policy's decision ([`crate::speedcheck::check_memory_admission`])
+    /// over this manager's own memory reading — the configured override
+    /// (tests) or the OS's. `Err` is the sentence for the user; the
+    /// probe never drains the live engine to make room.
+    pub fn probe_admission(&self, entry: &CatalogEntry) -> Result<(), String> {
+        let available = self
+            .inner
+            .config
+            .available_memory_override
+            .unwrap_or_else(available_memory);
+        crate::speedcheck::check_memory_admission(available, entry)
+            .map_err(|error| error.to_string())
+    }
+
     /// The catalog entry for `model_id`, for a run that needs the model's
     /// file name and server slug (`crate::speedcheck`). `None` when the
     /// id is not in this manager's catalog.

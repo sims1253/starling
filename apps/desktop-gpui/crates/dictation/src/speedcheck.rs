@@ -302,6 +302,68 @@ pub enum SpeedCheckError {
     Transcribe { kind: ProbeKind, reason: String },
     #[error("the speed check was cancelled")]
     Cancelled,
+    /// Loading a second resident model would not fit in the memory
+    /// currently free. The numbers are the swap policy's (#363):
+    /// `needed` is the conservative resident estimate plus its margin,
+    /// `available` what the OS reported free.
+    #[error(
+        "not enough free memory to measure {model_id} alongside the running engine \
+         (needs about {}, {} available); the current model keeps serving",
+        fmt_bytes(*needed),
+        fmt_bytes(*available)
+    )]
+    InsufficientMemory {
+        model_id: String,
+        needed: u64,
+        available: u64,
+    },
+}
+
+/// One decimal place, MB below a thousand and GB above — the same
+/// spelling the app's switch refusal uses, so a memory sentence reads
+/// the same whichever path produced it.
+fn fmt_bytes(bytes: u64) -> String {
+    const MB: f64 = 1_000_000.;
+    let mb = bytes as f64 / MB;
+    if mb >= 1000. {
+        format!("{:.1} GB", mb / 1000.)
+    } else {
+        format!("{:.1} MB", mb)
+    }
+}
+
+/// Whether loading `entry`'s model as a *second* resident copy fits in
+/// `available` free memory, under the same policy a model swap obeys
+/// (#363): the probe may load alongside the live engine only when the
+/// pair fits without freeing anything — it must never drain or OOM the
+/// engine serving the user's takes. `available` is a parameter (the
+/// caller reads the OS, or its test override) so the decision itself
+/// stays pure. No reading (`None`, macOS) admits the run, matching the
+/// swap policy's Unknown handling rather than disabling the feature
+/// where no honest number exists.
+pub fn check_memory_admission(
+    available: Option<u64>,
+    entry: &CatalogEntry,
+) -> Result<(), SpeedCheckError> {
+    use crate::engine::memory::{estimate_resident, swap_plan, SwapPlan, SWAP_MARGIN_BYTES};
+    let incoming = estimate_resident(entry.size_bytes);
+    let needed = incoming.saturating_add(SWAP_MARGIN_BYTES);
+    match swap_plan(available, incoming, None, SWAP_MARGIN_BYTES) {
+        SwapPlan::Rolling | SwapPlan::Unknown => Ok(()),
+        SwapPlan::Refuse { needed, available } => Err(SpeedCheckError::InsufficientMemory {
+            model_id: entry.id.clone(),
+            needed,
+            available,
+        }),
+        // Unreachable with nothing to drain (NeedsDrain needs an
+        // outgoing estimate), but a probe that cannot fit alongside is
+        // refused whatever the policy calls the shortfall.
+        SwapPlan::NeedsDrain { .. } => Err(SpeedCheckError::InsufficientMemory {
+            model_id: entry.id.clone(),
+            needed,
+            available: available.unwrap_or(0),
+        }),
+    }
 }
 
 /// Everything a probe run needs about one model, without the app's
@@ -375,6 +437,14 @@ pub fn run_speed_check(
             model_id: target.entry.id.clone(),
         });
     }
+    // The probe loads a second resident copy next to whatever engine is
+    // serving; the swap policy gets its say before anything spawns, so
+    // a machine that can run one model but not two refuses here instead
+    // of finding out through an allocation failure mid-take. A caller
+    // with its own memory reading (the host) repeats this with its
+    // override before it starts the run; this is the guard for direct
+    // callers.
+    check_memory_admission(crate::engine::memory::available_memory(), &target.entry)?;
 
     let sidecar = Sidecar::spawn(
         &target.engine_path,
@@ -390,37 +460,43 @@ pub fn run_speed_check(
     // nobody can cancel needs no thread, and nothing to report about
     // one. The flag is the only channel the sidecar understands, so the
     // watcher polls rather than awaits it.
-    let watcher = cancel.map(|token| {
-        let cancel_flag = Arc::clone(&engine_cancel);
-        // And the watcher's own stop: without it, a token that is never
-        // cancelled would keep it polling for the process's life, and
-        // joining it on the way out would hang the caller.
-        let watching = Arc::new(AtomicBool::new(true));
-        let watch_flag = Arc::clone(&watching);
-        let token = token.clone();
-        let handle = std::thread::Builder::new()
-            .name("starling-speedcheck-cancel".into())
-            .spawn(move || {
-                while watch_flag.load(Ordering::Acquire) {
-                    if token.is_cancelled() {
-                        cancel_flag.store(true, Ordering::Release);
-                        return;
+    let watcher = match cancel {
+        None => None,
+        Some(token) => {
+            let cancel_flag = Arc::clone(&engine_cancel);
+            // And the watcher's own stop: without it, a token that is never
+            // cancelled would keep it polling for the process's life, and
+            // joining it on the way out would hang the caller.
+            let watching = Arc::new(AtomicBool::new(true));
+            let watch_flag = Arc::clone(&watching);
+            let token = token.clone();
+            // A watcher that cannot start fails the run rather than
+            // degrading it: without the watcher nothing carries the
+            // caller's cancel into `wait_ready`, so a caller that asked
+            // for cancellation (the host, shutting down) could be held
+            // for the whole loading budget with a cancel that visibly
+            // did nothing. Returning here drops the sidecar, which
+            // stops it.
+            let handle = std::thread::Builder::new()
+                .name("starling-speedcheck-cancel".into())
+                .spawn(move || {
+                    while watch_flag.load(Ordering::Acquire) {
+                        if token.is_cancelled() {
+                            cancel_flag.store(true, Ordering::Release);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            })
-            .ok();
-        (handle, watching)
-    });
-    if cancel.is_some() && watcher.as_ref().is_some_and(|(handle, _)| handle.is_none()) {
-        // Cancellation degrades rather than failing: the probe still
-        // measures, it just cannot be stopped. On stderr, like the
-        // crate's other "I could not do this thing" notes, so nobody
-        // has to wonder later why a cancel did nothing.
-        eprintln!(
-            "speed check: the cancel watcher could not be started; this run cannot be cancelled"
-        );
-    }
+                })
+                .map_err(|error| SpeedCheckError::EngineStart {
+                    reason: format!(
+                        "the cancel watcher could not be started ({error}); \
+                         a run that cannot be cancelled is not started"
+                    ),
+                })?;
+            Some((Some(handle), watching))
+        }
+    };
     let _watch_guard = JoinOnDrop(watcher);
     // Declared after the watcher's guard on purpose: drop order is reverse
     // of declaration, so on any return path the sidecar is stopped before
@@ -743,5 +819,39 @@ mod tests {
                 model_id: "missing".to_string()
             }
         );
+    }
+
+    #[test]
+    fn memory_admission_refuses_when_a_second_resident_copy_cannot_fit() {
+        let entry = CatalogEntry::new(
+            "big",
+            "Big",
+            "parakeet",
+            "http://127.0.0.1/big.gguf",
+            1_000_000_000,
+            "00",
+            false,
+            "a one-gigabyte model",
+        );
+        // One byte free: the probe may not load beside the live engine,
+        // and the refusal carries the policy's numbers.
+        let refused = check_memory_admission(Some(1), &entry)
+            .expect_err("a second resident model cannot fit in one free byte");
+        match refused {
+            SpeedCheckError::InsufficientMemory {
+                model_id,
+                needed,
+                available,
+            } => {
+                assert_eq!(model_id, "big");
+                assert!(needed > 1_000_000_000, "{needed}");
+                assert_eq!(available, 1);
+            }
+            other => panic!("expected InsufficientMemory, got {other:?}"),
+        }
+        // No reading admits rather than disabling the check, and ample
+        // memory admits by fitting.
+        check_memory_admission(None, &entry).expect("no reading admits");
+        check_memory_admission(Some(u64::MAX), &entry).expect("ample memory admits");
     }
 }

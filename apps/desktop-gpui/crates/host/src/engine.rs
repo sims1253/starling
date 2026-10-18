@@ -251,11 +251,6 @@ pub enum SpeedCheckStatus {
     Failed { model_id: String, message: String },
 }
 
-/// Records the speed check's state and bumps its generation, so the
-/// engine feed pushes the change to every watching window. Both the
-/// starting thread and the worker write through this, which is what
-/// keeps `Running` ordered before any terminal state no matter which
-/// thread gets there first.
 /// The payload of a `catch_unwind` panic as text.
 fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
     payload
@@ -265,6 +260,12 @@ fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
+/// Records the speed check's state and bumps its generation, so the
+/// engine feed pushes the change to every watching window. Both the
+/// starting thread and the worker write through this, so no state
+/// change can land without its generation bump. The write itself does
+/// not order `Running` before a terminal state — `start_speed_check`
+/// establishes that by writing `Running` *before* the worker spawns.
 fn record_speed_check(
     slot: &Mutex<Option<SpeedCheckStatus>>,
     generation: &AtomicU64,
@@ -530,6 +531,16 @@ pub struct EngineHost {
     /// Bumped whenever `speed_check` would read differently, so the
     /// engine feed carries a running check's progress out.
     speed_check_generation: Arc<AtomicU64>,
+    /// The host-lifetime cancellation every speed-check worker carries:
+    /// tripped when shutdown begins, so a probe never outlives the
+    /// host that owns its sidecar. Never tripped otherwise — a
+    /// user-facing cancel would be a request of its own.
+    speed_check_cancel: starling_dictation::client::CancelToken,
+    /// The running speed-check worker, so shutdown can join it instead
+    /// of leaving its thread (and the status it would still write)
+    /// behind. `None` until a check starts; a finished worker's handle
+    /// stays until the next check or shutdown takes it.
+    speed_check_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// What the host runs right now.
@@ -633,6 +644,8 @@ impl EngineHost {
             revision: AtomicU64::new(0),
             speed_check: Arc::new(Mutex::new(None)),
             speed_check_generation: Arc::new(AtomicU64::new(0)),
+            speed_check_cancel: starling_dictation::client::CancelToken::new(),
+            speed_check_worker: Mutex::new(None),
         }
     }
 
@@ -665,9 +678,8 @@ impl EngineHost {
     }
 
     /// Whether the recorded speed check is the one for `model_id`. The
-    /// "one check at a time" guard and the delete path's clear both read
-    /// this, so the invariant lives in one place rather than in two
-    /// inline matches that can drift.
+    /// delete path's clear reads this: a report for a model the user
+    /// just removed must not keep rendering under its row.
     fn speed_check_is_for(&self, model_id: &str) -> bool {
         matches!(
             &*lock(&self.speed_check),
@@ -675,9 +687,10 @@ impl EngineHost {
         )
     }
 
-    /// Whether a speed check is running for `model_id`. Both the "one
-    /// check at a time" guard and the delete refusal read this, so the
-    /// two rules cannot drift apart.
+    /// Whether a speed check is running for `model_id`. The delete
+    /// refusal reads this (the "one check at a time" guard in
+    /// `start_speed_check` asks the model-agnostic question instead —
+    /// any `Running`, whichever model).
     fn speed_check_running_for(&self, model_id: &str) -> bool {
         matches!(
             &*lock(&self.speed_check),
@@ -960,6 +973,22 @@ impl EngineHost {
             );
             return EngineReply::Refused { message };
         };
+        // The probe loads a second resident copy beside the live
+        // engine; the memory policy decides before anything records
+        // `Running`, so a machine that fits one model but not two
+        // refuses here — recorded on the row like the no-engine path
+        // above, since the numbers are what the user can act on.
+        if let Err(message) = manager.probe_admission(&entry) {
+            record_speed_check(
+                &self.speed_check,
+                &self.speed_check_generation,
+                Some(SpeedCheckStatus::Failed {
+                    model_id: model_id.to_string(),
+                    message: message.clone(),
+                }),
+            );
+            return EngineReply::Refused { message };
+        }
         let target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
 
         let outcome_slot = Arc::clone(&self.speed_check);
@@ -990,12 +1019,16 @@ impl EngineHost {
         // host restarts. `handle()` is serialized on this one worker
         // thread, so the window between the write and the spawn is
         // invisible to a second request either way.
-        // The worker is detached on purpose: the sidecar it owns is
-        // spawned with `--parent-pid`, so the engine process goes with
-        // this host even if the thread lingers past teardown. That is the
-        // same backstop `EngineManager` relies on. Cancelling a running
-        // check needs a request and a UI affordance of its own (#475
-        // follow-up); the probe's `cancel` seam is ready for one.
+        // The worker carries the host-lifetime cancel token and its
+        // handle is kept, so shutdown cancels the probe and joins this
+        // thread before the host releases anything: a detached worker
+        // would otherwise outlive `shutdown()` still owning its
+        // sidecar and still owing the status a write. The sidecar's
+        // `--parent-pid` stays as the backstop for a host that dies
+        // without shutting down, the same one `EngineManager` relies
+        // on. Cancelling an individual running check still needs a
+        // request and a UI affordance of its own (#475 follow-up).
+        let cancel = self.speed_check_cancel.clone();
         let worker = std::thread::Builder::new()
             .name("starling-speedcheck".into())
             .spawn(move || {
@@ -1008,7 +1041,7 @@ impl EngineHost {
                         &target,
                         starling_dictation::speedcheck::ALL_PROBES,
                         &|_| {},
-                        None,
+                        Some(&cancel),
                     )
                 }))
                 .unwrap_or_else(|payload| {
@@ -1040,21 +1073,33 @@ impl EngineHost {
                 };
                 record_speed_check(&outcome_slot, &generation, Some(status));
             });
-        if let Err(error) = worker {
-            // The spawn failed, so no worker will ever clear the state:
-            // roll it back here, and say so in the reply. One sentence for
-            // both, so the recorded status and what the caller reads can
-            // never disagree.
-            let message = format!("The speed check could not be started ({error}).");
-            record_speed_check(
-                &starting_slot,
-                &starting_generation,
-                Some(SpeedCheckStatus::Failed {
-                    model_id: model_id.to_string(),
-                    message: message.clone(),
-                }),
-            );
-            return EngineReply::Refused { message };
+        match worker {
+            Ok(handle) => {
+                // Keep the handle for shutdown's join. A previous
+                // worker's handle can only be a finished thread: the
+                // `Running` guard above refused to start this one
+                // until it recorded its terminal state, after which
+                // nothing it owns is left running.
+                if let Some(previous) = lock(&self.speed_check_worker).replace(handle) {
+                    drop(previous);
+                }
+            }
+            Err(error) => {
+                // The spawn failed, so no worker will ever clear the
+                // state: roll it back here, and say so in the reply. One
+                // sentence for both, so the recorded status and what the
+                // caller reads can never disagree.
+                let message = format!("The speed check could not be started ({error}).");
+                record_speed_check(
+                    &starting_slot,
+                    &starting_generation,
+                    Some(SpeedCheckStatus::Failed {
+                        model_id: model_id.to_string(),
+                        message: message.clone(),
+                    }),
+                );
+                return EngineReply::Refused { message };
+            }
         }
         done
     }
@@ -1350,6 +1395,10 @@ impl EngineHost {
     /// this before it joins the settings watcher.
     pub fn begin_shutdown(&self) {
         self.closing.store(true, Ordering::SeqCst);
+        // A running speed check stops with the host: trip its cancel
+        // now, while the connection drain still runs, so by the time
+        // `shutdown` joins the worker it is already unwinding.
+        self.speed_check_cancel.cancel();
     }
 
     /// Stops the engine this host supervises (a no-op in manual mode).
@@ -1357,6 +1406,22 @@ impl EngineHost {
     /// shutdown path, after the settings watcher stopped and the
     /// runtime's machines joined.
     pub fn shutdown(&self) {
+        // The speed-check worker first: cancelled (again — `begin_shutdown`
+        // tripped it, and a direct caller of only this method gets the
+        // same stop) and joined, bounded, so no probe process and no
+        // pending status write outlives the host. A worker that somehow
+        // outlasts the bound is detached rather than holding shutdown
+        // hostage; its sidecar's `--parent-pid` backstop still applies.
+        self.speed_check_cancel.cancel();
+        if let Some(worker) = lock(&self.speed_check_worker).take() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
         // Clone out and release the state lock before the blocking stop,
         // so status reads (`label()`, `manager()`) never wait behind it.
         let manager = self.manager();
