@@ -91,6 +91,7 @@ target/
 local.properties
 playwright-report/
 test-results/
+.e2e/
 *.tsbuildinfo
 
 # Apple build products and user state

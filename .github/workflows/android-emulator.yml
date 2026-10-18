@@ -2,16 +2,31 @@ name: Android emulator
 
 # Instrumented tests on a Pixel-profile emulator: platform wiring (recognition
 # service discovery, model import, activity launch) that JVM unit tests in
-# apps.yml cannot see. Slow, so it runs only when the Android app changes.
+# apps.yml cannot see, followed by a UI journey with real inference and audio
+# evidence. Runs when the Android app or its native dependencies change.
 on:
   push:
     branches: [main, master]
     paths:
       - apps/mobile/**
+      - cpp/**
+      - third_party/**
+      - packages/contracts/**
+      - tests/fixtures/**
+      - CMakeLists.txt
+      - CMakePresets.json
+      - scripts/apply_ggml_patches.sh
       - .github/workflows/android-emulator.yml
   pull_request:
     paths:
       - apps/mobile/**
+      - cpp/**
+      - third_party/**
+      - packages/contracts/**
+      - tests/fixtures/**
+      - CMakeLists.txt
+      - CMakePresets.json
+      - scripts/apply_ggml_patches.sh
       - .github/workflows/android-emulator.yml
   workflow_dispatch:
 
@@ -47,6 +62,21 @@ jobs:
           distribution: temurin
           java-version: 17
           cache: gradle
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.8.0
+          cache: npm
+          cache-dependency-path: apps/mobile/e2e/package-lock.json
+      - name: Install audio evidence tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install acceptance test dependencies
+        working-directory: apps/mobile/e2e
+        env:
+          E2E_TELEMETRY_DISABLED: '1'
+        run: |
+          npm ci
+          npm run check
+          npm run test:verifier
       - name: Enable KVM
         shell: bash
         run: |
@@ -58,7 +88,7 @@ jobs:
         working-directory: apps/mobile
         shell: bash
         run: ./gradlew --no-daemon -PstarlingCompilerLauncher=ccache assembleDebug assembleDebugAndroidTest
-      - name: Run instrumented tests
+      - name: Run instrumented and acceptance tests
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 35
@@ -68,11 +98,20 @@ jobs:
           ram-size: 4096M
           disable-animations: true
           working-directory: apps/mobile
-          script: ./gradlew --no-daemon -PstarlingCompilerLauncher=ccache connectedDebugAndroidTest
+          script: |
+            ./gradlew --no-daemon -PstarlingCompilerLauncher=ccache connectedDebugAndroidTest
+            cd e2e && npm test
       - name: Upload test reports
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: android-instrumented-reports
           path: apps/mobile/app/build/reports/androidTests
+          retention-days: 7
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: android-acceptance-evidence
+          path: apps/mobile/e2e/artifacts
           retention-days: 7
