@@ -18,6 +18,7 @@ These cases define the checks before implementation:
 - An injected transcription failure must retain audio for a successful UI retry.
 - A failed test or evidence check must fail the command and CI job.
 - Passing runs must retain evidence too, including inputs and a rerun command.
+- Manifest paths and symlinks must stay within the downloaded evidence directory.
 
 The fixture replaces microphone hardware only. This pilot does not verify a
 physical microphone, keyboard insertion, interrupted capture, iOS, or GPUI

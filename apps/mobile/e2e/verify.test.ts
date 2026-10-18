@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { test } from 'node:test';
 import { command, fixture, hash, jsonFile, model, pcm, reference } from './support.ts';
 import { verify } from './verify.ts';
@@ -16,6 +16,7 @@ test('independently verifies audio and rejects incomplete or altered evidence', 
     raw_transcript: reference, revisions: [{ text: reference, model: model.name }] };
   const report = { run: { exitCode: 0, results: [{ status: 'passed' }] } };
   const manifest = { model, files: {} as Record<string, string> };
+  const outside = resolve(dir, '..', `${basename(dir)}-outside.txt`);
   try {
     copyFileSync(fixture, resolve(dir, 'input.wav'));
     jsonFile(resolve(dir, 'journey.json'), { recordingId: id, transcript: reference });
@@ -43,6 +44,19 @@ test('independently verifies audio and rejects incomplete or altered evidence', 
     reset();
     assert.doesNotThrow(() => verify(dir));
 
+    writeFileSync(outside, 'outside the evidence bundle');
+    const escape = `../${basename(outside)}`;
+    manifest.files[escape] = hash(readFileSync(outside));
+    jsonFile(resolve(dir, 'manifest.json'), manifest);
+    assert.throws(() => verify(dir), /escapes evidence directory/);
+    delete manifest.files[escape];
+    symlinkSync(outside, resolve(dir, 'outside-link'));
+    manifest.files['outside-link'] = hash(readFileSync(outside));
+    jsonFile(resolve(dir, 'manifest.json'), manifest);
+    assert.throws(() => verify(dir), /escapes evidence directory/);
+    delete manifest.files['outside-link'];
+    reset();
+
     jsonFile(resolve(dir, 'runner/report.json'), { run: { exitCode: 0, results: [{ status: 'skipped' }] } });
     assert.throws(() => verify(dir), /Skipped or filtered/);
     reset();
@@ -62,5 +76,8 @@ test('independently verifies audio and rejects incomplete or altered evidence', 
     reset();
     rmSync(resolve(dir, 'runner/video.mp4'));
     assert.throws(() => verify(dir), /Keep video/);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
+  }
 });
