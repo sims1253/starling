@@ -147,6 +147,9 @@ without them `assembleRelease` produces an unsigned APK.
 
 ## Build and run
 
+For the recorder's UI acceptance test and independently verifiable audio
+evidence, see [Run the Android acceptance journey](e2e/README.md).
+
 From this directory:
 
 ```bash
