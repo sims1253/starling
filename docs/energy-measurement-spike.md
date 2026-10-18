@@ -23,7 +23,8 @@ not feasible in v1; report time + peak RSS and label energy as unknown.**
 
 - `BatteryManager` exposes `BATTERY_PROPERTY_CURRENT_NOW` (µA) on some
   devices; Pixel firmware typically returns a coarse estimate or does not
-  support it (the property reports `0`/unsupported per the API contract).
+  support it (`getIntProperty()` returns `Integer.MIN_VALUE` for an
+  unsupported property per the API contract).
   `BATTERY_PROPERTY_ENERGY_COUNTER` (nanowatt-hours) is even less
   consistently populated.
 - `batterystats` is a *model*, not a rail measurement: it attributes
