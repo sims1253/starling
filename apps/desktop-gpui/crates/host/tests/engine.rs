@@ -1992,8 +1992,13 @@ fn recovery_waits_for_a_probe_admitted_before_the_switch() {
 
     app.engine(EngineRequest::CancelSwitch).expect("answered");
     // Recovery of the big model must not spawn beside the held probe.
+    // The window starts only once the cancelled target has exited —
+    // recovery runs immediately after that, so spawning then is
+    // observable; starting the clock at the CancelSwitch reply would
+    // let slow teardown, not coordination, pass the test.
+    wait_count(&small_gguf, 0, "the cancelled target exited");
     if count(&big_gguf).is_some() {
-        let settle = Instant::now() + Duration::from_millis(700);
+        let settle = Instant::now() + Duration::from_secs(1);
         while Instant::now() < settle {
             assert_eq!(
                 count(&big_gguf),
