@@ -193,6 +193,21 @@ class TakeRecorderTest {
     }
 
     @Test
+    fun rejectedPrivateTranscriptionDeletesAudioWithoutWaitingForACallback() {
+        for (live in listOf(false, true)) {
+            val f = Fixture()
+            f.transcriber.live = live
+            f.transcriber.queued = false
+            val take = f.start(ephemeral = true)
+            take.stop()
+            f.audio.stops.single()(CaptureResult.Completed(1.0))
+            assertTrue(f.transcriber.completions.isEmpty())
+            assertTrue("a rejected private take must leave no saved audio", f.store.rows.isEmpty())
+            assertTrue(f.transcriber.sessions.all { it.closed })
+        }
+    }
+
+    @Test
     fun callbacksFromStoppedTakesCannotAffectTheNextTake() {
         val f = Fixture()
         val seen = mutableListOf<StreamEvent>()

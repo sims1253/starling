@@ -137,7 +137,10 @@ class TakeRecorder internal constructor(
                             val queued = if (stream != null) transcription.finish(stream, saved, done)
                             else transcription.transcribe(saved, done)
                             // A rejected stream was not transferred to a worker.
-                            if (!queued) stream?.close()
+                            if (!queued) {
+                                stream?.close()
+                                if (ephemeral) delete()
+                            }
                         }
                         onStopped(Stopped.Saved(saved, result))
                     }
