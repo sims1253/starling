@@ -17,10 +17,28 @@
 //!
 //! Not ported here: the oracle's `activity_by_day` local-calendar grouping,
 //! which needs a timezone database.
+//!
+//! # Representable range
+//!
+//! The oracle computes with Python's unbounded integers; this port's
+//! counts are `u64`. Within `u64` the two agree exactly, including the
+//! oracle's `int(float(count))` normalization above 2^53, which
+//! `aggregate` reproduces where the oracle applies it. Beyond it the
+//! port refuses rather than diverges: a count (or a JSON number) that
+//! does not fit `u64` fails to parse, and a total that overflows `u64`
+//! is an [`InsightError`], never a panic or a wrapped zero. Two parse
+//! edges follow from the schema rather than the oracle's untyped dicts:
+//! non-integral numbers for `integer` fields are rejected (the oracle
+//! would truncate them), and the `*_ms` timings are `f64`, so two
+//! distinct integer timings above 2^53 ms (~285,000 years) compare
+//! equal for replay-conflict purposes — their metrics are identical
+//! either way, since the oracle also float-converts waits before
+//! summing them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::contract::{FailureReason, Locality, ProviderKind, ResultStatus, TransformKind};
 use crate::insight::Arrival;
@@ -36,6 +54,107 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 pub const TIME_COMPARISON_CAVEAT: &str = "Estimate excludes unobserved correction time; \
      generated words are not speech and never enter this estimate.";
 
+/// How JSON Schema (and the Python oracle) read an `integer` field: a
+/// numeral with a zero fractional part, so `1.0` is the integer `1`.
+/// serde's plain `u64`/`u32` reject `1.0`, which would make this port
+/// refuse schema-valid events the oracle aggregates. Integers that do
+/// not fit are refused, as are negatives and non-integral numbers (see
+/// the module's representable range). Sequence fields do NOT use this:
+/// the oracle requires an actual `int` there (`type(seq) is int`), so a
+/// float sequence is an error in both implementations.
+struct IntegralU64;
+
+impl Visitor<'_> for IntegralU64 {
+    type Value = u64;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a nonnegative integer")
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<u64, E> {
+        Ok(value)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<u64, E>
+    where
+        E: serde::de::Error,
+    {
+        u64::try_from(value).map_err(|_| E::custom("integer is negative"))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<u64, E>
+    where
+        E: serde::de::Error,
+    {
+        // 2^64 as f64 is exact; anything at or above it cannot fit.
+        if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value < 18_446_744_073_709_551_616.0 {
+            Ok(value as u64)
+        } else {
+            Err(E::custom("number is not an in-range nonnegative integer"))
+        }
+    }
+}
+
+fn de_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(IntegralU64)
+}
+
+fn de_u32<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u32::try_from(de_u64(deserializer)?)
+        .map_err(|_| D::Error::custom("integer does not fit u32"))
+}
+
+/// A schema-required key whose value may be `null`. serde feeds a plain
+/// `Option` field `None` when the key is *absent*, which would silently
+/// turn a malformed event (and a missing-vs-null replay conflict the
+/// oracle rejects) into an unknown wait. Routing through
+/// `deserialize_with` makes the key mandatory while keeping `null`
+/// legal — exactly the schema's `required` + `["…", "null"]`.
+fn de_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// [`de_required_nullable`] with an integral `u64` when present.
+fn de_required_nullable_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct NullableU64;
+    impl<'de> Visitor<'de> for NullableU64 {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a nonnegative integer or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            de_u64(deserializer).map(Some)
+        }
+    }
+    deserializer.deserialize_option(NullableU64)
+}
+
 // Every event carries `schema_version`, `event_id`, `capture_id` and
 // `occurred_at`; each struct repeats those fields rather than flattening a
 // shared header, because serde cannot combine `flatten` with
@@ -49,11 +168,14 @@ pub const TIME_COMPARISON_CAVEAT: &str = "Estimate excludes unobserved correctio
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureFinalized {
+    #[serde(deserialize_with = "de_u32")]
     pub schema_version: u32,
     pub event_id: String,
     pub capture_id: String,
     pub occurred_at: String,
+    #[serde(deserialize_with = "de_u64")]
     pub sample_count: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub sample_rate: u64,
     pub complete_audio: bool,
     pub mode_id: String,
@@ -67,15 +189,19 @@ pub struct CaptureFinalized {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecognitionSelected {
+    #[serde(deserialize_with = "de_u32")]
     pub schema_version: u32,
     pub event_id: String,
     pub capture_id: String,
     pub occurred_at: String,
     pub attempt_id: String,
     pub selection_seq: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub lexical_words: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub raw_words: u64,
     pub tokenizer: String,
+    #[serde(deserialize_with = "de_required_nullable")]
     pub post_stop_ready_ms: Option<f64>,
 }
 
@@ -84,10 +210,15 @@ pub struct RecognitionSelected {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeCounts {
+    #[serde(deserialize_with = "de_u64")]
     pub structural: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub user: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub dictionary: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub snippet: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub style: u64,
 }
 
@@ -95,6 +226,7 @@ pub struct ChangeCounts {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransformationCompleted {
+    #[serde(deserialize_with = "de_u32")]
     pub schema_version: u32,
     pub event_id: String,
     pub capture_id: String,
@@ -102,6 +234,7 @@ pub struct TransformationCompleted {
     pub revision_id: String,
     pub revision_seq: u64,
     pub transformation_kind: TransformationKind,
+    #[serde(deserialize_with = "de_u32")]
     pub formula_version: u32,
     pub change_counts: ChangeCounts,
 }
@@ -133,6 +266,7 @@ pub enum DeliveryStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryRecorded {
+    #[serde(deserialize_with = "de_u32")]
     pub schema_version: u32,
     pub event_id: String,
     pub capture_id: String,
@@ -140,7 +274,9 @@ pub struct DeliveryRecorded {
     pub delivery_id: String,
     pub delivery_seq: u64,
     pub status: DeliveryStatus,
+    #[serde(deserialize_with = "de_u64")]
     pub output_words: u64,
+    #[serde(deserialize_with = "de_u64")]
     pub generated_words: u64,
 }
 
@@ -149,23 +285,29 @@ pub struct DeliveryRecorded {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessingRecorded {
+    #[serde(deserialize_with = "de_u32")]
     pub schema_version: u32,
     pub event_id: String,
     pub capture_id: String,
     pub occurred_at: String,
     pub job_id: String,
     pub mode_id: String,
+    #[serde(deserialize_with = "de_u64")]
     pub mode_version: u64,
     pub provider_kind: ProviderKind,
     pub locality: Locality,
     pub transform_kinds: Vec<TransformKind>,
     pub status: ResultStatus,
+    #[serde(deserialize_with = "de_required_nullable")]
     pub failure_reason: Option<FailureReason>,
     pub arrival: Arrival,
     pub queued_ms: f64,
     pub processing_ms: f64,
+    #[serde(deserialize_with = "de_required_nullable")]
     pub stop_to_result_ms: Option<f64>,
+    #[serde(deserialize_with = "de_u64")]
     pub input_chars: u64,
+    #[serde(deserialize_with = "de_required_nullable_u64")]
     pub output_chars: Option<u64>,
 }
 
@@ -174,6 +316,7 @@ pub struct ProcessingRecorded {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureDeleted {
+    #[serde(deserialize_with = "de_u32")]
     pub schema_version: u32,
     pub event_id: String,
     pub capture_id: String,
@@ -291,6 +434,39 @@ impl TransformationTotals {
     }
 }
 
+/// JSON has no infinity: serde_json would emit a non-finite metric as
+/// `null`, indistinguishable from an unknown baseline or wait — exactly
+/// the plausible-looking number this contract refuses to produce. The
+/// oracle computes the same non-finite values for extreme inputs (a
+/// subnormal typing baseline overflows the proxy); this serializer
+/// fails loudly instead, so the value stays visible in memory and
+/// unrepresentable — never silently unknown — in JSON.
+fn ser_finite<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.is_finite() {
+        serializer.serialize_f64(*value)
+    } else {
+        Err(serde::ser::Error::custom(
+            "non-finite insight metric cannot be serialized as JSON",
+        ))
+    }
+}
+
+fn ser_finite_opt<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        None => serializer.serialize_none(),
+        Some(value) if value.is_finite() => serializer.serialize_some(value),
+        Some(_) => Err(serde::ser::Error::custom(
+            "non-finite insight metric cannot be serialized as JSON",
+        )),
+    }
+}
+
 /// The v1 metric contract for one event log, as plain JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Aggregate {
@@ -300,11 +476,14 @@ pub struct Aggregate {
     pub incomplete_captures: u64,
     pub recognized_words: u64,
     pub raw_recognized_words: u64,
+    #[serde(serialize_with = "ser_finite")]
     pub captured_seconds: f64,
+    #[serde(serialize_with = "ser_finite")]
     pub eligible_capture_seconds: f64,
     /// Silence-inclusive captured-minute rate, summed over the population.
     /// `None` when there is no eligible audio or the tokenizers differ; a
     /// VAD speech rate is a distinct metric and never substituted.
+    #[serde(serialize_with = "ser_finite_opt")]
     pub recognized_words_per_captured_minute: Option<f64>,
     pub tokenizers: Vec<String>,
     pub delivery_counts: DeliveryTotals,
@@ -314,6 +493,7 @@ pub struct Aggregate {
     pub transformation_counts: TransformationTotals,
     /// `None` when the baseline or a wait is unknown, or tokenizers are
     /// incomparable; may be negative and is reported as such.
+    #[serde(serialize_with = "ser_finite_opt")]
     pub typing_time_comparison_seconds: Option<f64>,
     pub time_comparison_caveat: String,
 }
@@ -333,6 +513,12 @@ pub struct Aggregate {
 /// delivery is replaced by the latest one before its counts and waits are
 /// read, exactly as the oracle's latest-wins semantics do, so a stale retry
 /// cannot fail an otherwise valid log.
+///
+/// Counts are read the way the oracle reads them — `int(nonnegative(x))`,
+/// a float conversion — so counts above 2^53 normalize identically in both
+/// implementations, while replay conflicts still compare the exact event
+/// payloads. A total beyond `u64` is an error (see the module's
+/// representable range), never a wrap.
 pub fn aggregate(
     events: &[InsightEvent],
     typing_wpm: Option<f64>,
@@ -396,15 +582,18 @@ pub fn aggregate(
         }))?;
         if let Some(selected) = selected {
             selected_recognitions += 1;
-            let lexical = selected.lexical_words;
-            let raw = selected.raw_words;
+            // Read as the oracle does: `nonnegative` float-converts, the
+            // comparison is on those floats, and `int()` truncates the
+            // result — so a count above 2^53 normalizes identically here.
+            let lexical = selected.lexical_words as f64;
+            let raw = selected.raw_words as f64;
             if lexical > raw {
                 return Err(InsightError::new(
                     "lexical count cannot exceed raw ASR count",
                 ));
             }
-            recognized_words += lexical;
-            raw_recognized_words += raw;
+            add_total(&mut recognized_words, lexical as u64, "recognized words")?;
+            add_total(&mut raw_recognized_words, raw as u64, "raw recognized words")?;
             eligible_seconds += duration;
             tokenizers.insert(selected.tokenizer.clone());
             match selected.post_stop_ready_ms {
@@ -415,17 +604,16 @@ pub fn aggregate(
 
         // Transformation revisions: the latest `revision_seq` per
         // `revision_id` wins; distinct revisions are distinct passes and
-        // both count.
-        let mut revisions: BTreeMap<&str, Vec<&TransformationCompleted>> = BTreeMap::new();
-        for &event in items {
-            if let InsightEvent::TransformationCompleted(revision) = event {
-                revisions
-                    .entry(&revision.revision_id)
-                    .or_default()
-                    .push(revision);
+        // both count. Groups run in first-occurrence order, like the
+        // oracle's insertion-ordered dicts, so which error a broken log
+        // reports first agrees across the implementations.
+        let revisions = groups_in_order(items.iter().filter_map(|event| match event {
+            InsightEvent::TransformationCompleted(revision) => {
+                Some((revision.revision_id.as_str(), revision))
             }
-        }
-        for revision_items in revisions.values() {
+            _ => None,
+        }));
+        for revision_items in revisions {
             let Some(revision) = latest_by_sequence(
                 revision_items
                     .iter()
@@ -435,23 +623,42 @@ pub fn aggregate(
                 continue;
             };
             *transformation_counts.slot(revision.transformation_kind) += 1;
-            change_counts.structural += revision.change_counts.structural;
-            change_counts.user += revision.change_counts.user;
-            change_counts.dictionary += revision.change_counts.dictionary;
-            change_counts.snippet += revision.change_counts.snippet;
-            change_counts.style += revision.change_counts.style;
+            // `int(nonnegative(...))` per kind, as the oracle reads them.
+            let changes = revision.change_counts;
+            add_total(
+                &mut change_counts.structural,
+                changes.structural as f64 as u64,
+                "structural changes",
+            )?;
+            add_total(
+                &mut change_counts.user,
+                changes.user as f64 as u64,
+                "user changes",
+            )?;
+            add_total(
+                &mut change_counts.dictionary,
+                changes.dictionary as f64 as u64,
+                "dictionary changes",
+            )?;
+            add_total(
+                &mut change_counts.snippet,
+                changes.snippet as f64 as u64,
+                "snippet changes",
+            )?;
+            add_total(
+                &mut change_counts.style,
+                changes.style as f64 as u64,
+                "style changes",
+            )?;
         }
 
-        let mut deliveries: BTreeMap<&str, Vec<&DeliveryRecorded>> = BTreeMap::new();
-        for &event in items {
-            if let InsightEvent::DeliveryRecorded(delivery) = event {
-                deliveries
-                    .entry(&delivery.delivery_id)
-                    .or_default()
-                    .push(delivery);
+        let deliveries = groups_in_order(items.iter().filter_map(|event| match event {
+            InsightEvent::DeliveryRecorded(delivery) => {
+                Some((delivery.delivery_id.as_str(), delivery))
             }
-        }
-        for delivery_items in deliveries.values() {
+            _ => None,
+        }));
+        for delivery_items in deliveries {
             let Some(delivery) = latest_by_sequence(
                 delivery_items
                     .iter()
@@ -460,28 +667,36 @@ pub fn aggregate(
             else {
                 continue;
             };
-            let output = delivery.output_words;
-            let generated = delivery.generated_words;
+            // Compared and counted as floats-then-int, like the counts above.
+            let output = delivery.output_words as f64;
+            let generated = delivery.generated_words as f64;
             if generated > output {
                 return Err(InsightError::new(
                     "generated words cannot exceed output words",
                 ));
             }
             *delivery_counts.slot(delivery.status) += 1;
-            *output_words_by_status.slot(delivery.status) += output;
-            *generated_words_by_status.slot(delivery.status) += generated;
+            let slot = output_words_by_status.slot(delivery.status);
+            add_total(slot, output as u64, "output words")?;
+            let slot = generated_words_by_status.slot(delivery.status);
+            add_total(slot, generated as u64, "generated words")?;
         }
     }
 
     let comparable = tokenizers.len() == 1;
+    // The oracle multiplies in exact integers (`words * 60`) and only
+    // the division converts to float; converting the total first would
+    // round it before the multiplication and drift the rate above 2^53
+    // words. u128 holds every u64 total times 60 exactly.
+    let words_x60 = (u128::from(recognized_words) * 60) as f64;
     let recognized_words_per_captured_minute = if eligible_seconds > 0.0 && comparable {
-        Some(recognized_words as f64 * 60.0 / eligible_seconds)
+        Some(words_x60 / eligible_seconds)
     } else {
         None
     };
     let typing_time_comparison_seconds = match typing_wpm {
         Some(wpm) if waits_known && selected_recognitions > 0 && comparable => {
-            Some(recognized_words as f64 * 60.0 / wpm - eligible_seconds - wait_seconds)
+            Some(words_x60 / wpm - eligible_seconds - wait_seconds)
         }
         _ => None,
     };
@@ -602,6 +817,36 @@ fn latest_by_sequence<'a, T: SequencedEvent>(
     Ok(seen.into_values().next_back())
 }
 
+/// Adds `by` to a running total, refusing past `u64`: the oracle's
+/// integers are unbounded, so an overflowing total is outside this
+/// port's representable range — an error, never a panic in debug or a
+/// wrapped zero in release.
+fn add_total(slot: &mut u64, by: u64, label: &str) -> Result<(), InsightError> {
+    *slot = slot.checked_add(by).ok_or_else(|| {
+        InsightError::new(format!("{label} total exceeds the supported range"))
+    })?;
+    Ok(())
+}
+
+/// Groups items by key in first-occurrence order — the iteration order
+/// of the oracle's insertion-ordered dicts — so error precedence among
+/// revision/delivery groups agrees across the implementations and
+/// never depends on hash order.
+fn groups_in_order<'a, T>(items: impl Iterator<Item = (&'a str, T)>) -> Vec<Vec<T>> {
+    let mut order: Vec<&'a str> = Vec::new();
+    let mut groups: HashMap<&'a str, Vec<T>> = HashMap::new();
+    for (key, item) in items {
+        if !groups.contains_key(key) {
+            order.push(key);
+        }
+        groups.entry(key).or_default().push(item);
+    }
+    order
+        .into_iter()
+        .map(|key| groups.remove(key).expect("ordered key was grouped"))
+        .collect()
+}
+
 /// Reject values the contract calls impossible: anything not a finite,
 /// non-negative number. Counts are already unsigned in the typed events,
 /// but `typing_wpm` and waits arrive as floats.
@@ -682,17 +927,50 @@ mod tests {
         }
     }
 
+    /// An integer-valued JSON number as an exact integer, whatever
+    /// width serde parsed it at.
+    fn as_exact_int(number: &serde_json::Number) -> Option<i128> {
+        if let Some(value) = number.as_u64() {
+            Some(i128::from(value))
+        } else {
+            number.as_i64().map(i128::from)
+        }
+    }
+
+    /// Whether exact integer `int` and float `float` are the same
+    /// number, proved in both directions so a float that merely
+    /// *rounds to* the integer (the only way to write 2^64 in a
+    /// serde_json `Value`) never certifies a different count.
+    fn int_float_equal(int: i128, float: f64) -> bool {
+        if !float.is_finite() || float.fract() != 0.0 {
+            return false;
+        }
+        // The float must convert back losslessly: in range for the
+        // saturating `as` cast, and landing exactly on the integer.
+        float >= i128::MIN as f64 && float < 18_446_744_073_709_551_616.0 && float as i128 == int
+    }
+
     fn numbers_match(actual: &Value, expected: &Value) -> bool {
         match (actual, expected) {
             (Value::Number(actual), Value::Number(expected)) => {
                 // Counts are integers in the contract, so an off-by-one
                 // must fail; only floating-point fields get the tolerance.
-                match (actual.as_u64(), expected.as_u64()) {
+                // Integers compare exactly (i128 covers u64 and i64), and
+                // an integer against a float must be *exactly* that float:
+                // falling back to f64 comparison would certify unequal
+                // totals above 2^53, where distinct integers share a float.
+                match (as_exact_int(actual), as_exact_int(expected)) {
                     (Some(actual), Some(expected)) => actual == expected,
+                    (Some(int), None) => expected
+                        .as_f64()
+                        .is_some_and(|float| int_float_equal(int, float)),
+                    (None, Some(int)) => actual
+                        .as_f64()
+                        .is_some_and(|float| int_float_equal(int, float)),
                     // Captured/wait seconds are sums of f64 divisions, which
                     // are not promised bit-exact across the Python oracle and
-                    // this port; integer counts must match exactly.
-                    _ => match (actual.as_f64(), expected.as_f64()) {
+                    // this port; they keep the tolerance.
+                    (None, None) => match (actual.as_f64(), expected.as_f64()) {
                         (Some(actual), Some(expected)) => (actual - expected).abs() <= 1e-9,
                         _ => actual == expected,
                     },
@@ -1045,6 +1323,195 @@ mod tests {
         .expect("tombstone");
         tombstone["reason"] = serde_json::json!("because");
         assert!(serde_json::from_value::<InsightEvent>(tombstone).is_err());
+    }
+
+    #[test]
+    fn required_nullable_keys_must_be_present_but_may_be_null() {
+        // The schema requires these keys and allows `null`; a missing
+        // key is malformed, and the oracle raises on it — and rejects a
+        // same-id replay that presents the field once as null and once
+        // absent as conflicting. serde's plain `Option` would read the
+        // absent key as `None` and hide both.
+        let mut raw = serde_json::to_value(event("a2")).expect("event serializes");
+        raw.as_object_mut()
+            .expect("object")
+            .remove("post_stop_ready_ms");
+        assert!(
+            serde_json::from_value::<InsightEvent>(raw.clone()).is_err(),
+            "a missing post_stop_ready_ms must not parse"
+        );
+        raw["post_stop_ready_ms"] = Value::Null;
+        let parsed = serde_json::from_value::<InsightEvent>(raw).expect("explicit null parses");
+        assert_eq!(recognition(&parsed).post_stop_ready_ms, None);
+
+        let processing = load("processing-latency.json")
+            .into_iter()
+            .find(|event| event.event_id() == "pp1")
+            .expect("fixture has pp1");
+        for key in ["failure_reason", "stop_to_result_ms", "output_chars"] {
+            let mut raw = serde_json::to_value(&processing).expect("event serializes");
+            raw.as_object_mut().expect("object").remove(key);
+            assert!(
+                serde_json::from_value::<InsightEvent>(raw).is_err(),
+                "a missing {key} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn integral_float_spellings_parse_like_the_oracle() {
+        // JSON Schema integers may be written `1.0`/`100.0`; Python's
+        // json + the oracle's `==`-comparisons accept them, so the
+        // typed port must too — including for `schema_version`, where a
+        // plain u32 would refuse an otherwise valid event.
+        let mut raw = load_raw("basic-session.json");
+        for value in &mut raw {
+            value["schema_version"] = serde_json::json!(1.0);
+            if value["event_id"] == "a2" {
+                value["lexical_words"] = serde_json::json!(100.0);
+            }
+        }
+        let events: Vec<InsightEvent> =
+            serde_json::from_value(Value::Array(raw)).expect("integral floats parse");
+        assert_eq!(
+            aggregate(&events, None).expect("aggregates"),
+            aggregate(&basic(), None).expect("aggregates")
+        );
+    }
+
+    #[test]
+    fn counts_normalize_through_float_like_the_oracle() {
+        // The oracle reads counts via int(float(x)): 2^53+1 becomes
+        // 2^53, so lexical 2^53+1 against raw 2^53 is *accepted* there.
+        // The port compares and counts the same normalized values,
+        // while the events themselves keep their exact payloads for
+        // replay-conflict comparison.
+        let mut selected = recognition(&event("a2")).clone();
+        selected.lexical_words = 9_007_199_254_740_993;
+        selected.raw_words = 9_007_199_254_740_992;
+        let events = vec![
+            event("c1"),
+            InsightEvent::RecognitionSelected(selected),
+        ];
+        let result = aggregate(&events, None).expect("aggregates like the oracle");
+        assert_eq!(result.recognized_words, 9_007_199_254_740_992);
+        assert_eq!(result.raw_recognized_words, 9_007_199_254_740_992);
+    }
+
+    #[test]
+    fn totals_refuse_past_u64_instead_of_wrapping() {
+        // Two captures of 2^63 words each: the oracle's bigint total is
+        // 2^64, past this port's u64. Refuse — a panic (checked builds)
+        // or a wrapped zero (unchecked) would be a plausible number.
+        let mut first = recognition(&event("a2")).clone();
+        first.lexical_words = 1 << 63;
+        first.raw_words = 1 << 63;
+        let mut second = recognition(&event("a3")).clone();
+        second.lexical_words = 1 << 63;
+        second.raw_words = 1 << 63;
+        let events = vec![
+            event("c1"),
+            InsightEvent::RecognitionSelected(first),
+            event("c2"),
+            InsightEvent::RecognitionSelected(second),
+        ];
+        assert!(aggregate(&events, None)
+            .unwrap_err()
+            .to_string()
+            .contains("supported range"));
+    }
+
+    #[test]
+    fn wpm_multiplies_in_integers_before_dividing() {
+        // Oracle: words * 60 / seconds, the multiplication in exact
+        // integers. With 2^53 + 1 total words, converting to f64 first
+        // would round the total to 2^53 and drift the rate by 32.
+        let mut take_one = capture(&event("c1")).clone();
+        take_one.sample_count = take_one.sample_rate; // one second
+        let mut take_two = capture(&event("c2")).clone();
+        take_two.sample_count = take_two.sample_rate;
+        let mut big = recognition(&event("a2")).clone();
+        big.lexical_words = 1 << 53;
+        big.raw_words = 1 << 53;
+        let mut small = recognition(&event("a3")).clone();
+        small.lexical_words = 1;
+        small.raw_words = 1;
+        let events = vec![
+            InsightEvent::CaptureFinalized(take_one),
+            InsightEvent::RecognitionSelected(big),
+            InsightEvent::CaptureFinalized(take_two),
+            InsightEvent::RecognitionSelected(small),
+        ];
+        let result = aggregate(&events, None).expect("aggregates");
+        let total_x60 = (u128::from((1u64 << 53) + 1) * 60) as f64;
+        assert_eq!(
+            result.recognized_words_per_captured_minute,
+            Some(total_x60 / 2.0)
+        );
+    }
+
+    #[test]
+    fn delivery_groups_report_errors_in_first_occurrence_order() {
+        // Group "z" arrives first with impossible counts; group "a"
+        // has a sequence conflict. The oracle iterates groups in
+        // insertion order and reports z's impossible count; sorted
+        // group order would report a's conflict instead.
+        let mut impossible = delivery(&event("d1")).clone();
+        impossible.event_id = "z1".to_string();
+        impossible.delivery_id = "z-delivery".to_string();
+        impossible.output_words = 10;
+        impossible.generated_words = 20;
+        let mut conflict_a = delivery(&event("d1")).clone();
+        conflict_a.event_id = "a-del-1".to_string();
+        conflict_a.delivery_id = "a-delivery".to_string();
+        conflict_a.output_words = 10;
+        conflict_a.generated_words = 0;
+        let mut conflict_b = conflict_a.clone();
+        conflict_b.event_id = "a-del-2".to_string();
+        conflict_b.output_words = 11;
+        let events = vec![
+            event("c1"),
+            InsightEvent::DeliveryRecorded(impossible),
+            InsightEvent::DeliveryRecorded(conflict_a),
+            InsightEvent::DeliveryRecorded(conflict_b),
+        ];
+        assert!(aggregate(&events, None)
+            .unwrap_err()
+            .to_string()
+            .contains("generated"));
+    }
+
+    #[test]
+    fn comparator_never_certifies_unequal_integer_totals() {
+        let big: Value = serde_json::from_str("18446744073709551616").unwrap();
+        assert!(!numbers_match(&serde_json::json!(u64::MAX), &big));
+        assert!(!numbers_match(
+            &serde_json::json!(9_007_199_254_740_992.0_f64),
+            &serde_json::json!(9_007_199_254_740_993_u64)
+        ));
+        assert!(!numbers_match(
+            &serde_json::json!(9_007_199_254_740_992_u64),
+            &serde_json::json!(9_007_199_254_740_993_u64)
+        ));
+        // The typed round-trip relies on exact int/float pairs matching.
+        assert!(numbers_match(
+            &serde_json::json!(10.0),
+            &serde_json::json!(10)
+        ));
+    }
+
+    #[test]
+    fn nonfinite_metrics_refuse_to_serialize_as_unknown() {
+        // A subnormal typing baseline overflows the proxy to infinity
+        // in both implementations. In memory the value stays visible;
+        // serialized it must fail, not become a `null` that reads as an
+        // unknown baseline or wait.
+        let result = aggregate(&basic(), Some(1e-308)).expect("aggregates");
+        assert!(matches!(
+            result.typing_time_comparison_seconds,
+            Some(value) if value.is_infinite()
+        ));
+        assert!(serde_json::to_value(&result).is_err());
     }
 
     #[test]
