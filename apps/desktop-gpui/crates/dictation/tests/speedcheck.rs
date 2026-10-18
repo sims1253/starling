@@ -111,7 +111,7 @@ fn both_probes_measure_offline_and_leave_no_engine_behind() {
     let results = speedcheck::run_speed_check(&target, speedcheck::ALL_PROBES, &|_| {}, None)
         .expect("the check runs");
 
-    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(results.len(), speedcheck::ALL_PROBES.len(), "{results:?}");
     assert_eq!(results[0].kind, ProbeKind::Smoke);
     assert_eq!(results[1].kind, ProbeKind::Speech);
     for check in &results {
@@ -227,7 +227,7 @@ fn a_completed_check_returns_despite_a_token_nobody_cancels() {
         Some(&token),
     )
     .expect("the check finishes with a live, never-cancelled token");
-    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(results.len(), speedcheck::ALL_PROBES.len(), "{results:?}");
     assert!(
         !token.is_cancelled(),
         "the run must not cancel the caller's token"

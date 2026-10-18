@@ -312,7 +312,8 @@ pub enum SpeedCheckError {
     /// Loading a second resident model would not fit in the memory
     /// currently free. The numbers are the swap policy's (#363):
     /// `needed` is the conservative resident estimate plus its margin,
-    /// `available` what the OS reported free.
+    /// `available` the free figure the decision was made against
+    /// (net of loads already admitted, when a manager decided it).
     #[error(
         "not enough free memory to measure {model_id} alongside the running engine \
          (needs about {}, {} available); the current model keeps serving",
@@ -326,17 +327,10 @@ pub enum SpeedCheckError {
     },
 }
 
-/// One decimal place, MB below a thousand and GB above — the same
-/// spelling the app's switch refusal uses, so a memory sentence reads
-/// the same whichever path produced it.
+/// The shared byte spelling ([`crate::engine::memory::fmt_size`]), so
+/// this refusal and the app's switch refusal cannot drift apart.
 fn fmt_bytes(bytes: u64) -> String {
-    const MB: f64 = 1_000_000.;
-    let mb = bytes as f64 / MB;
-    if mb >= 1000. {
-        format!("{:.1} GB", mb / 1000.)
-    } else {
-        format!("{:.1} MB", mb)
-    }
+    crate::engine::memory::fmt_size(bytes)
 }
 
 /// Whether loading `entry`'s model as a *second* resident copy fits in

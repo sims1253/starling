@@ -606,6 +606,25 @@ impl Inner {
             .unwrap_or_else(available_memory)
     }
 
+    /// Says so on stderr when an admission wait stops being momentary:
+    /// first after 30 s, then every five minutes with the elapsed
+    /// time, so a long contention wait is diagnosable from logs
+    /// instead of silent.
+    fn note_long_wait(waited_from: Instant, last_logged: &mut Option<Instant>) {
+        let due = match *last_logged {
+            None => waited_from.elapsed() >= Duration::from_secs(30),
+            Some(at) => at.elapsed() >= Duration::from_secs(5 * 60),
+        };
+        if due {
+            *last_logged = Some(Instant::now());
+            eprintln!(
+                "starling engine: a load has waited {:?} for memory held by another \
+                 admitted load (e.g. a speed check); it starts when that load releases it",
+                waited_from.elapsed()
+            );
+        }
+    }
+
     fn lock_reserved(&self) -> MutexGuard<'_, u64> {
         self.load_reserved
             .lock()
@@ -633,29 +652,24 @@ impl Inner {
         cancelled: &dyn Fn() -> bool,
     ) -> bool {
         let waited_from = Instant::now();
-        let mut logged = false;
+        let mut last_logged = None;
         loop {
             if cancelled() {
                 return false;
             }
+            // The reading is an OS snapshot; take it before the lock
+            // so the critical section stays ledger arithmetic.
+            let reading = self.memory_reading();
             {
                 let reserved = self.lock_reserved();
                 let others = reserved.saturating_sub(own_bytes);
-                let effective = self
-                    .memory_reading()
-                    .map(|available| available.saturating_sub(others));
+                let effective = reading.map(|available| available.saturating_sub(others));
                 let plan = swap_plan(effective, incoming_est, None, SWAP_MARGIN_BYTES);
                 if others == 0 || matches!(plan, SwapPlan::Rolling | SwapPlan::Unknown) {
                     return true;
                 }
             }
-            if !logged && waited_from.elapsed() >= Duration::from_secs(30) {
-                logged = true;
-                eprintln!(
-                    "starling engine: a load is still waiting for memory held by another \
-                     admitted load (e.g. a speed check); it starts when that load releases it"
-                );
-            }
+            Self::note_long_wait(waited_from, &mut last_logged);
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -676,15 +690,17 @@ impl Inner {
         cancelled: &dyn Fn() -> bool,
     ) -> Option<LoadReservation> {
         let waited_from = Instant::now();
-        let mut logged = false;
+        let mut last_logged = None;
         loop {
             if cancelled() {
                 return None;
             }
+            // The reading is an OS snapshot; take it before the lock
+            // so the critical section stays ledger arithmetic.
+            let reading = self.memory_reading();
             {
                 let mut reserved = self.lock_reserved();
                 let others = *reserved;
-                let reading = self.memory_reading();
                 let effective = reading.map(|available| available.saturating_sub(others));
                 let plan = swap_plan(effective, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
                 if others == 0 || matches!(plan, SwapPlan::Rolling | SwapPlan::Unknown) {
@@ -696,13 +712,7 @@ impl Inner {
                     });
                 }
             }
-            if !logged && waited_from.elapsed() >= Duration::from_secs(30) {
-                logged = true;
-                eprintln!(
-                    "starling engine: a load is still waiting for memory held by another \
-                     admitted load (e.g. a speed check); it starts when that load releases it"
-                );
-            }
+            Self::note_long_wait(waited_from, &mut last_logged);
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -720,8 +730,8 @@ impl Inner {
         outgoing_est: Option<u64>,
         recovery_est: Option<u64>,
     ) -> (SwapPlan, Option<u64>, Option<LoadReservation>) {
-        let mut reserved = self.lock_reserved();
         let reading = self.memory_reading();
+        let mut reserved = self.lock_reserved();
         let effective = reading.map(|available| available.saturating_sub(*reserved));
         let plan = swap_plan(effective, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
         let reservation = match plan {
@@ -983,12 +993,15 @@ impl EngineManager {
     /// manager's reading net of loads already admitted, registered in
     /// the same critical section — a switch admitted a moment later
     /// (or earlier) cannot spend the same free bytes twice. The
-    /// caller holds the reservation while the probe loads; a probe
+    /// caller holds the reservation while the probe runs; a probe
     /// never drains the live engine to make room. `Err` is the
     /// sentence for the user.
     pub fn reserve_probe(&self, entry: &CatalogEntry) -> Result<LoadReservation, String> {
-        let mut reserved = self.inner.lock_reserved();
+        // The OS reading is a snapshot either way; take it before the
+        // lock so the critical section is only the ledger arithmetic.
+        // Atomicity lives in the count check-and-register under it.
         let reading = self.inner.memory_reading();
+        let mut reserved = self.inner.lock_reserved();
         let effective = reading.map(|available| available.saturating_sub(*reserved));
         crate::speedcheck::check_memory_admission(effective, entry)
             .map_err(|error| error.to_string())?;

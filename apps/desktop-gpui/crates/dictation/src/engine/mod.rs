@@ -32,8 +32,8 @@ pub use manager::{
     SwapDecision, SwapMode, SwitchReport, SwitchStage, SwitchView,
 };
 pub use memory::{
-    available_memory, estimate_resident, process_peak_rss, process_rss, swap_plan, SwapPlan,
-    SWAP_MARGIN_BYTES,
+    available_memory, estimate_resident, fmt_size, process_peak_rss, process_rss, swap_plan,
+    SwapPlan, SWAP_MARGIN_BYTES,
 };
 pub use probe::{
     select_backend, try_select_backend, BackendSelection, EngineVersion, ProbeFailure,

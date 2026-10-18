@@ -336,16 +336,11 @@ pub(crate) fn download_percent(done: u64, total: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// A byte size as the settings rows show it (#363): MB under a GB, GB
-/// above, one decimal.
+/// A byte size as the settings rows show it (#363) — the one shared
+/// spelling next to the memory policy, so the speed check's refusal
+/// and this screen's sentences cannot drift apart.
 pub(crate) fn fmt_size(bytes: u64) -> String {
-    const MB: f64 = 1_000_000.;
-    let mb = bytes as f64 / MB;
-    if mb >= 1000. {
-        format!("{:.1} GB", mb / 1000.)
-    } else {
-        format!("{:.1} MB", mb)
-    }
+    starling_dictation::engine::fmt_size(bytes)
 }
 
 /// The last switch report line (#363): "Switched in 4.2 s · peak engine
