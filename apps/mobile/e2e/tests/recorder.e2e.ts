@@ -3,7 +3,7 @@ import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { test } from '@e2e-dev/mobile';
 import { expect } from 'e2e';
-import { adb, artifacts, jsonFile, packageId, privateFile, recordings, snapshot, until } from '../support.ts';
+import { adb, artifacts, jsonFile, packageId, recordings, snapshot, until } from '../support.ts';
 
 test('retains failed capture, retries with real inference, restarts, and exports', async ({ app, screen, device }) => {
   await app.open();
@@ -14,7 +14,7 @@ test('retains failed capture, retries with real inference, restarts, and exports
   await expect(record).toHaveText('Stop and transcribe');
   const [take] = await until(recordings, rows => rows.length === 1);
   // Wait for durable samples, not a sleep that assumes capture started.
-  await until(() => privateFile(`recordings/${take.id}.wav.part`).length,
+  await until(() => Number(adb('shell', 'run-as', packageId, 'stat', '-c', '%s', `files/recordings/${take.id}.wav.part`).toString().trim()),
     bytes => bytes >= 44 + 16_000 * 2 * 8);
   await record.tap();
   const status = screen.getByTestId('recording_status');

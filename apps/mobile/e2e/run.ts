@@ -68,7 +68,7 @@ try {
   adb('logcat', '-c');
   manifest.status = 'running';
   jsonFile(resolve(artifacts, 'manifest.json'), manifest);
-  const result = spawnSync(process.execPath, ['node_modules/e2e/dist/cli/bin.js', 'run', '--reporter', 'list,junit'],
+  const result = spawnSync(process.execPath, ['node_modules/.bin/e2e', 'run', '--reporter', 'list,junit'],
     { stdio: 'inherit', env: process.env, timeout: 900_000 });
   if (result.error) throw result.error;
   assert.equal(result.status, 0, `E2E runner exited with ${result.status} (${result.signal})`);

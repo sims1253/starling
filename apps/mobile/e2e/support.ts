@@ -20,7 +20,7 @@ export function command(binary: string, args: string[], input?: Buffer): Buffer 
 
 export function adb(...args: string[]): Buffer {
   const serial = process.env.ANDROID_SERIAL;
-  assert.match(serial ?? '', /^emulator-\d+$/, 'Select a dedicated emulator with ANDROID_SERIAL');
+  assert.match(serial ?? '', /^emulator-\d+$/, 'ANDROID_SERIAL must select a local emulator-<port> device');
   return command('adb', ['-s', serial!, ...args]);
 }
 

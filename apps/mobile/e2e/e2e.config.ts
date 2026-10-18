@@ -1,12 +1,13 @@
 import type { E2EConfig } from 'e2e';
 import { mobile } from '@e2e-dev/mobile';
+import { packageId } from './support.ts';
 
 export default {
   targets: [{
     name: 'android',
     engine: mobile({ platform: 'android', device: process.env.ANDROID_SERIAL }),
     app: {
-      bundleId: 'dev.starling.mobile.debug',
+      bundleId: packageId,
       permissions: { microphone: 'grant', notifications: 'grant' },
     },
   }],

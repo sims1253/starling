@@ -27,8 +27,9 @@ desktop. Existing device, recovery, and numerical tests remain in place.
 
 Use Node 24.8 or newer, Java 17, the Android SDK and NDK, `adb`, `curl`,
 `ffmpeg`, and `ffprobe`. Boot a dedicated API 35 emulator with at least 4 GB
-of RAM. The command clears **Starling Debug** data on that emulator. It refuses
-physical devices. It overwrites this directory's `artifacts/` on each run.
+of RAM. Select its local `emulator-<port>` serial from `adb devices`. The command
+clears **Starling Debug** data on that emulator. It refuses physical devices
+and TCP serials. It overwrites this directory's `artifacts/` on each run.
 
 1. From `apps/mobile`, build the debug APK:
 
