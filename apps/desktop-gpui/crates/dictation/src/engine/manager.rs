@@ -601,15 +601,41 @@ impl Inner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Registers `bytes` as loading (assumes admission already
-    /// decided). The caller holds the guard for the load's duration.
-    fn reserve_load(&self, bytes: u64) -> LoadReservation {
-        let mut reserved = self.lock_reserved();
-        *reserved = reserved.saturating_add(bytes);
-        LoadReservation {
-            reserved: Arc::clone(&self.load_reserved),
-            bytes,
-            reading: self.memory_reading(),
+    /// Waits until a load of `incoming_est` fits beside the loads
+    /// already admitted, then registers it — for the loads that must
+    /// eventually run (startup, crash restart, backend reload) rather
+    /// than be refused. Only *contention* waits: with no other
+    /// reservation held, the load proceeds exactly as it did before
+    /// reservations existed, even when the machine is simply low on
+    /// memory (the crash machinery handles a load that then fails).
+    /// Polls `cancelled` between attempts; `None` means the wait was
+    /// cancelled before anything registered.
+    fn wait_admit_load(
+        &self,
+        incoming_est: u64,
+        outgoing_est: Option<u64>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<LoadReservation> {
+        loop {
+            if cancelled() {
+                return None;
+            }
+            {
+                let mut reserved = self.lock_reserved();
+                let others = *reserved;
+                let reading = self.memory_reading();
+                let effective = reading.map(|available| available.saturating_sub(others));
+                let plan = swap_plan(effective, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
+                if others == 0 || matches!(plan, SwapPlan::Rolling | SwapPlan::Unknown) {
+                    *reserved = reserved.saturating_add(incoming_est);
+                    return Some(LoadReservation {
+                        reserved: Arc::clone(&self.load_reserved),
+                        bytes: incoming_est,
+                        reading,
+                    });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -624,6 +650,7 @@ impl Inner {
         &self,
         incoming_est: u64,
         outgoing_est: Option<u64>,
+        recovery_est: Option<u64>,
     ) -> (SwapPlan, Option<u64>, Option<LoadReservation>) {
         let mut reserved = self.lock_reserved();
         let reading = self.memory_reading();
@@ -632,10 +659,20 @@ impl Inner {
         let reservation = match plan {
             SwapPlan::Refuse { .. } => None,
             _ => {
-                *reserved = reserved.saturating_add(incoming_est);
+                // Reserve the largest load this switch may still make:
+                // the incoming model, or — if it fails and recovery
+                // reloads the previous one under this same reservation
+                // (the outgoing engine, or the last active model when
+                // nothing serves) — that bigger load instead. A probe
+                // admitted in between must already have accounted for
+                // it, not just for the small target's estimate.
+                let bytes = incoming_est
+                    .max(outgoing_est.unwrap_or(0))
+                    .max(recovery_est.unwrap_or(0));
+                *reserved = reserved.saturating_add(bytes);
                 Some(LoadReservation {
                     reserved: Arc::clone(&self.load_reserved),
-                    bytes: incoming_est,
+                    bytes,
                     reading,
                 })
             }
@@ -1384,6 +1421,21 @@ impl Supervisor {
             state.last_active_model = Some(model_id.to_string());
             state.bump();
         }
+        // Coordinate with loads already admitted (a speed check's
+        // probe) for the whole bring-up, verification included: wait
+        // until this launch fits beside them instead of each spending
+        // the same snapshot. Uncontended — the startup common case —
+        // this registers and proceeds at once, and a probe admitted
+        // during the load now sees this claim. The reservation drops
+        // when the launch ends (success installs the engine, whose
+        // bytes the reading then shows).
+        let Some(_launch_reservation) = self.inner.wait_admit_load(
+            estimate_resident(entry.size_bytes),
+            None,
+            &|| self.inner.shutdown.load(Ordering::Acquire),
+        ) else {
+            return;
+        };
         // A hand-placed file is verified (and marked) before first use.
         if matches!(
             self.inner.lock().install.get(model_id),
@@ -1912,16 +1964,26 @@ fn run_switch(ctx: SwitchCtx) {
     //    admitted meanwhile sees the claim instead of the pre-load
     //    snapshot.
     let incoming_est = estimate_resident(entry.size_bytes);
-    let outgoing_est = {
+    let (outgoing_est, recovery_est) = {
         let state = ctx.lock();
-        state
+        let outgoing = state
             .active
             .as_ref()
             .and_then(|engine| ctx.inner.entry(&engine.model_id))
-            .map(|outgoing| estimate_resident(outgoing.size_bytes))
+            .map(|outgoing| estimate_resident(outgoing.size_bytes));
+        // The model recovery would reload if this switch fails with
+        // nothing serving (`recover_if_idle` reads the same field).
+        let recovery = state
+            .last_active_model
+            .as_deref()
+            .filter(|id| *id != ctx.target)
+            .and_then(|id| ctx.inner.entry(id))
+            .map(|previous| estimate_resident(previous.size_bytes));
+        (outgoing, recovery)
     };
     let (plan, available, _load_reservation) =
-        ctx.inner.admit_switch_load(incoming_est, outgoing_est);
+        ctx.inner
+            .admit_switch_load(incoming_est, outgoing_est, recovery_est);
 
     match plan {
         SwapPlan::Refuse { needed, available } => {
@@ -2465,10 +2527,19 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
 /// toggle). The old engine keeps serving until the cutover and then
 /// drains. A newer activation cancels this like any switch.
 fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
-    // No admission change for a backend reload (it has never asked the
-    // memory policy: same model, previous engine keeps serving), but
-    // register the load so a probe admitted meanwhile accounts for it.
-    let _load_reservation = ctx.inner.reserve_load(estimate_resident(entry.size_bytes));
+    // A backend reload loads a second copy beside the serving one, so
+    // it waits until that copy fits beside loads already admitted (a
+    // speed check's probe) instead of overspending behind them. With
+    // nothing else admitted it proceeds exactly as before — a reload
+    // never asked the memory policy whether the machine, uncontended,
+    // can hold it. Cancelled while waiting, the previous engine simply
+    // keeps serving on the old backend.
+    let est = estimate_resident(entry.size_bytes);
+    let Some(_load_reservation) = ctx.inner.wait_admit_load(est, Some(est), &|| ctx.cancelled())
+    else {
+        ctx.end_switch();
+        return;
+    };
     ctx.set_stage(SwitchStage::Loading);
     match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {

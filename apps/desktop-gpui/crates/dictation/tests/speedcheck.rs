@@ -147,10 +147,13 @@ fn the_check_does_not_disturb_the_live_engine_manager() {
     let bytes = model_bytes(5, 4_096);
     let addr = spawn_model_server(vec![("live.gguf".to_string(), Arc::new(bytes.clone()))]);
     let live = entry("live", "live.gguf", addr, &bytes);
-    let manager = starling_dictation::engine::EngineManager::start(
-        config(&engine_dir, &models_dir, &state_dir, vec![live.clone()]),
-        None,
-    );
+    let mut live_config = config(&engine_dir, &models_dir, &state_dir, vec![live.clone()]);
+    // Same stand-in reasoning as the probe target below: the live
+    // fixture model never becomes resident, so its activation must not
+    // depend on the test machine's real free RAM either.
+    live_config.available_memory_override = Some(None);
+    let manager =
+        starling_dictation::engine::EngineManager::start(live_config, None);
     manager.activate("live");
     let ready = wait_until(&manager, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready)
         .expect("the real engine warms");

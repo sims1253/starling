@@ -1806,16 +1806,30 @@ fn a_probe_and_a_switch_cannot_spend_the_same_free_memory_twice() {
                 model_id: "other".into(),
             })
             .expect("answered");
-            // Stage Loading means admission already happened and the
-            // incoming engine is the one held at its wrapper.
-            until_engine(&app, "the switch admitted and loading", |status| {
-                status.snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot
-                        .switch
-                        .as_ref()
-                        .is_some_and(|switch| switch.stage == SwitchStage::Loading)
-                })
-            });
+            // The held wrapper process existing proves admission already
+            // happened (it is spawned only after the policy step), unlike
+            // the Loading stage, which is published before the switch
+            // worker runs — on machines without a readable process
+            // table, fall back to the stage.
+            if count_processes_with(&engines).is_some() {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while count_processes_with(&engines) != Some(1) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the admitted switch's held wrapper never appeared"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            } else {
+                until_engine(&app, "the switch loading", |status| {
+                    status.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot
+                            .switch
+                            .as_ref()
+                            .is_some_and(|switch| switch.stage == SwitchStage::Loading)
+                    })
+                });
+            }
             let reply = app
                 .engine(EngineRequest::SpeedCheck {
                     model_id: MODEL_ID.into(),
