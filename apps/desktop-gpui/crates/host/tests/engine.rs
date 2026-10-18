@@ -1879,6 +1879,141 @@ fn a_probe_and_a_switch_cannot_spend_the_same_free_memory_twice() {
     }
 }
 
+/// #475: the reverse admission order. Nothing serves (the big model
+/// crash-looped), a 2.625 GiB probe is admitted and held, then a tiny
+/// target is activated — it fits beside the probe, so it is admitted.
+/// Cancelling that switch must not now spawn the 1.5 GiB *recovery* of
+/// the previous model beside the still-held probe (2.625 + 1.5 > the
+/// 4 GiB free): recovery waits until the probe's claim is gone, even
+/// though the switch's reservation already covered its bytes — the
+/// reservation sizes the claim, the recovery spawn still has to fit
+/// beside claims admitted after it.
+#[cfg(unix)]
+#[test]
+fn recovery_waits_for_a_probe_admitted_before_the_switch() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let mut config =
+        engine_config_with_held_models(root.path(), &fixture, &[MODEL_ID, "small", "probe"]);
+    for entry in &mut config.catalog {
+        entry.size_bytes = match entry.id.as_str() {
+            MODEL_ID => 1024 * 1024 * 1024,
+            "probe" => 2 * 1024 * 1024 * 1024,
+            _ => 4096,
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(config.models_dir.join(format!("{}.gguf", entry.id)))
+            .unwrap()
+            .set_len(entry.size_bytes)
+            .unwrap();
+    }
+    config.available_memory_override = Some(Some(4 * 1024 * 1024 * 1024));
+    let big_gguf = config.models_dir.join(format!("{MODEL_ID}.gguf"));
+    let probe_gguf = config.models_dir.join("probe.gguf");
+    let small_gguf = config.models_dir.join("small.gguf");
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    until_engine(&app, "the big model serving", |status| {
+        serving(status, MODEL_ID)
+    });
+
+    // Crash-loop the big model out of service: five kills inside the
+    // window trip the loop guard, leaving last_active_model = the big
+    // model with nothing serving.
+    let manager = host.engine().expect("builtin");
+    let wait_snapshot = |label: &str, ok: &dyn Fn(&starling_dictation::engine::EngineSnapshot) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snapshot = manager.snapshot();
+            if ok(&snapshot) {
+                return snapshot;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    for _ in 0..5 {
+        let pid = wait_snapshot("an engine to kill", &|s| s.active.is_some())
+            .active
+            .expect("active")
+            .pid;
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success(),
+            "kill the engine"
+        );
+        wait_snapshot("the engine's death", &move |s| {
+            s.active.as_ref().is_none_or(|active| active.pid != pid)
+        });
+    }
+    until_engine(&app, "the crash-loop failure", |status| {
+        status.snapshot.as_ref().is_some_and(|snapshot| {
+            matches!(snapshot.phase, EnginePhase::Failed(_)) && snapshot.active.is_none()
+        })
+    });
+
+    // Probe first, held; then the small target, also held.
+    std::fs::write(engine_hold(root.path()), "").unwrap();
+    assert!(matches!(
+        app.engine(EngineRequest::SpeedCheck {
+            model_id: "probe".into()
+        })
+        .expect("answered"),
+        EngineReply::Done { .. }
+    ));
+    let count = |path: &std::path::Path| count_processes_with(path.to_str().unwrap());
+    let wait_count = |path: &std::path::Path, want: usize, label: &str| {
+        if count(path).is_none() {
+            return; // no readable process table: the model-level waits still ran
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while count(path) != Some(want) {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait_count(&probe_gguf, 1, "the probe held");
+    app.engine(EngineRequest::Activate {
+        model_id: "small".into(),
+    })
+    .expect("answered");
+    wait_count(&small_gguf, 1, "the small switch held");
+
+    app.engine(EngineRequest::CancelSwitch).expect("answered");
+    // Recovery of the big model must not spawn beside the held probe.
+    if count(&big_gguf).is_some() {
+        let settle = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < settle {
+            assert_eq!(
+                count(&big_gguf),
+                Some(0),
+                "recovery spawned beside the held probe"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // Release everything: the probe finishes, its claim drops, and
+    // recovery brings the big model back.
+    std::fs::remove_file(engine_hold(root.path())).unwrap();
+    until_engine(&app, "the big model recovered", |status| {
+        serving(status, MODEL_ID)
+    });
+    drop(app);
+    host.shutdown();
+}
+
 /// #475: a check that is still measuring when the host shuts down stops
 /// with the host. The probe is held at its wrapper for the whole test,
 /// so shutdown can only return promptly — and leave nothing running —

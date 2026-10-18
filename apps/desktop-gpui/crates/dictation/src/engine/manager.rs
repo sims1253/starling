@@ -564,6 +564,13 @@ impl LoadReservation {
     pub fn reading(&self) -> Option<u64> {
         self.reading
     }
+
+    /// The resident-estimate bytes this reservation claims. Recovery
+    /// coordination needs it: a switch's own claim must be excluded
+    /// when asking whether its recovery load fits beside *other* loads.
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Drop for LoadReservation {
@@ -610,6 +617,40 @@ impl Inner {
     /// memory (the crash machinery handles a load that then fails).
     /// Polls `cancelled` between attempts; `None` means the wait was
     /// cancelled before anything registered.
+    /// Waits until a load of `incoming_est` fits beside *other* loads'
+    /// reservations (`own_bytes` is the caller's own claim, already
+    /// registered — excluded, since the load being waited for runs
+    /// under that claim, not in addition to it). Registers nothing:
+    /// for a recovery load whose bytes the caller's reservation
+    /// already covers, where spawning immediately could still
+    /// overspend beside a probe admitted after the caller's claim was
+    /// sized. Only contention waits; with nothing else reserved the
+    /// load proceeds as it always did. `false` means cancelled.
+    fn wait_for_load_fit(
+        &self,
+        incoming_est: u64,
+        own_bytes: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> bool {
+        loop {
+            if cancelled() {
+                return false;
+            }
+            {
+                let reserved = self.lock_reserved();
+                let others = reserved.saturating_sub(own_bytes);
+                let effective = self
+                    .memory_reading()
+                    .map(|available| available.saturating_sub(others));
+                let plan = swap_plan(effective, incoming_est, None, SWAP_MARGIN_BYTES);
+                if others == 0 || matches!(plan, SwapPlan::Rolling | SwapPlan::Unknown) {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn wait_admit_load(
         &self,
         incoming_est: u64,
@@ -1630,6 +1671,7 @@ impl Supervisor {
             confirm,
             superseded,
             inner: Arc::clone(&self.inner),
+            reserved_bytes: 0,
         };
         let inner = Arc::clone(&self.inner);
         let thread = match std::thread::Builder::new()
@@ -1843,6 +1885,10 @@ struct SwitchCtx {
     /// after a cancel (restoring the previous engine) keys off it.
     superseded: Arc<AtomicBool>,
     inner: Arc<Inner>,
+    /// Bytes this switch's own load reservation claims (0 until
+    /// admission). Recovery excludes it when asking whether restoring
+    /// the previous model fits beside *other* loads.
+    reserved_bytes: u64,
 }
 
 impl SwitchCtx {
@@ -1866,6 +1912,7 @@ impl SwitchCtx {
             confirm: Arc::clone(&self.confirm),
             superseded: Arc::clone(&self.superseded),
             inner: Arc::clone(&self.inner),
+            reserved_bytes: self.reserved_bytes,
         }
     }
 
@@ -1925,7 +1972,7 @@ impl SwitchCtx {
     }
 }
 
-fn run_switch(ctx: SwitchCtx) {
+fn run_switch(mut ctx: SwitchCtx) {
     let Some(entry) = ctx.inner.entry(&ctx.target) else {
         ctx.set_last_error(format!("unknown model {}", ctx.target));
         ctx.end_switch();
@@ -1984,6 +2031,10 @@ fn run_switch(ctx: SwitchCtx) {
     let (plan, available, _load_reservation) =
         ctx.inner
             .admit_switch_load(incoming_est, outgoing_est, recovery_est);
+    ctx.reserved_bytes = _load_reservation
+        .as_ref()
+        .map(|reservation| reservation.bytes())
+        .unwrap_or(0);
 
     match plan {
         SwapPlan::Refuse { needed, available } => {
@@ -2490,6 +2541,23 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
         return;
     };
     let recovery = ctx.recovery();
+    // This switch's reservation already covers the previous model's
+    // bytes (admission reserved the largest load it may still make),
+    // but a probe admitted *after* that admission may have been sized
+    // against a moment when the recovery claim was still just the
+    // target's estimate in a reader's snapshot — so coordinate the
+    // spawn itself: wait until the recovery load fits beside other
+    // loads' claims (this switch's own excluded), rather than spawning
+    // into memory another admitted load is about to spend. Cancelled
+    // here means superseded or shutting down: a newer intent decides
+    // what serves, exactly as a cancelled spawn would end.
+    if !ctx.inner.wait_for_load_fit(
+        estimate_resident(entry.size_bytes),
+        ctx.reserved_bytes,
+        &|| recovery.cancelled(),
+    ) {
+        return;
+    }
     recovery.set_stage(SwitchStage::Loading);
     match spawn_incoming(&recovery, &entry, false) {
         Ok(engine) => {
