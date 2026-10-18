@@ -12,13 +12,9 @@ import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.window.OnBackInvokedDispatcher
-import dev.starling.mobile.audio.AudioCapture
-import dev.starling.mobile.audio.AudioChunkListener
-import dev.starling.mobile.audio.CaptureResult
-import dev.starling.mobile.data.Recording
 import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.transcription.StreamEvent
-import dev.starling.mobile.transcription.StreamSession
+import dev.starling.mobile.transcription.TakeRecorder
 
 /**
  * The `ACTION_RECOGNIZE_SPEECH` popup (E22): apps that ask the system for
@@ -41,30 +37,26 @@ import dev.starling.mobile.transcription.StreamSession
  *
  * Threading: every method here runs on the main thread (capture stop
  * callbacks and TranscriptionCoordinator callbacks are delivered there), so
- * the plain fields need no synchronization; only [streamSession] is read
- * by the capture worker.
+ * the plain fields need no synchronization. [TakeRecorder] forwards PCM
+ * to the live session on the capture worker.
  */
 class RecognizeSpeechActivity : Activity() {
     private val application by lazy { starlingApplication() }
-    private val capture = AudioCapture()
+    private val recorder by lazy { TakeRecorder(this, application.recordings, application.transcription) }
 
     private lateinit var statusView: TextView
     private lateinit var partialView: TextView
     private lateinit var doneButton: Button
     private lateinit var cancelButton: Button
 
-    private var activeRecording: Recording? = null
+    private var activeTake: TakeRecorder.Take? = null
 
     // The listening status and the take's free-space warning (#342) below it.
     private var takeStatus = ""
     private var diskNotice: String? = null
 
     /** Whether the microphone capture is running; instrumented tests branch on it. */
-    internal val capturing: Boolean get() = activeRecording != null
-
-    // Read by the capture worker through the chunk listener.
-    @Volatile
-    private var streamSession: StreamSession? = null
+    internal val capturing: Boolean get() = activeTake != null
 
     /** Set once a result has been delivered; later outcomes are store-only. */
     private var resultDelivered = false
@@ -89,7 +81,7 @@ class RecognizeSpeechActivity : Activity() {
                 ?.takeIf { it.isNotBlank() }
                 ?: getString(R.string.recognize_prompt)
 
-        doneButton.setOnClickListener { if (activeRecording != null) stopAndTranscribe() else finish() }
+        doneButton.setOnClickListener { if (activeTake != null) stopAndTranscribe() else finish() }
         cancelButton.setOnClickListener { cancel() }
         if (Build.VERSION.SDK_INT >= 33) {
             // The activity opts in to OnBackInvokedCallback (manifest), so
@@ -131,12 +123,12 @@ class RecognizeSpeechActivity : Activity() {
         // The caller only gets the transcript if this dialog is still alive
         // when it settles; otherwise it sees RESULT_CANCELED and the
         // transcript stays retrievable in Starling Mobile.
-        if (activeRecording != null) stopAndTranscribe()
+        if (activeTake != null) stopAndTranscribe()
         super.onStop()
     }
 
     override fun onDestroy() {
-        if (activeRecording != null) stopAndTranscribe()
+        if (activeTake != null) stopAndTranscribe()
         super.onDestroy()
     }
 
@@ -154,38 +146,29 @@ class RecognizeSpeechActivity : Activity() {
             )
             return
         }
-        val recording = runCatching { application.recordings.create() }.getOrElse {
-            deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_storage_error)
-            return
-        }
-        var session: StreamSession? = null
-        val savedAudio = application.recordings.partialFile(recording)
-        session = application.transcription.beginStreaming(savedAudio) { event ->
-            if (streamSession === session) onStreamEvent(event)
-        }
-        val error = capture.start(
-            this,
-            savedAudio,
-            onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
-            // The capture ended itself (low storage, the two-hour cap): Done.
-            onEnded = { if (activeRecording === recording) stopAndTranscribe() },
+        val recorded = when (val started = recorder.start(
             diskWarned = application.diskWarnedAtStart(disk),
+            onEvent = ::onStreamEvent,
+            onEnded = ::stopAndTranscribe,
             onDiskLow = { minutes ->
-                if (!isDestroyed && !isFinishing && activeRecording === recording) {
+                if (!isDestroyed && !isFinishing) {
                     diskNotice = application.diskLowDuringTake(minutes)
                     showListeningStatus(takeStatus)
                 }
             },
-        )
-        if (error != null) {
-            session?.close()
-            runCatching { application.recordings.salvageCapture(recording.id, error) }
-            deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_AUDIO_ERROR), null, error)
-            return
+        )) {
+            is TakeRecorder.Start.Started -> started.take
+            is TakeRecorder.Start.Failed -> {
+                deliver(
+                    RecognizeSpeechOutcome.Outcome(if (started.storage) RecognizerIntent.RESULT_CLIENT_ERROR else RecognizerIntent.RESULT_AUDIO_ERROR),
+                    if (started.storage) R.string.recording_storage_error else null,
+                    if (started.storage) null else started.message,
+                )
+                return
+            }
         }
-        activeRecording = recording
-        streamSession = session
-        val loading = session != null && application.isOnDeviceModelLoading()
+        activeTake = recorded
+        val loading = recorded.live && application.isOnDeviceModelLoading()
         diskNotice = application.diskWarning(disk)
         showListeningStatus(getString(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening))
     }
@@ -199,7 +182,7 @@ class RecognizeSpeechActivity : Activity() {
     private fun onStreamEvent(event: StreamEvent) {
         if (isDestroyed || isFinishing) return
         when (event) {
-            StreamEvent.Live -> if (activeRecording != null) showListeningStatus(getString(R.string.recognize_listening))
+            StreamEvent.Live -> if (activeTake != null) showListeningStatus(getString(R.string.recognize_listening))
             is StreamEvent.Partial -> {
                 partialView.visibility = View.VISIBLE
                 partialView.text = event.text
@@ -213,84 +196,51 @@ class RecognizeSpeechActivity : Activity() {
             }
             // The stop path falls back to the batch transcription of the WAV;
             // the status must not keep claiming the model is loading.
-            is StreamEvent.Interrupted -> if (activeRecording != null) {
+            is StreamEvent.Interrupted -> if (activeTake != null) {
                 showListeningStatus(getString(R.string.keyboard_stream_interrupted, event.reason))
             }
         }
     }
 
     private fun stopAndTranscribe() {
-        val recording = activeRecording ?: return
-        activeRecording = null
+        val recorded = activeTake ?: return
+        activeTake = null
         diskNotice = null
-        val session = streamSession
-        streamSession = null
         doneButton.isEnabled = false
         statusView.setText(R.string.recognize_transcribing)
-        capture.stop { result -> settleCapture(recording, session, result) }
-    }
-
-    private fun settleCapture(recording: Recording, session: StreamSession?, result: CaptureResult) {
-        RecognizeSpeechOutcome.captureEnded(result)?.let { failed ->
-            session?.close()
-            val message = (result as? CaptureResult.Failed)?.message
-            if (message != null) runCatching { application.recordings.salvageCapture(recording.id, message) }
-            deliver(failed, R.string.recognize_failed, message)
-            return
-        }
-        val completed = result as CaptureResult.Completed
-        if (completed.stoppedForLowDisk) statusView.setText(R.string.recording_stopped_low_disk)
-        // The WAV is finalized and durable before any transcription.
-        val finalized = runCatching {
-            application.recordings.commitAudio(recording, completed.durationSeconds)
-        }.getOrElse {
-            session?.close()
-            runCatching { application.recordings.salvageCapture(recording.id, "Unable to finalize the private WAV recording") }
-            deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_finalize_error)
-            return
-        }
-        val settled: (Recording) -> Unit = { done ->
-            val outcome = RecognizeSpeechOutcome.settled(done)
-            val message = when (outcome.resultCode) {
-                RESULT_OK -> null
-                RecognizerIntent.RESULT_NO_MATCH -> R.string.recognize_no_match
-                else -> R.string.recognize_failed
-            }
-            deliver(outcome, message)
-        }
-        if (session != null) {
-            application.transcription.finishStreaming(session, finalized.id, settled)
-        } else {
-            application.transcription.transcribe(finalized.id, callback = settled)
-        }
+        recorded.stop(
+            onStopped = { result ->
+                when (result) {
+                    is TakeRecorder.Stopped.Saved -> if (result.capture.stoppedForLowDisk && !isDestroyed && !isFinishing) {
+                        statusView.setText(R.string.recording_stopped_low_disk)
+                    }
+                    is TakeRecorder.Stopped.Failed -> deliver(
+                        RecognizeSpeechOutcome.Outcome(
+                            if (result.kind == TakeRecorder.Failure.FINALIZATION) RecognizerIntent.RESULT_CLIENT_ERROR
+                            else RecognizerIntent.RESULT_AUDIO_ERROR,
+                        ),
+                        if (result.kind == TakeRecorder.Failure.FINALIZATION) R.string.recording_finalize_error else R.string.recognize_failed,
+                        result.message,
+                    )
+                }
+            },
+            onTranscribed = { done ->
+                val outcome = RecognizeSpeechOutcome.settled(done)
+                val message = when (outcome.resultCode) {
+                    RESULT_OK -> null
+                    RecognizerIntent.RESULT_NO_MATCH -> R.string.recognize_no_match
+                    else -> R.string.recognize_failed
+                }
+                deliver(outcome, message)
+            },
+        )
     }
 
     private fun cancel() {
-        val recording = activeRecording
-        if (recording != null) {
-            activeRecording = null
-            val session = streamSession
-            streamSession = null
-            // Like a cancelled recognizer session: keep the audio, skip the
-            // transcription, and drop any live session.
-            session?.close()
-            capture.stop { result ->
-                when (result) {
-                    is CaptureResult.Completed ->
-                        runCatching { application.recordings.commitAudio(recording, result.durationSeconds) }
-                            .onFailure {
-                                runCatching {
-                                    application.recordings.salvageCapture(recording.id, "Unable to finalize the private WAV recording")
-                                }
-                            }
-                    is CaptureResult.Failed ->
-                        runCatching { application.recordings.salvageCapture(recording.id, result.message) }
-                    CaptureResult.AlreadyStopped -> Unit
-                }
-            }
-        }
-        // Dismissing an error screen keeps the error code already set for
-        // the caller; RESULT_CANCELED is only for a genuine user cancel.
+        val recorded = activeTake
+        activeTake = null
+        recorded?.stop(transcribe = false)
+        // Dismissing an error screen keeps the error code already set.
         if (!resultDelivered) {
             resultDelivered = true
             setResult(RESULT_CANCELED)

@@ -13,14 +13,11 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
 import android.widget.Toast
-import dev.starling.mobile.audio.AudioCapture
-import dev.starling.mobile.audio.AudioChunkListener
-import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.transcription.StreamEvent
-import dev.starling.mobile.transcription.StreamSession
+import dev.starling.mobile.transcription.TakeRecorder
 import java.util.concurrent.TimeUnit
 
 /**
@@ -40,15 +37,11 @@ import java.util.concurrent.TimeUnit
  */
 class StarlingRecognitionService : RecognitionService() {
     private val application by lazy { starlingApplication() }
-    private val capture = AudioCapture()
+    private val recorder by lazy { TakeRecorder(this, application.recordings, application.transcription) }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val sessions = RecognitionSessionGuard<Callback>()
 
-    // Live-stream state of the one session this service can host. The
-    // session is set before the capture starts and is read by the capture
-    // worker through the chunk listener.
-    @Volatile
-    private var streamSession: StreamSession? = null
+    private var recordedTake: TakeRecorder.Take? = null
 
     private val listenTimeout = Runnable {
         // A wedged host keyboard must not hold the microphone open forever.
@@ -75,10 +68,6 @@ class StarlingRecognitionService : RecognitionService() {
             return
         }
         application.diskWarning(disk)?.let(::toast)
-        val recording = runCatching { application.recordings.create() }.getOrElse {
-            sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
-            return
-        }
         // Attribute mic access to the calling keyboard so its identity, not
         // ours, is checked and shown during data delivery (API 33+).
         val captureContext = if (Build.VERSION.SDK_INT >= 33) {
@@ -92,38 +81,26 @@ class StarlingRecognitionService : RecognitionService() {
         } else {
             this
         }
-        // The live stream is an observer of the capture: null means no
-        // model is installed and the take goes to the batch transcription.
-        val savedAudio = application.recordings.partialFile(recording)
-        val session = application.transcription.beginStreaming(savedAudio) { event ->
-            onStreamEvent(callback, event)
-        }
-        val error = capture.start(
-            captureContext,
-            savedAudio,
-            onChunk = session?.let { streaming ->
-                AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
-            },
-            // The capture ended itself (low storage, the two-hour cap):
-            // finish the session like the host's stopListening.
-            onEnded = { if (sessions.isLive(callback)) sessions.stopListening(callback)?.let(::endSession) },
-            // The host keyboard owns the screen; the warning is a toast.
+        val recorded = when (val started = recorder.start(
+            attributionContext = captureContext,
             diskWarned = application.diskWarnedAtStart(disk),
+            onEvent = { onStreamEvent(callback, it) },
+            onEnded = { sessions.stopListening(callback)?.let(::endSession) },
             onDiskLow = { minutes ->
                 if (sessions.isLive(callback)) {
                     runCatching { Log.w(TAG, "storage is low during a take: about $minutes minutes left") }
                     toast(application.diskLowDuringTake(minutes))
                 }
             },
-        )
-        if (error != null) {
-            session?.close()
-            runCatching { application.recordings.salvageCapture(recording.id, error) }
-            sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
-            return
+        )) {
+            is TakeRecorder.Start.Started -> started.take
+            is TakeRecorder.Start.Failed -> {
+                sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
+                return
+            }
         }
-        streamSession = session
-        sessions.begin(recording, callback)
+        recordedTake = recorded
+        sessions.begin(recorded.recording, callback)
         mainHandler.removeCallbacks(listenTimeout)
         mainHandler.postDelayed(listenTimeout, MAX_LISTEN_MILLIS)
         // Keyboards wait for this before showing their "speak now" state.
@@ -168,80 +145,24 @@ class StarlingRecognitionService : RecognitionService() {
 
     private fun endSession(ending: RecognitionSessionGuard.Ending<Callback>) {
         mainHandler.removeCallbacks(listenTimeout)
-        val session = streamSession
-        streamSession = null
-        // The capture settles inline on this main thread in the common
-        // case; when the microphone refuses to stop, the outcome is
-        // delivered later, still on the main thread, so the host callback,
-        // the watchdog, and onDestroy never block on the forced-release
-        // wait.
-        capture.stop { result -> settleEndedSession(ending, session, result) }
-    }
-
-    private fun settleEndedSession(
-        ending: RecognitionSessionGuard.Ending<Callback>,
-        session: StreamSession?,
-        result: CaptureResult,
-    ) {
-        when (val settlement = sessions.settle(ending, result)) {
-            is RecognitionSessionGuard.Settlement.Transcribe -> {
-                // Storage ran nearly full and the take stopped itself (#342).
-                // What was said up to then is complete and still goes to the
-                // host as its result, so no error ends the session; the
-                // toast says why the recording stopped early.
-                if (settlement.stoppedForLowDisk) {
-                    runCatching { Log.w(TAG, "a take stopped early: storage is nearly full") }
-                    toast(getString(R.string.recording_stopped_low_disk))
-                }
-                // The WAV is finalized and durable before it is transcribed.
-                val finalized = runCatching {
-                    application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
-                }.getOrNull()
-                if (finalized == null) {
-                    session?.close()
-                    runCatching {
-                        application.recordings.salvageCapture(settlement.recording.id, "Unable to finalize the private WAV recording")
+        val recorded = recordedTake ?: return
+        recordedTake = null
+        val finalize = ending is RecognitionSessionGuard.Ending.Finalize
+        recorded.stop(
+            transcribe = finalize,
+            onStopped = { result ->
+                when (result) {
+                    is TakeRecorder.Stopped.Saved -> if (finalize && result.capture.stoppedForLowDisk) {
+                        runCatching { Log.w(TAG, "a take stopped early: storage is nearly full") }
+                        toast(getString(R.string.recording_stopped_low_disk))
                     }
-                    sessions.deliver(ending.session.owner) { it.error(SpeechRecognizer.ERROR_CLIENT) }
-                    return
-                }
-                val settled: (Recording) -> Unit = { completed ->
-                    deliverSettled(ending, completed)
-                }
-                if (session != null) {
-                    // Finish the live stream; any failure falls back to
-                    // transcribing the same saved WAV.
-                    application.transcription.finishStreaming(session, finalized.id, settled)
-                } else {
-                    application.transcription.transcribe(finalized.id, callback = settled)
-                }
-            }
-            is RecognitionSessionGuard.Settlement.Keep -> {
-                // The recording itself was the user's intent; keep it, skip
-                // transcription, and drop the live session.
-                session?.close()
-                runCatching {
-                    application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
-                }.onFailure {
-                    runCatching {
-                        application.recordings.salvageCapture(settlement.recording.id, "Unable to finalize the private WAV recording")
+                    is TakeRecorder.Stopped.Failed -> if (finalize) {
+                        sessions.deliver(ending.session.owner) { it.error(SpeechRecognizer.ERROR_CLIENT) }
                     }
                 }
-            }
-            is RecognitionSessionGuard.Settlement.Fail -> {
-                session?.close()
-                runCatching { application.recordings.salvageCapture(settlement.recordingId, settlement.message) }
-                settlement.errorCode?.let { code ->
-                    sessions.deliver(ending.session.owner) { it.error(code) }
-                }
-            }
-            is RecognitionSessionGuard.Settlement.Empty -> {
-                session?.close()
-                settlement.errorCode?.let { code ->
-                    sessions.deliver(ending.session.owner) { it.error(code) }
-                }
-            }
-        }
+            },
+            onTranscribed = { deliverSettled(ending, it) },
+        )
     }
 
     private fun deliverSettled(

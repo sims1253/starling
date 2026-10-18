@@ -31,9 +31,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import dev.starling.mobile.audio.AudioCapture
-import dev.starling.mobile.audio.AudioChunkListener
-import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.DerivedRevision
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
@@ -46,7 +43,7 @@ import dev.starling.mobile.processing.RegionKind
 import dev.starling.mobile.processing.StagedTake
 import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.transcription.StreamEvent
-import dev.starling.mobile.transcription.StreamSession
+import dev.starling.mobile.transcription.TakeRecorder
 import dev.starling.mobile.ui.BoundaryDelivery
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
@@ -100,7 +97,7 @@ import dev.starling.mobile.ui.InputTargetGuard
  */
 class VoiceInputService : InputMethodService() {
     private val application by lazy { starlingApplication() }
-    private val capture = AudioCapture()
+    private val recorder by lazy { TakeRecorder(this, application.recordings, application.transcription) }
     private val targetGuard = InputTargetGuard<InputConnection>()
 
     private var keyboardView: View? = null
@@ -360,44 +357,25 @@ class VoiceInputService : InputMethodService() {
             statusView?.text = getString(R.string.disk_full_refused, (disk.availableBytes / 1_000_000).toInt())
             return
         }
-        val recording = runCatching { application.recordings.create(ephemeral = sensitive) }.getOrElse {
-            statusView?.setText(R.string.recording_storage_error)
-            return
-        }
-        // The live stream is an observer of the capture; null means no
-        // model is installed and the take records in the plain batch mode.
-        var session: StreamSession? = null
-        val savedAudio = application.recordings.partialFile(recording)
-        session = application.transcription.beginStreaming(savedAudio) { event ->
-            // Events from a superseded or stopped take must not touch the
-            // state of the take that replaced it.
-            val current = take
-            if (current != null && current.capturing && current.session === session) onStreamEvent(current, event)
-        }
-        val error = capture.start(
-            this,
-            savedAudio,
-            onChunk = session?.let { streaming ->
-                AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
-            },
-            // A microphone that ends by itself settles like Stop, which also
-            // releases the foreground hold.
-            onEnded = { if (take?.recording === recording) stopTake() },
+        val recorded = when (val started = recorder.start(
+            ephemeral = sensitive,
             diskWarned = application.diskWarnedAtStart(disk),
+            onEvent = { event -> take?.let { onStreamEvent(it, event) } },
+            onEnded = ::stopTake,
             onDiskLow = { minutes ->
-                val current = take
-                if (current?.recording === recording && current.capturing) {
+                take?.let { current ->
                     current.diskNotice = application.diskLowDuringTake(minutes)
                     showDiskWarning(current.diskNotice)
                 }
             },
-        )
-        if (error != null) {
-            session?.close()
-            discardOrFail(recording, sensitive, error)
-            statusView?.text = error
-            return
+        )) {
+            is TakeRecorder.Start.Started -> started.take
+            is TakeRecorder.Start.Failed -> {
+                statusView?.text = if (started.storage) getString(R.string.recording_storage_error) else started.message
+                return
+            }
         }
+        val recording = recorded.recording
         // Only a capture that really started replaces the earlier take, whose
         // callbacks may still be queued; it stays in the store (or is deleted
         // there, if it was private).
@@ -406,14 +384,13 @@ class VoiceInputService : InputMethodService() {
         take?.let(::clearComposingText)
         transcriptView?.visibility = View.GONE
         transcriptView?.text = null
-        take = Take(recording, continuing?.field ?: field, sensitive, mode = mode).also { started ->
-            started.session = session
+        take = Take(recorded, continuing?.field ?: field, sensitive, mode = mode).also { started ->
             started.target = target
             started.staged = continuing?.staged
                 ?: if (!sensitive && mode.processingDelivery == STAGED) newStagedTake(mode, recording.id) else null
             started.replacing = replacing && started.staged?.beginCorrection() == true
             if (!started.replacing) started.staged?.beginSegment()
-            started.liveInField = session != null && field.supportsComposing && started.staged == null
+            started.liveInField = recorded.live && field.supportsComposing && started.staged == null
         }
         take?.foregroundHold = CaptureForegroundService.hold(this) { stopTake() }
         renderTake()
@@ -421,7 +398,7 @@ class VoiceInputService : InputMethodService() {
             when {
                 take?.replacing == true -> R.string.staging_say_replacement
                 take?.staged != null -> R.string.staging_drafting
-                session == null -> R.string.keyboard_recording
+                !recorded.live -> R.string.keyboard_recording
                 // Audio is already being saved; live text follows the load.
                 application.isOnDeviceModelLoading() -> R.string.keyboard_recording_loading
                 else -> R.string.keyboard_streaming
@@ -588,67 +565,28 @@ class VoiceInputService : InputMethodService() {
         current.stoppedAtNanos = System.nanoTime()
         current.diskNotice = null
         showDiskWarning(null)
-        val session = current.session
-        current.session = null
         renderTake()
-
-        // The capture settles inline on this main thread in the common
-        // case; when the microphone refuses to stop, the outcome is
-        // delivered later, still on the main thread, so input teardown and
-        // onDestroy never block on the forced-release wait.
-        capture.stop { result ->
-            // The foreground lasts until the capture has really let go of the
-            // microphone and finalized its WAV; the token keeps this late
-            // callback from releasing a newer take's hold.
-            CaptureForegroundService.release(current.foregroundHold)
-            settleStoppedRecording(current, session, result)
-        }
-    }
-
-    private fun settleStoppedRecording(current: Take, session: StreamSession?, result: CaptureResult) {
-        val recording = current.recording
-        when (result) {
-            is CaptureResult.Completed -> {
-                // The WAV is finalized and durable before it is transcribed.
-                val finalized = runCatching {
-                    application.recordings.commitAudio(recording, result.durationSeconds)
-                }.getOrElse {
-                    session?.close()
-                    discardOrFail(recording, current.sensitive, "Unable to finalize the private WAV recording")
-                    failCapture(current, R.string.recording_finalize_error)
-                    return
-                }
-                if (take === current) {
-                    statusView?.setText(
-                        when {
-                            result.stoppedForLowDisk -> R.string.recording_stopped_low_disk
-                            result.cappedAtLimit -> R.string.recording_capped
+        current.audio.stop(
+            // A late stop releases only its own foreground hold.
+            onCaptured = { CaptureForegroundService.release(current.foregroundHold) },
+            onStopped = { result ->
+                when (result) {
+                    is TakeRecorder.Stopped.Saved -> if (take === current) {
+                        statusView?.setText(when {
+                            result.capture.stoppedForLowDisk -> R.string.recording_stopped_low_disk
+                            result.capture.cappedAtLimit -> R.string.recording_capped
                             else -> R.string.keyboard_sending
-                        },
-                    )
+                        })
+                    }
+                    is TakeRecorder.Stopped.Failed -> when (result.kind) {
+                        TakeRecorder.Failure.FINALIZATION -> failCapture(current, R.string.recording_finalize_error)
+                        TakeRecorder.Failure.ALREADY_STOPPED -> failCapture(current, R.string.recording_already_stopped)
+                        TakeRecorder.Failure.CAPTURE -> failCapture(current, null, result.message)
+                    }
                 }
-                val settled: (Recording) -> Unit = { completed -> onTranscriptionSettled(current, completed) }
-                if (session != null) {
-                    // Finish the live stream; the coordinator falls back to
-                    // transcribing the same saved WAV on any failure.
-                    application.transcription.finishStreaming(session, finalized.id, settled)
-                } else {
-                    application.transcription.transcribe(finalized.id, callback = settled)
-                }
-            }
-            is CaptureResult.Failed -> {
-                // Nothing will be transcribed; drop the live session and
-                // any composing region the live stream left in the editor.
-                session?.close()
-                discardOrFail(recording, current.sensitive, result.message)
-                failCapture(current, null, result.message)
-            }
-            CaptureResult.AlreadyStopped -> {
-                session?.close()
-                if (current.sensitive) runCatching { application.recordings.delete(recording.id) }
-                failCapture(current, R.string.recording_already_stopped)
-            }
-        }
+            },
+            onTranscribed = { onTranscriptionSettled(current, it) },
+        )
     }
 
     /**
@@ -658,7 +596,6 @@ class VoiceInputService : InputMethodService() {
      * outcome; its text lives on only in this keyboard until it is inserted.
      */
     private fun onTranscriptionSettled(current: Take, completed: Recording) {
-        if (current.sensitive) runCatching { application.recordings.delete(completed.id) }
         if (take !== current) return
         var text = completed.rawTranscript
         if (completed.status != RecordingStatus.TRANSCRIBED || text == null) {
@@ -1095,17 +1032,6 @@ class VoiceInputService : InputMethodService() {
     }
 
     /**
-     * A private take is deleted outright; any other keeps whatever audio it
-     * captured, retryable in Starling (RecordingStore.salvageCapture).
-     */
-    private fun discardOrFail(recording: Recording, sensitive: Boolean, message: String) {
-        runCatching {
-            if (sensitive) application.recordings.delete(recording.id)
-            else application.recordings.salvageCapture(recording.id, message)
-        }
-    }
-
-    /**
      * Buttons and the transcript for the current take. Status lines that
      * report progress are set where the progress happens; this only owns
      * the state that follows from the take and the focused field.
@@ -1252,7 +1178,7 @@ class VoiceInputService : InputMethodService() {
      * was handed at start.
      */
     private class Take(
-        val recording: Recording,
+        val audio: TakeRecorder.Take,
         /** The field the take was started in; it attaches only to that field. */
         val field: EditorField,
         val sensitive: Boolean,
@@ -1260,7 +1186,7 @@ class VoiceInputService : InputMethodService() {
         var mode: Mode,
     ) {
         var capturing = true
-        var session: StreamSession? = null
+        val recording: Recording get() = audio.recording
 
         /** The free-space warning shown while it captures (#342); null when there is none. */
         var diskNotice: String? = null

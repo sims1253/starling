@@ -11,8 +11,6 @@ import android.util.Log
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import dev.starling.mobile.audio.AudioCapture
-import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.audio.PcmSource
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.Recording
@@ -20,6 +18,7 @@ import dev.starling.mobile.engine.StreamDebug
 import dev.starling.mobile.engine.StreamTrace
 import dev.starling.mobile.engine.WavPcm
 import dev.starling.mobile.transcription.InferenceResult
+import dev.starling.mobile.transcription.TakeRecorder
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -36,8 +35,8 @@ import java.util.concurrent.atomic.AtomicReference
  * Paced same-audio streaming workload for #226/#357 on a real phone, in the
  * debug app's own process: each workload take (stream_workload.py, pushed to
  * files/debug/stream-workload/) is played once at real-time pace through the
- * production path — AudioCapture writing the take's WAV, the on-device live
- * session fed from its chunks, Stop, commit, finishStreaming — and the
+ * production TakeRecorder module, including durable capture and live
+ * finalization, and the
  * session's [StreamTrace] is written to
  * files/debug/stream-runs/<label>/r<repeat>-<take>.json together with
  * thermal state, app CPU time and a batch transcription of the same audio.
@@ -158,38 +157,31 @@ class StreamBaselineDeviceTest {
 
     /** Records [pcm] once at real-time pace through the production capture and streaming path. */
     private fun runTake(pcm: ByteArray): TakeRun {
-        val recording = app.recordings.create()
-        val partial = app.recordings.partialFile(recording)
-        val session = app.transcription.beginStreaming(partial)
-        assertNotNull("no on-device live session", session)
-        session!!
         val source = PacedOnceSource(pcm)
         PcmSource.debugSource = { source }
-        val capture = AudioCapture()
-        // As the app's entry points do: the WAV first, then the live session.
-        assertEquals(null, capture.start(app, partial, onChunk = { bytes, count -> session.onAudio(bytes, count) }))
+        val take = AtomicReference<TakeRecorder.Take>()
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        instrumentation.runOnMainSync {
+            val started = TakeRecorder(app, app.recordings, app.transcription).start()
+            val recording = (started as? TakeRecorder.Start.Started)?.take
+                ?: throw AssertionError("capture: $started")
+            assertTrue("no on-device live session", recording.live)
+            take.set(recording)
+        }
         assertTrue("the take did not play out", source.exhausted.await(30, TimeUnit.MINUTES))
         val stopPressed = System.nanoTime() / 1e9
-
-        val stopped = CountDownLatch(1)
-        val captured = AtomicReference<CaptureResult>()
-        capture.stop { captured.set(it); stopped.countDown() }
-        assertTrue(stopped.await(30, TimeUnit.SECONDS))
-        val completed = captured.get() as? CaptureResult.Completed ?: throw AssertionError("capture: ${captured.get()}")
-        assertEquals(pcm.size / 32_000.0, completed.durationSeconds, 1e-6)
-        val committed = app.recordings.commitAudio(recording, completed.durationSeconds)
-
         val settled = CountDownLatch(1)
         val result = AtomicReference<Recording>()
         var delivered = 0.0
-        assertTrue(
-            app.transcription.finishStreaming(session, committed.id) {
+        instrumentation.runOnMainSync {
+            take.get().stop(onTranscribed = {
                 delivered = System.nanoTime() / 1e9
                 result.set(it)
                 settled.countDown()
-            },
-        )
+            })
+        }
         assertTrue(settled.await(30, TimeUnit.MINUTES))
+        assertEquals(pcm.size / 32_000.0, result.get().durationSeconds, 1e-6)
         return TakeRun(result.get(), stopPressed, delivered)
     }
 

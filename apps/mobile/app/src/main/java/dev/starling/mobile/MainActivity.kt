@@ -23,9 +23,6 @@ import android.widget.Spinner
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import dev.starling.mobile.audio.AudioCapture
-import dev.starling.mobile.audio.AudioChunkListener
-import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
@@ -42,7 +39,7 @@ import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.storage.HoldReason
 import dev.starling.mobile.storage.StorageSettings
 import dev.starling.mobile.transcription.StreamEvent
-import dev.starling.mobile.transcription.StreamSession
+import dev.starling.mobile.transcription.TakeRecorder
 import java.text.DateFormat
 import java.util.Date
 import kotlin.concurrent.thread
@@ -62,9 +59,10 @@ class MainActivity : Activity() {
     private lateinit var recordingsContainer: LinearLayout
     private lateinit var retentionReport: TextView
 
-    private val capture = AudioCapture()
+    private val recorder by lazy { TakeRecorder(this, application.recordings, application.transcription) }
     private val application by lazy { starlingApplication() }
-    private var activeRecording: Recording? = null
+    private var activeTake: TakeRecorder.Take? = null
+    private var shownTake: TakeRecorder.Take? = null
     private var awaitingPermission = false
 
     // The running take's status line and its free-space warning (#342),
@@ -80,12 +78,6 @@ class MainActivity : Activity() {
 
     // The format the export document was named for; it is what gets written.
     private var pendingExportFlac = false
-
-    // Written on the main thread. Read by the capture worker through the
-    // chunk listener, so a stop that nulls it racing an escalated worker is
-    // still safe: a stale session simply ignores the audio once finished.
-    @Volatile
-    private var streamSession: StreamSession? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -143,7 +135,7 @@ class MainActivity : Activity() {
         downloadOtherModelButton = findViewById(R.id.download_other_model_button)
         downloadOtherModelButton.setOnClickListener { chooseDownload() }
         recordButton.setOnClickListener {
-            if (activeRecording == null) requestOrStartRecording() else stopAndQueueRecording()
+            if (activeTake == null) requestOrStartRecording() else stopAndQueueRecording()
         }
         findViewById<Button>(R.id.open_keyboard_button).setOnClickListener {
             startActivity(Intent("android.settings.INPUT_METHOD_SETTINGS"))
@@ -247,7 +239,7 @@ class MainActivity : Activity() {
         if (application.audioUpkeep.onReport === upkeepListener) application.audioUpkeep.onReport = null
         // A backgrounded Activity should never keep the microphone open. The
         // finalized file stays in app-private storage and can be retried later.
-        if (activeRecording != null) stopAndQueueRecording()
+        if (activeTake != null) stopAndQueueRecording()
         stopPlayback()
         super.onStop()
     }
@@ -352,7 +344,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        if (activeRecording != null) stopAndQueueRecording()
+        if (activeTake != null) stopAndQueueRecording()
         super.onDestroy()
     }
 
@@ -662,44 +654,26 @@ class MainActivity : Activity() {
             showMessage(getString(R.string.disk_full_refused, mb(disk.availableBytes)))
             return
         }
-        val recording = runCatching { application.recordings.create() }.getOrElse {
-            showMessage(getString(R.string.recording_storage_error))
-            return
-        }
-        // The live stream is an observer of the capture, never a gate on it:
-        // beginStreaming returns null when no model is installed, and the
-        // recording proceeds as before.
-        var session: StreamSession? = null
-        val savedAudio = application.recordings.partialFile(recording)
-        session = application.transcription.beginStreaming(savedAudio) { event ->
-            // Events from a superseded session must not rewrite the views of
-            // the recording that replaced it.
-            if (streamSession === session) onStreamEvent(event)
-        }
-        val error = capture.start(
-            this,
-            savedAudio,
-            onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
-            // The capture ended itself (low storage, the two-hour cap):
-            // settle it like Stop.
-            onEnded = { if (activeRecording === recording) stopAndQueueRecording() },
+        val recorded = when (val started = recorder.start(
             diskWarned = application.diskWarnedAtStart(disk),
+            onEvent = ::onStreamEvent,
+            onEnded = ::stopAndQueueRecording,
             onDiskLow = { minutes ->
-                if (!isDestroyed && !isFinishing && activeRecording === recording) {
+                if (!isDestroyed && !isFinishing) {
                     diskNotice = application.diskLowDuringTake(minutes)
                     showRecordingStatus(takeStatus)
                 }
             },
-        )
-        if (error != null) {
-            session?.close()
-            runCatching { application.recordings.salvageCapture(recording.id, error) }
-            showMessage(error)
-            refreshRecordings()
-            return
+        )) {
+            is TakeRecorder.Start.Started -> started.take
+            is TakeRecorder.Start.Failed -> {
+                showMessage(if (started.storage) getString(R.string.recording_storage_error) else started.message)
+                refreshRecordings()
+                return
+            }
         }
-        activeRecording = recording
-        streamSession = session
+        activeTake = recorded
+        shownTake = recorded
         recordButton.setText(R.string.stop_and_transcribe)
         liveTranscript.visibility = View.GONE
         liveTranscript.text = null
@@ -707,7 +681,7 @@ class MainActivity : Activity() {
         showRecordingStatus(
             getString(
                 when {
-                    session == null -> R.string.recording_now
+                    !recorded.live -> R.string.recording_now
                     application.isOnDeviceModelLoading() -> R.string.streaming_loading
                     else -> R.string.streaming_connecting
                 },
@@ -751,79 +725,40 @@ class MainActivity : Activity() {
     }
 
     private fun stopAndQueueRecording() {
-        val recording = activeRecording ?: return
-        activeRecording = null
+        val recorded = activeTake ?: return
+        activeTake = null
         diskNotice = null
-        val session = streamSession
-        streamSession = null
         recordButton.setText(R.string.start_recording)
-
-        // The capture settles inline on this main thread in the common
-        // case; when the microphone refuses to stop, the outcome is
-        // delivered later, still on the main thread, so onStop/onDestroy
-        // never block on the forced-release wait.
-        capture.stop { result -> settleStoppedRecording(recording, session, result) }
-    }
-
-    private fun settleStoppedRecording(
-        recording: Recording,
-        session: StreamSession?,
-        result: CaptureResult,
-    ) {
-        when (result) {
-            is CaptureResult.Completed -> {
-                // The WAV is finalized and durable before it is transcribed.
-                val finalized = runCatching {
-                    application.recordings.commitAudio(recording, result.durationSeconds)
-                }.getOrElse {
-                    session?.close()
-                    runCatching {
-                        application.recordings.salvageCapture(recording.id, "Unable to finalize the private WAV recording")
-                    }
-                    updateRecordingViews {
-                        showMessage(getString(R.string.recording_finalize_error))
-                        refreshRecordings()
-                    }
-                    return
-                }
-                // Why a take that ended by itself stopped stays on screen
-                // through its transcription.
-                val notice = when {
-                    result.stoppedForLowDisk -> getString(R.string.recording_stopped_low_disk)
-                    result.cappedAtLimit -> getString(R.string.recording_capped)
-                    else -> null
-                }
-                val settled: (Recording) -> Unit = { onTranscriptionSettled(it, notice) }
-                // With a live session, finish it and store its final
-                // transcript; the coordinator falls back to transcribing this
-                // same saved WAV whenever the session failed.
-                val queued = if (session != null) {
-                    application.transcription.finishStreaming(session, finalized.id, settled)
-                } else {
-                    application.transcription.transcribe(finalized.id, callback = settled)
-                }
-                if (queued) updateRecordingViews { showMessage(notice ?: getString(R.string.sending_recording)) }
-                updateRecordingViews { refreshRecordings() }
-            }
-            is CaptureResult.Failed -> {
-                // Nothing will be transcribed; the live session and the
-                // stale live partial go with it.
-                session?.close()
-                updateRecordingViews { liveTranscript.visibility = View.GONE }
-                runCatching { application.recordings.salvageCapture(recording.id, result.message) }
+        var notice: String? = null
+        recorded.stop(
+            onStopped = { result ->
                 updateRecordingViews {
-                    showMessage(result.message)
                     refreshRecordings()
+                    if (shownTake === recorded) when (result) {
+                        is TakeRecorder.Stopped.Saved -> {
+                            notice = when {
+                                result.capture.stoppedForLowDisk -> getString(R.string.recording_stopped_low_disk)
+                                result.capture.cappedAtLimit -> getString(R.string.recording_capped)
+                                else -> null
+                            }
+                            showMessage(notice ?: getString(R.string.sending_recording))
+                        }
+                        is TakeRecorder.Stopped.Failed -> {
+                            liveTranscript.visibility = View.GONE
+                            showMessage(when (result.kind) {
+                                TakeRecorder.Failure.FINALIZATION -> getString(R.string.recording_finalize_error)
+                                TakeRecorder.Failure.ALREADY_STOPPED -> getString(R.string.recording_already_stopped)
+                                TakeRecorder.Failure.CAPTURE -> result.message.orEmpty()
+                            })
+                        }
+                    }
                 }
-            }
-            CaptureResult.AlreadyStopped -> {
-                session?.close()
-                updateRecordingViews {
-                    liveTranscript.visibility = View.GONE
-                    showMessage(getString(R.string.recording_already_stopped))
-                }
-            }
-        }
+            },
+            onTranscribed = {
+                if (shownTake === recorded) onTranscriptionSettled(it, notice)
+                else updateRecordingViews { refreshRecordings() }
+            },
+        )
     }
 
     private fun onTranscriptionSettled(completed: Recording, notice: String? = null) {
