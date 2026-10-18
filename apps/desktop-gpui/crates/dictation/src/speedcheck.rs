@@ -382,6 +382,16 @@ pub struct SpeedCheckTarget {
     /// engine's: `Sidecar::spawn` truncates the file past 5 MB, so
     /// sharing would let a probe wipe the engine's history.
     pub log_path: PathBuf,
+    /// The free-memory reading the run's admission is decided against
+    /// instead of the OS's, in the engine config's spelling: `None`
+    /// reads the OS (production), `Some(reading)` replays a reading a
+    /// caller already admitted against (the host passes its
+    /// reservation's, so the library guard cannot race a fresh reading
+    /// against the reservation), and `Some(None)` forces the
+    /// no-reading path. Tests with a stand-in model file use the seam
+    /// instead of depending on the test machine's real free RAM for a
+    /// model that never becomes resident.
+    pub available_memory_override: Option<Option<u64>>,
 }
 
 impl SpeedCheckTarget {
@@ -394,6 +404,7 @@ impl SpeedCheckTarget {
             entry,
             engine_path: paths.engine_path.clone(),
             log_path: paths.log_path.clone(),
+            available_memory_override: None,
         }
     }
 
@@ -440,11 +451,16 @@ pub fn run_speed_check(
     // The probe loads a second resident copy next to whatever engine is
     // serving; the swap policy gets its say before anything spawns, so
     // a machine that can run one model but not two refuses here instead
-    // of finding out through an allocation failure mid-take. A caller
-    // with its own memory reading (the host) repeats this with its
-    // override before it starts the run; this is the guard for direct
-    // callers.
-    check_memory_admission(crate::engine::memory::available_memory(), &target.entry)?;
+    // of finding out through an allocation failure mid-take. The host
+    // admits (and reserves) before it starts the run and replays its
+    // reading through the target; for direct callers this check, over
+    // a fresh OS reading, is the guard.
+    check_memory_admission(
+        target
+            .available_memory_override
+            .unwrap_or_else(crate::engine::memory::available_memory),
+        &target.entry,
+    )?;
 
     let sidecar = Sidecar::spawn(
         &target.engine_path,
@@ -810,6 +826,7 @@ mod tests {
             engine_path: PathBuf::from("/nonexistent-engine"),
             gguf_path: PathBuf::from("/nonexistent-model.gguf"),
             log_path: PathBuf::from("/dev/null"),
+            available_memory_override: None,
         };
         let error = run_speed_check(&target, ALL_PROBES, &|_| {}, None)
             .expect_err("a missing model is refused");

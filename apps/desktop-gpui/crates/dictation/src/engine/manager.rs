@@ -532,6 +532,48 @@ struct Inner {
     shutdown: Arc<AtomicBool>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
     config: EngineConfig,
+    /// Resident-estimate bytes of model loads admitted but not yet
+    /// resident (a switch's incoming engine, a speed check's probe).
+    /// Admission decisions subtract this from the OS reading under the
+    /// same lock that registers a new load, so two loads starting
+    /// together cannot each spend the whole free-memory budget a
+    /// snapshot showed before either allocated. Conservative on
+    /// purpose: bytes already allocated by a loading engine are also
+    /// missing from the OS reading, so a load in flight is counted
+    /// slightly twice until its reservation drops — refusing a
+    /// retryable load beats OOMing the serving engine.
+    load_reserved: Arc<Mutex<u64>>,
+}
+
+/// One admitted load's claim on free memory, released on drop. The
+/// host holds a speed check's reservation until the probe reports its
+/// model loaded (resident bytes then show in the OS reading itself);
+/// a switch holds its own until the switch ends.
+pub struct LoadReservation {
+    reserved: Arc<Mutex<u64>>,
+    bytes: u64,
+    reading: Option<u64>,
+}
+
+impl LoadReservation {
+    /// The raw free-memory reading this admission was decided against
+    /// (before subtracting other loads' reservations); `None` where no
+    /// reading exists. A caller re-checking admission downstream (the
+    /// probe's library guard) replays this snapshot instead of racing
+    /// a fresh OS reading against its own reservation.
+    pub fn reading(&self) -> Option<u64> {
+        self.reading
+    }
+}
+
+impl Drop for LoadReservation {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *reserved = reserved.saturating_sub(self.bytes);
+    }
 }
 
 impl Inner {
@@ -543,6 +585,62 @@ impl Inner {
 
     fn entry(&self, id: &str) -> Option<CatalogEntry> {
         self.catalog.iter().find(|entry| entry.id == id).cloned()
+    }
+
+    /// This manager's free-memory reading: the configured override
+    /// when present (tests), the OS's otherwise.
+    fn memory_reading(&self) -> Option<u64> {
+        self.config
+            .available_memory_override
+            .unwrap_or_else(available_memory)
+    }
+
+    fn lock_reserved(&self) -> MutexGuard<'_, u64> {
+        self.load_reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Registers `bytes` as loading (assumes admission already
+    /// decided). The caller holds the guard for the load's duration.
+    fn reserve_load(&self, bytes: u64) -> LoadReservation {
+        let mut reserved = self.lock_reserved();
+        *reserved = reserved.saturating_add(bytes);
+        LoadReservation {
+            reserved: Arc::clone(&self.load_reserved),
+            bytes,
+            reading: self.memory_reading(),
+        }
+    }
+
+    /// The swap policy's decision for an incoming load, computed
+    /// against free memory net of already-admitted loads and — unless
+    /// refused — registered in the same critical section, so a second
+    /// admission (a probe, another switch) sees this load's claim
+    /// immediately instead of after it allocates. Returns the plan,
+    /// the effective available bytes it was decided against, and the
+    /// reservation to hold while loading.
+    fn admit_switch_load(
+        &self,
+        incoming_est: u64,
+        outgoing_est: Option<u64>,
+    ) -> (SwapPlan, Option<u64>, Option<LoadReservation>) {
+        let mut reserved = self.lock_reserved();
+        let reading = self.memory_reading();
+        let effective = reading.map(|available| available.saturating_sub(*reserved));
+        let plan = swap_plan(effective, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
+        let reservation = match plan {
+            SwapPlan::Refuse { .. } => None,
+            _ => {
+                *reserved = reserved.saturating_add(incoming_est);
+                Some(LoadReservation {
+                    reserved: Arc::clone(&self.load_reserved),
+                    bytes: incoming_est,
+                    reading,
+                })
+            }
+        };
+        (plan, effective, reservation)
     }
 }
 
@@ -567,6 +665,7 @@ impl EngineManager {
             shutdown: Arc::new(AtomicBool::new(false)),
             supervisor: Mutex::new(None),
             config: config.clone(),
+            load_reserved: Arc::new(Mutex::new(0)),
         });
         let supervisor = Supervisor {
             rx: cmd_rx,
@@ -772,20 +871,29 @@ impl EngineManager {
         })
     }
 
-    /// Whether a probe may load `entry`'s model as a second resident
-    /// copy alongside whatever this manager keeps serving (#475): the
-    /// swap policy's decision ([`crate::speedcheck::check_memory_admission`])
-    /// over this manager's own memory reading — the configured override
-    /// (tests) or the OS's. `Err` is the sentence for the user; the
-    /// probe never drains the live engine to make room.
-    pub fn probe_admission(&self, entry: &CatalogEntry) -> Result<(), String> {
-        let available = self
-            .inner
-            .config
-            .available_memory_override
-            .unwrap_or_else(available_memory);
-        crate::speedcheck::check_memory_admission(available, entry)
-            .map_err(|error| error.to_string())
+    /// Admits (and reserves) a probe's load of `entry`'s model as a
+    /// second resident copy alongside whatever this manager keeps
+    /// serving (#475): the swap policy's decision
+    /// ([`crate::speedcheck::check_memory_admission`]) over this
+    /// manager's reading net of loads already admitted, registered in
+    /// the same critical section — a switch admitted a moment later
+    /// (or earlier) cannot spend the same free bytes twice. The
+    /// caller holds the reservation while the probe loads; a probe
+    /// never drains the live engine to make room. `Err` is the
+    /// sentence for the user.
+    pub fn reserve_probe(&self, entry: &CatalogEntry) -> Result<LoadReservation, String> {
+        let mut reserved = self.inner.lock_reserved();
+        let reading = self.inner.memory_reading();
+        let effective = reading.map(|available| available.saturating_sub(*reserved));
+        crate::speedcheck::check_memory_admission(effective, entry)
+            .map_err(|error| error.to_string())?;
+        let bytes = estimate_resident(entry.size_bytes);
+        *reserved = reserved.saturating_add(bytes);
+        Ok(LoadReservation {
+            reserved: Arc::clone(&self.inner.load_reserved),
+            bytes,
+            reading,
+        })
     }
 
     /// The catalog entry for `model_id`, for a run that needs the model's
@@ -1797,7 +1905,12 @@ fn run_switch(ctx: SwitchCtx) {
         return;
     }
 
-    // 2. Memory policy.
+    // 2. Memory policy. The decision is taken against free memory net
+    //    of loads already admitted (a speed check's probe) and this
+    //    load's own claim is registered in the same critical section,
+    //    held via `_load_reservation` until this switch ends — a probe
+    //    admitted meanwhile sees the claim instead of the pre-load
+    //    snapshot.
     let incoming_est = estimate_resident(entry.size_bytes);
     let outgoing_est = {
         let state = ctx.lock();
@@ -1807,12 +1920,8 @@ fn run_switch(ctx: SwitchCtx) {
             .and_then(|engine| ctx.inner.entry(&engine.model_id))
             .map(|outgoing| estimate_resident(outgoing.size_bytes))
     };
-    let available = ctx
-        .inner
-        .config
-        .available_memory_override
-        .unwrap_or_else(available_memory);
-    let plan = swap_plan(available, incoming_est, outgoing_est, SWAP_MARGIN_BYTES);
+    let (plan, available, _load_reservation) =
+        ctx.inner.admit_switch_load(incoming_est, outgoing_est);
 
     match plan {
         SwapPlan::Refuse { needed, available } => {
@@ -2356,6 +2465,10 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
 /// toggle). The old engine keeps serving until the cutover and then
 /// drains. A newer activation cancels this like any switch.
 fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
+    // No admission change for a backend reload (it has never asked the
+    // memory policy: same model, previous engine keeps serving), but
+    // register the load so a probe admitted meanwhile accounts for it.
+    let _load_reservation = ctx.inner.reserve_load(estimate_resident(entry.size_bytes));
     ctx.set_stage(SwitchStage::Loading);
     match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {
@@ -2616,6 +2729,7 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             supervisor: Mutex::new(None),
             config: config.clone(),
+            load_reserved: Arc::new(Mutex::new(0)),
         });
         Supervisor {
             rx,

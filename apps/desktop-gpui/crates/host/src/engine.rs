@@ -977,19 +977,33 @@ impl EngineHost {
         // engine; the memory policy decides before anything records
         // `Running`, so a machine that fits one model but not two
         // refuses here — recorded on the row like the no-engine path
-        // above, since the numbers are what the user can act on.
-        if let Err(message) = manager.probe_admission(&entry) {
-            record_speed_check(
-                &self.speed_check,
-                &self.speed_check_generation,
-                Some(SpeedCheckStatus::Failed {
-                    model_id: model_id.to_string(),
-                    message: message.clone(),
-                }),
-            );
-            return EngineReply::Refused { message };
-        }
-        let target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
+        // above, since the numbers are what the user can act on. The
+        // admission also *reserves* the load with the manager, so a
+        // switch admitted while the probe loads (or the reverse) is
+        // decided against what remains, not the same snapshot twice.
+        let reservation = match manager.reserve_probe(&entry) {
+            Ok(reservation) => reservation,
+            Err(message) => {
+                record_speed_check(
+                    &self.speed_check,
+                    &self.speed_check_generation,
+                    Some(SpeedCheckStatus::Failed {
+                        model_id: model_id.to_string(),
+                        message: message.clone(),
+                    }),
+                );
+                return EngineReply::Refused { message };
+            }
+        };
+        let mut target = starling_dictation::speedcheck::SpeedCheckTarget::at(entry, &paths);
+        // The worker's own admission re-check replays the reading this
+        // reservation was decided against instead of racing a fresh OS
+        // reading (which the reservation itself is meant to govern).
+        target.available_memory_override = Some(reservation.reading());
+        // Released by the worker once its sidecar reports the model
+        // loaded — from then on the resident bytes show in the OS
+        // reading itself — or when the worker ends, whichever first.
+        let reservation = Arc::new(Mutex::new(Some(reservation)));
 
         let outcome_slot = Arc::clone(&self.speed_check);
         let generation = Arc::clone(&self.speed_check_generation);
@@ -1029,6 +1043,7 @@ impl EngineHost {
         // on. Cancelling an individual running check still needs a
         // request and a UI affordance of its own (#475 follow-up).
         let cancel = self.speed_check_cancel.clone();
+        let releasing = Arc::clone(&reservation);
         let worker = std::thread::Builder::new()
             .name("starling-speedcheck".into())
             .spawn(move || {
@@ -1040,7 +1055,18 @@ impl EngineHost {
                     starling_dictation::speedcheck::run_speed_check(
                         &target,
                         starling_dictation::speedcheck::ALL_PROBES,
-                        &|_| {},
+                        &|stage| {
+                            // `Warming` is loaded-but-not-warm: the
+                            // weights are resident, so the reservation
+                            // has done its work and later admissions can
+                            // trust the OS reading again. (A poll can
+                            // skip straight past it to ready; the
+                            // reservation then simply lives until this
+                            // worker ends.)
+                            if stage == starling_dictation::engine::ReadyStage::Warming {
+                                lock(&releasing).take();
+                            }
+                        },
                         Some(&cancel),
                     )
                 }))

@@ -44,6 +44,11 @@ fn target(
         engine_path: engine_dir.join("starling-serve-cpu"),
         gguf_path: models_dir.join(file),
         log_path: state_dir.join("logs/engine-speedcheck.log"),
+        // The fixture's model file is a few KiB stand-in that never
+        // becomes resident; forcing the no-reading path keeps these
+        // tests about plumbing, not about the test machine's free RAM.
+        // Admission itself is covered by the unit tests and the host's.
+        available_memory_override: Some(None),
     }
 }
 

@@ -1752,6 +1752,119 @@ fn count_processes_with(needle: &str) -> Option<usize> {
     }
 }
 
+/// #475: a probe load and a model switch admitted together must not
+/// each spend the whole free-memory budget a pre-load snapshot
+/// showed. Both models are one GiB sparse files (resident estimate
+/// 1.5 GiB; needed with margin exactly the 2 GiB reported free), so
+/// either load alone fits — together they cannot, before either
+/// allocates. Whichever is admitted second must be decided against
+/// what remains: the probe refuses, and the switch is asked to drain
+/// instead of rolling.
+#[cfg(unix)]
+#[test]
+fn a_probe_and_a_switch_cannot_spend_the_same_free_memory_twice() {
+    use starling_dictation::engine::{SwapDecision, SwitchStage};
+    let Some(fixture) = fixture() else { return };
+    for switch_first in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config =
+            engine_config_with_held_models(root.path(), &fixture, &[MODEL_ID, "other"]);
+        // Sparse files make the catalog's sizes true without writing a
+        // GiB per model; the `.verified` markers stay as staged.
+        for entry in &mut config.catalog {
+            entry.size_bytes = 1024 * 1024 * 1024;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(config.models_dir.join(format!("{}.gguf", entry.id)))
+                .unwrap()
+                .set_len(entry.size_bytes)
+                .unwrap();
+        }
+        config.available_memory_override = Some(Some(2 * 1024 * 1024 * 1024));
+        let engines = root.path().join("engines/starling-serve-cpu");
+        let engines = engines.to_str().unwrap().to_string();
+        let mut host = serve(host_config(
+            root.path(),
+            EngineChoice::Builtin {
+                config,
+                active_model: Some(MODEL_ID.into()),
+            },
+        ))
+        .expect("host serves");
+        let app = watching(host.socket_path());
+        until_engine(&app, "the first model serving", |status| {
+            serving(status, MODEL_ID)
+        });
+        // Both loads now park at their wrappers until released, so the
+        // second admission is decided while the first has allocated
+        // nothing — where a fresh snapshot alone would still show the
+        // full 2 GiB free.
+        std::fs::write(engine_hold(root.path()), "").unwrap();
+
+        if switch_first {
+            app.engine(EngineRequest::Activate {
+                model_id: "other".into(),
+            })
+            .expect("answered");
+            // Stage Loading means admission already happened and the
+            // incoming engine is the one held at its wrapper.
+            until_engine(&app, "the switch admitted and loading", |status| {
+                status.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .switch
+                        .as_ref()
+                        .is_some_and(|switch| switch.stage == SwitchStage::Loading)
+                })
+            });
+            let reply = app
+                .engine(EngineRequest::SpeedCheck {
+                    model_id: MODEL_ID.into(),
+                })
+                .expect("answered");
+            match reply {
+                EngineReply::Refused { message } => {
+                    assert!(message.contains("memory"), "{message}")
+                }
+                other => panic!("the probe must refuse behind the switch's load: {other:?}"),
+            }
+        } else {
+            assert!(matches!(
+                app.engine(EngineRequest::SpeedCheck {
+                    model_id: MODEL_ID.into()
+                })
+                .expect("answered"),
+                EngineReply::Done { .. }
+            ));
+            // `Running` is recorded only after the reservation, so
+            // observing it means the probe's claim is registered.
+            until_engine(&app, "the check running", |status| {
+                matches!(status.speed_check, Some(SpeedCheckStatus::Running { .. }))
+            });
+            app.engine(EngineRequest::Activate {
+                model_id: "other".into(),
+            })
+            .expect("answered");
+            // Not admitted rolling beside the probe: the switch must
+            // ask to drain (which loads nothing until confirmed).
+            until_engine(&app, "the switch asked to drain", |status| {
+                status.snapshot.as_ref().is_some_and(|snapshot| {
+                    matches!(snapshot.pending_decision, Some(SwapDecision::NeedsDrain { .. }))
+                })
+            });
+        }
+        if count_processes_with(&engines).is_some() {
+            assert_eq!(
+                count_processes_with(&engines),
+                Some(1),
+                "exactly one admitted load is in flight (switch_first={switch_first})"
+            );
+        }
+        drop(app);
+        host.shutdown();
+        std::fs::remove_file(engine_hold(root.path())).unwrap();
+    }
+}
+
 /// #475: a check that is still measuring when the host shuts down stops
 /// with the host. The probe is held at its wrapper for the whole test,
 /// so shutdown can only return promptly — and leave nothing running —
