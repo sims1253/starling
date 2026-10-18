@@ -879,21 +879,39 @@ fn a_retry_with_another_model_runs_once_the_host_s_engine_serves_it() {
     host.shutdown();
 }
 
-/// Stages the engine dir with a wrapper that sleeps `delay_secs` before
-/// the real fixture whenever its arguments mention `slow_arg`, then
-/// re-hashes it. A speed check against it holds `Running` long enough
-/// for the engine feed (which polls every 200 ms) to push it — the
-/// contract fixture finishes a probe faster than that otherwise.
+/// The file that holds a staged engine (see [`stage_held_engine_dir`]):
+/// while it exists under `root`, a wrapper serving a `.gguf` waits
+/// instead of exec'ing the fixture.
 #[cfg(unix)]
-fn stage_delayed_engine_dir(root: &Path, fixture: &Path, slow_arg: &str, delay_secs: u32) {
+fn engine_hold(root: &Path) -> PathBuf {
+    root.join("engine-hold")
+}
+
+/// Stages the engine dir with a wrapper that waits for the hold file
+/// under `root` to disappear before the real fixture, whenever its
+/// arguments mention a model file, then re-hashes it. A speed check
+/// against it stays `Running` until the test removes the file —
+/// deterministic, unlike a fixed sleep racing the engine feed's
+/// 200 ms poll on a loaded runner (which could let the check finish
+/// before a test that thinks it is concurrent ever starts). The live
+/// engine passes the same wrapper, so tests observe it serving first
+/// and only then create the hold file. The loop still gives up after
+/// ~120 s, so a test that panics with the hold in place leaves no
+/// immortal child behind.
+#[cfg(unix)]
+fn stage_held_engine_dir(root: &Path, fixture: &Path) {
     use std::io::Write;
 
     let engines = root.join("engines");
     std::fs::create_dir_all(&engines).unwrap();
     let staged = engines.join("starling-serve-cpu");
     let quoted = format!("'{}'", fixture.display().to_string().replace('\'', r"'\''"));
+    let hold = format!(
+        "'{}'",
+        engine_hold(root).display().to_string().replace('\'', r"'\''")
+    );
     let script = format!(
-        "#!/bin/sh\ncase \"$*\" in *{slow_arg}*) sleep {delay_secs} ;; esac\nexec {quoted} \"$@\"\n"
+        "#!/bin/sh\ncase \"$*\" in *.gguf*) n=0; while [ -f {hold} ] && [ $n -lt 1200 ]; do sleep 0.1; n=$((n+1)); done ;; esac\nexec {quoted} \"$@\"\n"
     );
     // Written by a `sh` child rather than in this process: a sibling
     // test spawning while such a descriptor is open copies it into a
@@ -911,7 +929,7 @@ fn stage_delayed_engine_dir(root: &Path, fixture: &Path, slow_arg: &str, delay_s
         .unwrap()
         .write_all(script.as_bytes())
         .unwrap();
-    assert!(writer.wait().unwrap().success(), "stage the delayed engine");
+    assert!(writer.wait().unwrap().success(), "stage the held engine");
 
     let sha = sha256_file(&staged).unwrap();
     std::fs::write(
@@ -928,17 +946,17 @@ fn stage_delayed_engine_dir(root: &Path, fixture: &Path, slow_arg: &str, delay_s
     .unwrap();
 }
 
-/// [`engine_config_with_models`] with a start-delayed engine: the model
-/// is installed, but its sidecar takes `delay_secs` to become ready, so
-/// a check is observably `Running` while it loads.
+/// [`engine_config_with_models`] with a held engine: the model is
+/// installed, but while [`engine_hold`] exists under `root` a fresh
+/// sidecar does not become ready, so a check stays observably
+/// `Running` until the test removes the hold.
 #[cfg(unix)]
-fn engine_config_with_delayed_models(
+fn engine_config_with_held_models(
     root: &Path,
     fixture: &Path,
     models: &[&str],
-    delay_secs: u32,
 ) -> EngineConfig {
-    stage_delayed_engine_dir(root, fixture, ".gguf", delay_secs);
+    stage_held_engine_dir(root, fixture);
     let models_dir = root.join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
     let mut catalog = Vec::new();
@@ -1433,7 +1451,7 @@ fn a_check_that_refuses_before_it_starts_lands_as_failed() {
 /// which only says "started". One line per probe, and the synthetic one
 /// marked as the upper bound it is.
 ///
-/// Unix-only because it needs the staged start delay to see the transient
+/// Unix-only because it needs the staged hold to see the transient
 /// `Running` push: a `sh` wrapper cannot slow a Windows engine, and the
 /// host feed polls every 200 ms while the contract fixture finishes a
 /// probe faster than that. The refusal test below runs everywhere.
@@ -1442,8 +1460,7 @@ fn a_check_that_refuses_before_it_starts_lands_as_failed() {
 fn a_speed_check_over_the_socket_reports_through_the_engine_feed() {
     let Some(fixture) = fixture() else { return };
     let root = tempfile::tempdir().unwrap();
-    // The start is slowed so `Running` outlives the feed's 200 ms poll.
-    let config = engine_config_with_delayed_models(root.path(), &fixture, &[MODEL_ID], 3);
+    let config = engine_config_with_held_models(root.path(), &fixture, &[MODEL_ID]);
     let mut host = serve(host_config(
         root.path(),
         EngineChoice::Builtin {
@@ -1458,6 +1475,9 @@ fn a_speed_check_over_the_socket_reports_through_the_engine_feed() {
         serving(status, MODEL_ID)
     });
 
+    // Hold the probe's sidecar at its wrapper: the check now stays
+    // `Running` until this test releases it, however loaded the runner.
+    std::fs::write(engine_hold(root.path()), "").unwrap();
     let reply = app
         .engine(EngineRequest::SpeedCheck {
             model_id: MODEL_ID.into(),
@@ -1489,6 +1509,8 @@ fn a_speed_check_over_the_socket_reports_through_the_engine_feed() {
     };
     let pid_before = live_pid(&running);
 
+    // Release the probe: now it may finish and report.
+    std::fs::remove_file(engine_hold(root.path())).unwrap();
     let reported = until_engine(&app, "the check reported", |status| {
         matches!(status.speed_check, Some(SpeedCheckStatus::Reported { .. }))
     });
@@ -1543,7 +1565,7 @@ fn a_speed_check_over_the_socket_reports_through_the_engine_feed() {
 fn a_second_speed_check_is_refused_while_one_runs() {
     let Some(fixture) = fixture() else { return };
     let root = tempfile::tempdir().unwrap();
-    let config = engine_config_with_delayed_models(root.path(), &fixture, &[MODEL_ID], 3);
+    let config = engine_config_with_held_models(root.path(), &fixture, &[MODEL_ID]);
     let mut host = serve(host_config(
         root.path(),
         EngineChoice::Builtin {
@@ -1557,6 +1579,9 @@ fn a_second_speed_check_is_refused_while_one_runs() {
         serving(status, MODEL_ID)
     });
 
+    // Held at its wrapper, the first check is still running whenever
+    // the second request lands — however long the runner took.
+    std::fs::write(engine_hold(root.path()), "").unwrap();
     // Nothing running yet: the first request is taken.
     assert!(matches!(
         app.engine(EngineRequest::SpeedCheck {
@@ -1579,7 +1604,8 @@ fn a_second_speed_check_is_refused_while_one_runs() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
-    // The first check still finishes and reports.
+    // The first check still finishes and reports once released.
+    std::fs::remove_file(engine_hold(root.path())).unwrap();
     let _reported = until_engine(&app, "the first check reported", |status| {
         matches!(status.speed_check, Some(SpeedCheckStatus::Reported { .. }))
     });
@@ -1629,4 +1655,159 @@ fn a_speed_check_for_an_unknown_model_is_refused() {
     ));
     drop(app);
     host.shutdown();
+}
+
+/// #475: the probe loads a second resident copy of the model beside the
+/// live engine, so it obeys the same memory policy as a swap (#363).
+/// With essentially nothing free, the check is refused before it
+/// records `Running` or spawns anything — and the serving model is
+/// untouched.
+#[test]
+fn a_speed_check_is_refused_when_a_second_resident_copy_cannot_fit() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let mut config = engine_config_with_models(root.path(), Some(&fixture), &[MODEL_ID]);
+    config.available_memory_override = Some(Some(1024));
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    let before = until_engine(&app, "the first model serving", |status| {
+        serving(status, MODEL_ID)
+    });
+    let live_pid = before
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.active.as_ref())
+        .map(|active| active.pid);
+
+    let reply = app
+        .engine(EngineRequest::SpeedCheck {
+            model_id: MODEL_ID.into(),
+        })
+        .expect("answered");
+    let message = match reply {
+        EngineReply::Refused { message } => message,
+        other => panic!("expected a memory refusal, got {other:?}"),
+    };
+    assert!(message.contains("memory"), "{message}");
+
+    // Recorded on the model's row, not only in the reply — and never as
+    // `Running`: nothing was started that would clear a running state.
+    let settled = until_engine(&app, "the memory refusal recorded", |status| {
+        matches!(status.speed_check, Some(SpeedCheckStatus::Failed { .. }))
+    });
+    match settled.speed_check.as_ref().expect("recorded") {
+        SpeedCheckStatus::Failed {
+            model_id,
+            message: recorded,
+        } => {
+            assert_eq!(model_id, MODEL_ID);
+            assert_eq!(recorded, &message);
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    // The live engine never blinked.
+    let after = settled
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.active.as_ref())
+        .map(|active| active.pid);
+    assert_eq!(after, live_pid, "the serving engine is the same process");
+    drop(app);
+    host.shutdown();
+}
+
+/// How many processes carry `needle` in their command line (Linux
+/// `/proc`); `None` where there is no process table to read.
+#[cfg(unix)]
+fn count_processes_with(needle: &str) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut count = 0;
+        for entry in std::fs::read_dir("/proc").ok()? {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            if let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) {
+                if String::from_utf8_lossy(&cmdline).contains(needle) {
+                    count += 1;
+                }
+            }
+        }
+        Some(count)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = needle;
+        None
+    }
+}
+
+/// #475: a check that is still measuring when the host shuts down stops
+/// with the host. The probe is held at its wrapper for the whole test,
+/// so shutdown can only return promptly — and leave nothing running —
+/// if it cancels the worker and stops its sidecar rather than
+/// detaching both.
+#[cfg(unix)]
+#[test]
+fn shutdown_stops_a_running_speed_check() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config_with_held_models(root.path(), &fixture, &[MODEL_ID]);
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    until_engine(&app, "the first model serving", |status| {
+        serving(status, MODEL_ID)
+    });
+
+    std::fs::write(engine_hold(root.path()), "").unwrap();
+    assert!(matches!(
+        app.engine(EngineRequest::SpeedCheck {
+            model_id: MODEL_ID.into()
+        })
+        .expect("answered"),
+        EngineReply::Done { .. }
+    ));
+    until_engine(&app, "the check running", |status| {
+        matches!(status.speed_check, Some(SpeedCheckStatus::Running { .. }))
+    });
+    let engines = root.path().join("engines/starling-serve-cpu");
+    let engines = engines.to_str().unwrap().to_string();
+    // The probe's wrapper is up and held (Linux-observable).
+    if let Some(count) = count_processes_with(&engines) {
+        assert!(count >= 1, "the held probe wrapper is running");
+    }
+
+    drop(app);
+    // The hold is never released: this returns because shutdown
+    // cancels the check and stops its sidecar, not because the probe
+    // finished.
+    host.shutdown();
+
+    if count_processes_with(&engines).is_some() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut count = count_processes_with(&engines).unwrap();
+        while count > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            count = count_processes_with(&engines).unwrap();
+        }
+        assert_eq!(count, 0, "no probe process outlives shutdown");
+    }
+    std::fs::remove_file(engine_hold(root.path())).unwrap();
 }
