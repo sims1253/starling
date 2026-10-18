@@ -77,7 +77,8 @@ fn assert_sane(check: &starling_dictation::speedcheck::SpeedCheck) {
 /// Waits until at most `want` processes carry `needle` in their command
 /// line; `None` off Linux, where /proc is not the process table.
 fn wait_engine_count(needle: &Path, want: usize) -> bool {
-    let Some(mut count) = count_engine_processes(needle.to_str().unwrap()) else {
+    let needle = needle.to_string_lossy();
+    let Some(mut count) = count_engine_processes(&needle) else {
         // Off Linux there is no /proc to read: nothing to wait for.
         return true;
     };
@@ -87,7 +88,7 @@ fn wait_engine_count(needle: &Path, want: usize) -> bool {
         // A re-count that fails keeps the previous count rather than
         // reading as zero: ending the wait early would let this pass
         // while the engine process is still alive.
-        if let Some(fresh) = count_engine_processes(needle.to_str().unwrap()) {
+        if let Some(fresh) = count_engine_processes(&needle) {
             count = fresh;
         }
     }
@@ -164,7 +165,7 @@ fn the_check_does_not_disturb_the_live_engine_manager() {
     // One engine process: the live one, before any check. The count is
     // /proc-only, so it is guarded rather than asserted — a `Some(1)`
     // cannot be answered off Linux.
-    if let Some(count) = count_engine_processes(engine_dir.to_str().unwrap()) {
+    if let Some(count) = count_engine_processes(&engine_dir.to_string_lossy()) {
         assert_eq!(count, 1, "only the live engine runs before a check");
     }
 

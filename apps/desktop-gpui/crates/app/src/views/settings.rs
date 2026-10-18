@@ -981,16 +981,15 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
     rows
 }
 
-/// The lines a model row shows for the host's per-model speed check
-/// (#475), in the order the probes ran.
+/// The lines `model_id`'s row shows for the host's per-model speed
+/// check (#475), in the order the probes ran. `status` is the whole
+/// list's status, shared across the rows: only the row it belongs to
+/// returns anything.
 ///
 /// The arithmetic is the shared one (`starling_dictation::speedcheck`):
 /// this only renders it. What it must not do is invent a number — an
 /// unmeasurable probe reports unknown, and the synthetic one is always
 /// labelled as the upper bound it is (a tone decodes faster than speech).
-/// The lines `model_id`'s row shows for the host's per-model speed check
-/// (#475). `status` is the whole list's status, shared across the rows:
-/// only the row it belongs to returns anything.
 fn speedcheck_status_lines(
     status: Option<&starling_runtime_host::engine::SpeedCheckStatus>,
     model_id: &str,

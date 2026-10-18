@@ -354,7 +354,6 @@ pub fn check_memory_admission(
 ) -> Result<(), SpeedCheckError> {
     use crate::engine::memory::{estimate_resident, swap_plan, SwapPlan, SWAP_MARGIN_BYTES};
     let incoming = estimate_resident(entry.size_bytes);
-    let needed = incoming.saturating_add(SWAP_MARGIN_BYTES);
     match swap_plan(available, incoming, None, SWAP_MARGIN_BYTES) {
         SwapPlan::Rolling | SwapPlan::Unknown => Ok(()),
         SwapPlan::Refuse { needed, available } => Err(SpeedCheckError::InsufficientMemory {
@@ -368,7 +367,7 @@ pub fn check_memory_admission(
         // alongside is refused whatever the policy calls the shortfall.
         SwapPlan::NeedsDrain { .. } => Err(SpeedCheckError::InsufficientMemory {
             model_id: entry.id.clone(),
-            needed,
+            needed: incoming.saturating_add(SWAP_MARGIN_BYTES),
             available: available.expect("NeedsDrain implies a memory reading"),
         }),
     }

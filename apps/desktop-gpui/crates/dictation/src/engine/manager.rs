@@ -579,6 +579,10 @@ impl Drop for LoadReservation {
             .reserved
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Paired add/release under the same lock must never underflow;
+        // saturate in release so a bug degrades accounting, not the
+        // process — and say so loudly in debug builds.
+        debug_assert!(*reserved >= self.bytes, "load reservation counter underflow");
         *reserved = reserved.saturating_sub(self.bytes);
     }
 }
@@ -608,15 +612,6 @@ impl Inner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Waits until a load of `incoming_est` fits beside the loads
-    /// already admitted, then registers it — for the loads that must
-    /// eventually run (startup, crash restart, backend reload) rather
-    /// than be refused. Only *contention* waits: with no other
-    /// reservation held, the load proceeds exactly as it did before
-    /// reservations existed, even when the machine is simply low on
-    /// memory (the crash machinery handles a load that then fails).
-    /// Polls `cancelled` between attempts; `None` means the wait was
-    /// cancelled before anything registered.
     /// Waits until a load of `incoming_est` fits beside *other* loads'
     /// reservations (`own_bytes` is the caller's own claim, already
     /// registered — excluded, since the load being waited for runs
@@ -626,12 +621,19 @@ impl Inner {
     /// overspend beside a probe admitted after the caller's claim was
     /// sized. Only contention waits; with nothing else reserved the
     /// load proceeds as it always did. `false` means cancelled.
+    ///
+    /// The fit-then-spawn gap after this returns is covered by that
+    /// same standing claim: a load admitted in the gap is decided net
+    /// of the caller's registered bytes, so it cannot spend the memory
+    /// this spawn is about to use.
     fn wait_for_load_fit(
         &self,
         incoming_est: u64,
         own_bytes: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> bool {
+        let waited_from = Instant::now();
+        let mut logged = false;
         loop {
             if cancelled() {
                 return false;
@@ -647,16 +649,34 @@ impl Inner {
                     return true;
                 }
             }
+            if !logged && waited_from.elapsed() >= Duration::from_secs(30) {
+                logged = true;
+                eprintln!(
+                    "starling engine: a load is still waiting for memory held by another \
+                     admitted load (e.g. a speed check); it starts when that load releases it"
+                );
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
+    /// Waits until a load of `incoming_est` fits beside the loads
+    /// already admitted, then registers it — for the loads that must
+    /// eventually run (startup, crash restart, backend reload) rather
+    /// than be refused. Only *contention* waits: with no other
+    /// reservation held, the load proceeds exactly as it did before
+    /// reservations existed, even when the machine is simply low on
+    /// memory (the crash machinery handles a load that then fails).
+    /// Polls `cancelled` between attempts; `None` means the wait was
+    /// cancelled before anything registered.
     fn wait_admit_load(
         &self,
         incoming_est: u64,
         outgoing_est: Option<u64>,
         cancelled: &dyn Fn() -> bool,
     ) -> Option<LoadReservation> {
+        let waited_from = Instant::now();
+        let mut logged = false;
         loop {
             if cancelled() {
                 return None;
@@ -675,6 +695,13 @@ impl Inner {
                         reading,
                     });
                 }
+            }
+            if !logged && waited_from.elapsed() >= Duration::from_secs(30) {
+                logged = true;
+                eprintln!(
+                    "starling engine: a load is still waiting for memory held by another \
+                     admitted load (e.g. a speed check); it starts when that load releases it"
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -978,12 +1005,7 @@ impl EngineManager {
     /// file name and server slug (`crate::speedcheck`). `None` when the
     /// id is not in this manager's catalog.
     pub fn catalog_entry(&self, model_id: &str) -> Option<CatalogEntry> {
-        self.inner
-            .config
-            .catalog
-            .iter()
-            .find(|entry| entry.id == model_id)
-            .cloned()
+        self.inner.entry(model_id)
     }
 
     /// Stops every sidecar (blocking, at most a few seconds).
@@ -1979,7 +2001,7 @@ fn run_switch(mut ctx: SwitchCtx) {
         return;
     };
     if ctx.kind == SwitchKind::Reload {
-        run_reload(&ctx, &entry);
+        run_reload(&mut ctx, &entry);
         return;
     }
 
@@ -2594,7 +2616,7 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
 /// Restarts the active model on the newly selected backend (the CPU
 /// toggle). The old engine keeps serving until the cutover and then
 /// drains. A newer activation cancels this like any switch.
-fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
+fn run_reload(ctx: &mut SwitchCtx, entry: &CatalogEntry) {
     // A backend reload loads a second copy beside the serving one, so
     // it waits until that copy fits beside loads already admitted (a
     // speed check's probe) instead of overspending behind them. With
@@ -2608,6 +2630,10 @@ fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
         ctx.end_switch();
         return;
     };
+    // Keep the context's accounting truthful for any recovery path
+    // ever reached from here (today: none — a failed reload keeps the
+    // old engine serving instead of recovering).
+    ctx.reserved_bytes = _load_reservation.bytes();
     ctx.set_stage(SwitchStage::Loading);
     match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {

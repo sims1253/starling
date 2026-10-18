@@ -760,8 +760,9 @@ impl EngineHost {
 
     /// Changes whenever [`Self::status`] would read differently: the
     /// settings revision, the running manager's generation, and the
-    /// per-model speed check's (#475) — which advances while one runs,
-    /// so the feed carries its progress to every watching window.
+    /// per-model speed check's (#475) — which advances when a check
+    /// starts and when it finishes, so the feed carries both
+    /// transitions to every watching window.
     pub fn generation(&self) -> (u64, u64, u64) {
         let state = lock(&self.state);
         let manager = match &*state {
@@ -953,6 +954,10 @@ impl EngineHost {
             }
         };
         let Some(entry) = manager.catalog_entry(model_id) else {
+            // Not recorded: there is no catalog row to keep the reason
+            // on, and recording a Failed for an unknown id would
+            // replace a real model's last result in the one status
+            // slot every row reads.
             return EngineReply::Refused {
                 message: format!("No model {model_id} is in this host's catalog."),
             };
@@ -1000,10 +1005,12 @@ impl EngineHost {
         // reservation was decided against instead of racing a fresh OS
         // reading (which the reservation itself is meant to govern).
         target.available_memory_override = Some(reservation.reading());
-        // Released by the worker once its sidecar reports the model
-        // loaded — from then on the resident bytes show in the OS
-        // reading itself — or when the worker ends, whichever first.
-        let reservation = Arc::new(Mutex::new(Some(reservation)));
+        // Held by the worker for the whole run and released just
+        // before it records the terminal status: releasing at the
+        // loaded-but-warming stage would reopen admission against an
+        // OS reading that does not yet show the probe's peak footprint
+        // (warmup is still allocating), exactly the double-spend the
+        // claim exists to prevent.
 
         let outcome_slot = Arc::clone(&self.speed_check);
         let generation = Arc::clone(&self.speed_check_generation);
@@ -1043,7 +1050,6 @@ impl EngineHost {
         // on. Cancelling an individual running check still needs a
         // request and a UI affordance of its own (#475 follow-up).
         let cancel = self.speed_check_cancel.clone();
-        let releasing = Arc::clone(&reservation);
         let worker = std::thread::Builder::new()
             .name("starling-speedcheck".into())
             .spawn(move || {
@@ -1055,18 +1061,7 @@ impl EngineHost {
                     starling_dictation::speedcheck::run_speed_check(
                         &target,
                         starling_dictation::speedcheck::ALL_PROBES,
-                        &|stage| {
-                            // `Warming` is loaded-but-not-warm: the
-                            // weights are resident, so the reservation
-                            // has done its work and later admissions can
-                            // trust the OS reading again. (A poll can
-                            // skip straight past it to ready; the
-                            // reservation then simply lives until this
-                            // worker ends.)
-                            if stage == starling_dictation::engine::ReadyStage::Warming {
-                                lock(&releasing).take();
-                            }
-                        },
+                        &|_| {},
                         Some(&cancel),
                     )
                 }))
@@ -1094,6 +1089,10 @@ impl EngineHost {
                         message: error.to_string(),
                     },
                 };
+                // Release the memory claim before the terminal status
+                // becomes visible, so a check started the moment this
+                // one reports never decides against its leftover claim.
+                drop(reservation);
                 record_speed_check(&outcome_slot, &generation, Some(status));
             });
         match worker {
@@ -1431,10 +1430,13 @@ impl EngineHost {
     pub fn shutdown(&self) {
         // The speed-check worker first: cancelled (again — `begin_shutdown`
         // tripped it, and a direct caller of only this method gets the
-        // same stop) and joined, bounded, so no probe process and no
-        // pending status write outlives the host. A worker that somehow
-        // outlasts the bound is detached rather than holding shutdown
-        // hostage; its sidecar's `--parent-pid` backstop still applies.
+        // same stop) and joined, bounded, so a probe process does not
+        // outlive the host. A worker that somehow outlasts the bound
+        // is detached rather than holding shutdown hostage: it may
+        // still record its (cancelled) terminal status into the shared
+        // slot afterwards, which nothing on a shutting-down host
+        // supervises or relies on; its sidecar's `--parent-pid`
+        // backstop covers the process.
         self.speed_check_cancel.cancel();
         if let Some(worker) = lock(&self.speed_check_worker).take() {
             let deadline = Instant::now() + Duration::from_secs(10);
