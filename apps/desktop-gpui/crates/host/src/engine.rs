@@ -1075,11 +1075,8 @@ impl EngineHost {
                     // payload is the only clue to the real cause: dropping
                     // it leaves a `Failed` nobody can debug.
                     Err(
-                        starling_dictation::speedcheck::SpeedCheckError::EngineStart {
-                            reason: format!(
-                                "the speed check failed unexpectedly: {}",
-                                panic_text(&payload)
-                            ),
+                        starling_dictation::speedcheck::SpeedCheckError::Unexpected {
+                            reason: panic_text(&payload),
                         },
                     )
                 });

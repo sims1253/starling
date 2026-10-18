@@ -302,6 +302,13 @@ pub enum SpeedCheckError {
     Transcribe { kind: ProbeKind, reason: String },
     #[error("the speed check was cancelled")]
     Cancelled,
+    /// The run failed for a reason that is not the engine, the model,
+    /// or the machine's memory: its own machinery (a thread that would
+    /// not start, a panic in the worker). Kept apart from
+    /// [`SpeedCheckError::EngineStart`] so the sentence never claims
+    /// the engine failed to start when it was never the problem.
+    #[error("the speed check failed unexpectedly ({reason})")]
+    Unexpected { reason: String },
     /// Loading a second resident model would not fit in the memory
     /// currently free. The numbers are the swap policy's (#363):
     /// `needed` is the conservative resident estimate plus its margin,
@@ -355,13 +362,14 @@ pub fn check_memory_admission(
             needed,
             available,
         }),
-        // Unreachable with nothing to drain (NeedsDrain needs an
-        // outgoing estimate), but a probe that cannot fit alongside is
-        // refused whatever the policy calls the shortfall.
+        // Unreachable today (with nothing outgoing, `swap_plan`
+        // collapses NeedsDrain into Rolling-or-Refuse, and only ever
+        // returns it with a reading), but a probe that cannot fit
+        // alongside is refused whatever the policy calls the shortfall.
         SwapPlan::NeedsDrain { .. } => Err(SpeedCheckError::InsufficientMemory {
             model_id: entry.id.clone(),
             needed,
-            available: available.unwrap_or(0),
+            available: available.expect("NeedsDrain implies a memory reading"),
         }),
     }
 }
@@ -504,13 +512,13 @@ pub fn run_speed_check(
                         std::thread::sleep(Duration::from_millis(50));
                     }
                 })
-                .map_err(|error| SpeedCheckError::EngineStart {
+                .map_err(|error| SpeedCheckError::Unexpected {
                     reason: format!(
                         "the cancel watcher could not be started ({error}); \
                          a run that cannot be cancelled is not started"
                     ),
                 })?;
-            Some((Some(handle), watching))
+            Some((handle, watching))
         }
     };
     let _watch_guard = JoinOnDrop(watcher);
@@ -630,15 +638,13 @@ impl Drop for StopOnDrop<'_> {
 /// a run nobody can cancel). Clearing the flag first is what keeps the
 /// join bounded: a watcher polling a token nobody is going to cancel
 /// would otherwise outlive the run that owns it.
-struct JoinOnDrop(Option<(Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>)>);
+struct JoinOnDrop(Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>);
 
 impl Drop for JoinOnDrop {
     fn drop(&mut self) {
         if let Some((handle, watching)) = self.0.take() {
             watching.store(false, Ordering::Release);
-            if let Some(handle) = handle {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
     }
 }
