@@ -546,8 +546,8 @@ struct Inner {
 }
 
 /// One admitted load's claim on free memory, released on drop. The
-/// host holds a speed check's reservation until the probe reports its
-/// model loaded (resident bytes then show in the OS reading itself);
+/// host holds a speed check's reservation for the whole run (through
+/// warmup and measurement, until just before the result is recorded);
 /// a switch holds its own until the switch ends.
 pub struct LoadReservation {
     reserved: Arc<Mutex<u64>>,
