@@ -586,9 +586,11 @@ pub(crate) fn readiness_headline(readiness: Option<Readiness>) -> &'static str {
 /// How the active take ends, in the words the capture pane shows.
 pub(crate) fn finish_hint(latch: Option<Latch>, shortcut: &str) -> Option<String> {
     Some(match latch? {
-        Latch::Held => "Release to finish · Esc cancels".to_string(),
-        Latch::Latched => format!("Press {shortcut} to finish · Esc cancels"),
-        Latch::HandsFree => format!("Hands-free · press {shortcut} to finish · Esc cancels"),
+        Latch::Held => "Release to finish, or press Esc to cancel.".to_string(),
+        Latch::Latched => format!("Press {shortcut} to finish, or Esc to cancel."),
+        Latch::HandsFree => {
+            format!("Hands-free. Press {shortcut} to finish, or Esc to cancel.")
+        }
     })
 }
 
@@ -1444,11 +1446,11 @@ mod tests {
         assert_eq!(finish_hint(None, "F9"), None);
         assert_eq!(
             finish_hint(Some(Latch::Held), "F9").as_deref(),
-            Some("Release to finish · Esc cancels")
+            Some("Release to finish, or press Esc to cancel.")
         );
         assert_eq!(
             finish_hint(Some(Latch::HandsFree), "F9").as_deref(),
-            Some("Hands-free · press F9 to finish · Esc cancels")
+            Some("Hands-free. Press F9 to finish, or Esc to cancel.")
         );
     }
 

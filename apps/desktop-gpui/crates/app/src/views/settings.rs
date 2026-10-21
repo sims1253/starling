@@ -1,12 +1,14 @@
-//! The settings modal: dark scrim over the workspace, light centered card
-//! with the Engine section (mode, models, switches — #362/#363), the
-//! manual server fields, and the after-transcription section.
+//! The settings sheet: a scrim over the window, the page list on the
+//! left, the chosen page on the right, and Save always in reach at the
+//! foot. Pages: the Engine (mode, models, switches — #362/#363, or the
+//! manual server's fields), then dictation, input, and what happens to a
+//! take afterwards.
 
 use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, Context, Div, FontWeight, MouseButton, SharedString, Window, div,
-    prelude::*, px, rgba,
+    prelude::*, px,
 };
 use starling_dictation::engine::{
     Backend, EngineFailure, EngineSnapshot, InstallState, SwapDecision, SwitchReport, SwitchStage,
@@ -16,33 +18,185 @@ use starling_dictation::settings::{ActivationMode, EngineMode, PlaybackMode};
 use crate::app::{ConnectionProbe, StarlingApp, settings_callout_view};
 use crate::processing;
 use crate::theme;
+use crate::views::kit::{self, Tone};
 use crate::views::{SETTINGS_CALLOUT_DOT_ID, icon, status_dot};
+
+/// The pages of the settings sheet, in the order the list shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsPage {
+    Engine,
+    Dictation,
+    Microphone,
+    Playback,
+    Feedback,
+    LivePreview,
+    HistoryAudio,
+    AfterTake,
+    AfterTranscription,
+}
+
+impl SettingsPage {
+    pub const ALL: [SettingsPage; 9] = [
+        SettingsPage::Engine,
+        SettingsPage::Dictation,
+        SettingsPage::Microphone,
+        SettingsPage::Playback,
+        SettingsPage::Feedback,
+        SettingsPage::LivePreview,
+        SettingsPage::HistoryAudio,
+        SettingsPage::AfterTake,
+        SettingsPage::AfterTranscription,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsPage::Engine => "Engine",
+            SettingsPage::Dictation => "Dictation",
+            SettingsPage::Microphone => "Microphone",
+            SettingsPage::Playback => "Playback",
+            SettingsPage::Feedback => "Overlay and sounds",
+            SettingsPage::LivePreview => "Live preview",
+            SettingsPage::HistoryAudio => "History audio",
+            SettingsPage::AfterTake => "After a take",
+            SettingsPage::AfterTranscription => "After transcription",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            SettingsPage::Engine => "settings-page-engine",
+            SettingsPage::Dictation => "settings-page-dictation",
+            SettingsPage::Microphone => "settings-page-microphone",
+            SettingsPage::Playback => "settings-page-playback",
+            SettingsPage::Feedback => "settings-page-feedback",
+            SettingsPage::LivePreview => "settings-page-live-preview",
+            SettingsPage::HistoryAudio => "settings-page-history-audio",
+            SettingsPage::AfterTake => "settings-page-after-take",
+            SettingsPage::AfterTranscription => "settings-page-after-transcription",
+        }
+    }
+}
 
 pub fn render_settings_modal(
     app: &mut StarlingApp,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<StarlingApp>,
 ) -> impl IntoElement {
-    // B06 (#207): the status line belongs to the probe once one ran — a
-    // draft's failure shows here without touching the live connection —
-    // and without a probe the committed status shows. Manual mode only:
-    // builtin mode has no manual endpoint, and its engine state fills the
-    // callout's place instead.
     let manual = app.draft_engine_mode == EngineMode::Manual;
-    let callout = settings_callout_view(app.probe.as_ref(), app.connection, &app.endpoint);
     let probing = matches!(app.probe, Some(ConnectionProbe::Testing { .. }));
-    let draft_endpoint = app.draft_endpoint.clone();
-    let draft_model = app.draft_model.clone();
-    let draft_terms = app.draft_terms.clone();
-    let engine_section = render_engine_section(app, cx);
-    let processing_section = render_processing_section(app, cx);
-    let microphone_section = crate::views::microphone::render_microphone_section(app, cx);
-    let dictation_section = render_dictation_section(app, cx);
-    let playback_section = render_playback_section(app, cx);
-    let feedback_section = crate::views::feedback::render_feedback_section(app, cx);
-    let live_preview_section = crate::views::live_preview::render_live_preview_section(app, cx);
-    let storage_section = crate::views::storage::render_storage_section(app, cx);
-    let insertion_section = crate::views::delivery::render_insertion_section(app, cx);
+    let page = app.settings_page;
+    let viewport = window.viewport_size();
+    let height = (viewport.height - px(48.)).min(px(720.));
+
+    let content: Div = match page {
+        SettingsPage::Engine => render_engine_page(app, cx),
+        SettingsPage::Dictation => render_dictation_section(app, cx),
+        SettingsPage::Microphone => crate::views::microphone::render_microphone_section(app, cx),
+        SettingsPage::Playback => render_playback_section(app, cx),
+        SettingsPage::Feedback => crate::views::feedback::render_feedback_section(app, cx),
+        SettingsPage::LivePreview => {
+            crate::views::live_preview::render_live_preview_section(app, cx)
+        }
+        SettingsPage::HistoryAudio => crate::views::storage::render_storage_section(app, cx),
+        SettingsPage::AfterTake => crate::views::delivery::render_insertion_section(app, cx),
+        SettingsPage::AfterTranscription => render_processing_section(app, cx),
+    };
+
+    let mut nav = div()
+        .id("settings-nav")
+        .w(px(210.))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .px(px(12.))
+        .py(px(20.))
+        .bg(theme::SHEET)
+        .border_r_1()
+        .border_color(theme::SHEET_LINE)
+        .child(
+            div()
+                .px(px(10.))
+                .pb(px(14.))
+                .font(theme::display_font())
+                .text_size(px(theme::HEADING))
+                .text_color(theme::SHEET_INK)
+                .child("Settings"),
+        );
+    for entry in SettingsPage::ALL {
+        let current = entry == page;
+        nav = nav.child(
+            div()
+                .id(entry.id())
+                .relative()
+                .px(px(10.))
+                .py(px(7.))
+                .rounded(px(6.))
+                .text_size(px(theme::TEXT_MD))
+                .text_color(if current {
+                    theme::SHEET_INK
+                } else {
+                    theme::SHEET_QUILL
+                })
+                .when(current, |item| {
+                    item.bg(theme::SHEET_CARD).font_weight(FontWeight::SEMIBOLD)
+                })
+                .when(!current, |item| {
+                    item.cursor_pointer()
+                        .hover(|style| style.bg(theme::SHEET_HOVER).text_color(theme::SHEET_INK))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.settings_page = entry;
+                            cx.notify();
+                        }))
+                })
+                .child(entry.label()),
+        );
+    }
+
+    let footer = div()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .gap(px(8.))
+        .px(px(28.))
+        .py(px(14.))
+        .border_t_1()
+        .border_color(theme::SHEET_LINE)
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(theme::SHEET_QUILL)
+                .child("Engine actions apply at once; everything else applies on Save."),
+        )
+        .when(manual, |footer| {
+            // B06 (#207): one probe at a time — while the newest press is
+            // in flight the button carries no click handler at all (and
+            // `test_connection` drops re-entrant presses as the
+            // state-layer twin of the same guard).
+            footer.child(
+                kit::button("test-connection", Tone::SheetQuiet, probing)
+                    .when(!probing, |button| {
+                        button.on_click(cx.listener(|this, _, _window, cx| {
+                            this.test_connection(cx);
+                        }))
+                    })
+                    .child(if probing {
+                        "Testing…"
+                    } else {
+                        "Test connection"
+                    }),
+            )
+        })
+        .child(
+            kit::button("save-settings", Tone::SheetPrimary, false)
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.save_settings(cx);
+                }))
+                .child("Save settings"),
+        );
 
     let card = div()
         .id("settings-card")
@@ -52,193 +206,73 @@ pub fn render_settings_modal(
                 cx.stop_propagation();
             }),
         )
-        .relative()
-        .w(px(510.))
+        .w(px(880.))
         .max_w_full()
-        .max_h(px(680.))
-        .overflow_y_scroll()
-        .bg(theme::PAPER_LIGHT)
-        .text_color(theme::SETTINGS_INK)
-        .p(px(33.))
-        .shadow(vec![gpui::BoxShadow {
-            color: rgba(0x00000099).into(),
-            offset: gpui::point(px(0.), px(30.)),
-            blur_radius: px(100.),
-            spread_radius: px(0.),
-        }])
+        .h(height)
+        .flex()
+        .flex_row()
+        .overflow_hidden()
+        .rounded(px(10.))
+        .bg(theme::SHEET_CARD)
+        .text_color(theme::SHEET_INK)
+        .child(nav)
         .child(
             div()
-                .id("settings-close")
-                .absolute()
-                .top(px(18.))
-                .right(px(18.))
-                .cursor_pointer()
-                .text_color(theme::SETTINGS_MUTED)
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.close_settings(cx);
-                }))
-                .child(icon("icons/x.svg", 18., theme::SETTINGS_MUTED)),
-        )
-        // ---- Engine (#362, #363): the section at the top ------------
-        .child(
-            div()
-                .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("ENGINE"),
-        )
-        .child(
-            div()
-                .mb(px(13.))
-                .font(theme::serif_font())
-                .font_weight(FontWeight::MEDIUM)
-                .text_size(px(33.))
-                .line_height(px(33.))
-                .child("Transcription engine"),
-        )
-        .child(
-            div()
-                .mb(px(25.))
-                .text_size(px(11.))
-                .line_height(px(11. * 1.65))
-                .text_color(theme::SETTINGS_MUTED)
-                .child(if manual {
-                    "Your own starling-serve or OpenAI-compatible transcription endpoint."
-                } else {
-                    "Dictation runs on the bundled engine on this machine; models are \
-                     downloaded and switched here."
-                }),
-        )
-        .child(mode_choice(app, cx))
-        .children((!manual).then_some(engine_section))
-        // ---- Manual server fields (manual mode only) ----------------
-        .when(manual, |card| {
-            card.child(
-                div()
-                    .mt(px(10.))
-                    .mb(px(13.))
-                    .font(theme::mono_font())
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::SETTINGS_EYEBROW)
-                    .child("CONNECTION"),
-            )
-        })
-        .when(manual, |card| {
-            card.child(field_label("Server endpoint").child(draft_endpoint))
-                .child(field_label("Model").child(draft_model))
-        })
-        .child(
-            field_label("Words to watch").child(draft_terms).child(
-                div()
-                    .mt(px(2.))
-                    .font_weight(FontWeight::NORMAL)
-                    .line_height(px(10. * 1.5))
-                    .text_color(theme::SETTINGS_HELPER)
-                    .child(
-                        "Comma-separated terms are checked after transcription. They are never \
-                         inserted or substituted.",
-                    ),
-            ),
-        )
-        .when(manual, |card| {
-            card.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(12.))
-                    .bg(theme::SETTINGS_CALLOUT)
-                    .p(px(12.))
-                    .mt(px(21.))
-                    .child(status_dot(SETTINGS_CALLOUT_DOT_ID, callout.dot, false))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .text_size(px(10.))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(callout.title))
-                            .child(
-                                div()
-                                    .font(theme::mono_font())
-                                    .text_size(px(9.))
-                                    .text_color(theme::SETTINGS_CALLOUT_ENDPOINT)
-                                    .child(callout.detail),
-                            ),
-                    ),
-            )
-        })
-        .child(dictation_section)
-        .child(microphone_section)
-        .child(playback_section)
-        .child(feedback_section)
-        .child(live_preview_section)
-        .child(storage_section)
-        .child(insertion_section)
-        .child(processing_section)
-        .child(
-            div()
+                .flex_1()
+                .min_w_0()
                 .flex()
-                .flex_row()
-                .justify_end()
-                .gap(px(9.))
-                .mt(px(25.))
-                .when(manual, |footer| {
-                    footer.child(
-                        div()
-                            .id("test-connection")
-                            .px(px(13.))
-                            .py(px(9.))
-                            .rounded(px(3.))
-                            .border_1()
-                            .border_color(theme::SETTINGS_FOOT_LINE)
-                            .text_size(px(10.))
-                            // B06 (#207): one probe at a time — while the
-                            // newest press is in flight the button carries no
-                            // click handler at all (and `test_connection`
-                            // drops re-entrant presses as the state-layer
-                            // twin of the same guard).
-                            .when(!probing, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme::PAPER_HOVER))
-                                    .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.test_connection(cx);
-                                    }))
-                            })
-                            .child(if probing {
-                                "Testing…"
-                            } else {
-                                "Test connection"
-                            }),
-                    )
-                })
+                .flex_col()
                 .child(
                     div()
-                        .id("save-settings")
-                        .px(px(13.))
-                        .py(px(9.))
-                        .rounded(px(3.))
-                        .border_1()
-                        .border_color(theme::SETTINGS_INK)
-                        .bg(theme::SETTINGS_INK)
-                        .text_color(theme::SETTINGS_PRIMARY_TEXT)
-                        .text_size(px(10.))
-                        .cursor_pointer()
-                        .hover(|style| style.opacity(0.9))
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.save_settings(cx);
-                        }))
-                        .child("Save settings"),
-                ),
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .pl(px(28.))
+                        .pr(px(14.))
+                        .pt(px(18.))
+                        .pb(px(12.))
+                        .child(
+                            div()
+                                .font(theme::display_font())
+                                .text_size(px(30.))
+                                .text_color(theme::SHEET_INK)
+                                .child(page.label()),
+                        )
+                        .child(
+                            div()
+                                .id("settings-close")
+                                .size(px(34.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::SHEET_HOVER))
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.close_settings(cx);
+                                }))
+                                .child(icon("icons/x.svg", 18., theme::SHEET_QUILL)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{}-body", page.id())))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .px(px(28.))
+                        .pb(px(28.))
+                        .text_size(px(theme::TEXT_MD))
+                        .child(content),
+                )
+                .child(footer),
         );
 
     let animated_card = card.with_animation(
         "modal-fade",
-        Animation::new(Duration::from_millis(200)),
+        Animation::new(Duration::from_millis(160)),
         |el, delta| el.opacity(delta),
     );
 
@@ -263,15 +297,78 @@ pub fn render_settings_modal(
         .child(animated_card)
 }
 
+/// The Engine page: which engine transcribes (#362, #363), its models or
+/// the manual server's fields, and the words to watch for.
+fn render_engine_page(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
+    // B06 (#207): the status line belongs to the probe once one ran — a
+    // draft's failure shows here without touching the live connection —
+    // and without a probe the committed status shows. Manual mode only:
+    // builtin mode has no manual endpoint, and its engine state fills the
+    // callout's place instead.
+    let manual = app.draft_engine_mode == EngineMode::Manual;
+    let callout = settings_callout_view(app.probe.as_ref(), app.connection, &app.endpoint);
+    let draft_endpoint = app.draft_endpoint.clone();
+    let draft_model = app.draft_model.clone();
+    let draft_terms = app.draft_terms.clone();
+    let engine_section = render_engine_section(app, cx);
+
+    div()
+        .flex()
+        .flex_col()
+        .child(kit::sheet_intro(if manual {
+            "Your own starling-serve or OpenAI-compatible transcription endpoint."
+        } else {
+            "Dictation runs on the bundled engine on this machine; models are downloaded and \
+             switched here."
+        }))
+        .child(div().mt(px(16.)).child(mode_choice(app, cx)))
+        .children((!manual).then_some(engine_section))
+        // ---- Manual server fields (manual mode only) ----------------
+        .when(manual, |page| {
+            page.child(kit::sheet_subheading("Connection").mt(px(22.)))
+                .child(field_label("Server endpoint").child(draft_endpoint))
+                .child(field_label("Model").child(draft_model))
+        })
+        .child(
+            field_label("Words to watch").child(draft_terms).child(helper(
+                "Comma-separated terms are checked after transcription. They are never inserted \
+                 or substituted.",
+            )),
+        )
+        .when(manual, |page| {
+            page.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .p(px(12.))
+                    .mt(px(8.))
+                    .rounded(px(6.))
+                    .bg(theme::SHEET_CALLOUT)
+                    .child(status_dot(SETTINGS_CALLOUT_DOT_ID, callout.dot))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .text_size(px(theme::TEXT_SM))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(callout.title))
+                            .child(div().text_color(theme::SHEET_QUILL).child(callout.detail)),
+                    ),
+            )
+        })
+}
+
 fn field_label(label: &str) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(7.))
-        .my(px(16.))
-        .text_size(px(10.))
+        .mt(px(18.))
+        .text_size(px(theme::TEXT_MD))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme::SETTINGS_INK)
+        .text_color(theme::SHEET_INK)
         .child(label.to_string())
 }
 
@@ -417,46 +514,41 @@ fn mode_choice(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
                 .id(SharedString::from(format!("engine-mode-{}", mode_label(mode))))
                 .flex()
                 .flex_row()
-                .gap(px(10.))
-                .p(px(10.))
-                .rounded(px(3.))
+                .gap(px(12.))
+                .p(px(12.))
+                .rounded(px(6.))
                 .border_1()
                 .border_color(if selected {
-                    theme::SETTINGS_INK
+                    theme::SHEET_BEAK
                 } else {
-                    theme::SETTINGS_LINE
+                    theme::SHEET_LINE
                 })
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::PAPER_HOVER))
+                .hover(|style| style.bg(theme::SHEET_HOVER))
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.pick_draft_engine_mode(mode, cx);
                 }))
                 .child(
-                    div()
-                        .mt(px(2.))
-                        .size(px(10.))
-                        .flex_none()
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(theme::SETTINGS_INK)
-                        .when(selected, |dot| dot.bg(theme::SETTINGS_INK)),
+                    kit::radio(selected),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_col()
+                        .flex_1()
+                        .min_w_0()
                         .gap(px(3.))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(theme::TEXT_MD))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(name),
                         )
                         .child(
                             div()
-                                .text_size(px(10.))
-                                .line_height(px(10. * 1.5))
-                                .text_color(theme::SETTINGS_HELPER)
+                                .text_size(px(theme::TEXT_SM))
+                                .line_height(px(theme::TEXT_SM * 1.5))
+                                .text_color(theme::SHEET_QUILL)
                                 .child(description),
                         ),
                 ),
@@ -510,9 +602,9 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
         .when(!backend_line.is_empty(), |section| {
             section.child(
                 div()
-                    .text_size(px(10.))
-                    .line_height(px(10. * 1.5))
-                    .text_color(theme::SETTINGS_MUTED)
+                    .text_size(px(theme::TEXT_SM))
+                    .line_height(px(theme::TEXT_SM * 1.5))
+                    .text_color(theme::SHEET_QUILL)
                     .child(backend_line),
             )
         })
@@ -529,7 +621,8 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
         div()
             .flex()
             .flex_row()
-            .gap(px(7.))
+            .items_center()
+            .gap(px(10.))
             .child(
                 engine_action(
                     "engine-backend-toggle",
@@ -545,9 +638,9 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
             )
             .child(
                 div()
-                    .text_size(px(10.))
-                    .line_height(px(10. * 1.5))
-                    .text_color(theme::SETTINGS_HELPER)
+                    .text_size(px(theme::TEXT_SM))
+                    .line_height(px(theme::TEXT_SM * 1.5))
+                    .text_color(theme::SHEET_QUILL)
                     .child("Automatic prefers Vulkan and falls back to the CPU engine."),
             ),
     );
@@ -592,24 +685,21 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(5.))
-            .text_size(px(10.))
-            .font(theme::mono_font());
+            .gap(px(6.))
+            .text_size(px(theme::TEXT_SM));
         if let Some(note) = note {
-            line = line
-                .child(div().text_color(theme::SETTINGS_MUTED).child(note))
-                .child(div().child("·"));
+            line = line.child(div().text_color(theme::SHEET_QUILL).child(format!("{note} ")));
         }
         for (index, step) in steps.iter().enumerate() {
             if index > 0 {
-                line = line.child(div().text_color(theme::SETTINGS_MUTED).child("→"));
+                line = line.child(div().text_color(theme::SHEET_QUILL).child("→"));
             }
             line = line.child(
                 div()
                     .text_color(if step.current {
-                        theme::SETTINGS_INK
+                        theme::SHEET_INK
                     } else {
-                        theme::SETTINGS_MUTED
+                        theme::SHEET_QUILL
                     })
                     .font_weight(if step.current {
                         FontWeight::SEMIBOLD
@@ -623,18 +713,18 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
             .child(line)
             .child(
                 div()
-                    .text_size(px(10.))
-                    .line_height(px(10. * 1.5))
-                    .text_color(theme::SETTINGS_HELPER)
+                    .text_size(px(theme::TEXT_SM))
+                    .line_height(px(theme::TEXT_SM * 1.5))
+                    .text_color(theme::SHEET_QUILL)
                     .child("The current model keeps serving until the new one is ready."),
             );
     }
     if let Some(report) = &snapshot.last_switch {
         section = section.child(
             div()
-                .text_size(px(10.))
-                .line_height(px(10. * 1.5))
-                .text_color(theme::SETTINGS_MUTED)
+                .text_size(px(theme::TEXT_SM))
+                .line_height(px(theme::TEXT_SM * 1.5))
+                .text_color(theme::SHEET_QUILL)
                 .child(switch_report_line(report)),
         );
     }
@@ -703,13 +793,13 @@ fn engine_note(text: &str) -> Div {
         .flex_row()
         .items_start()
         .gap(px(6.))
-        .p(px(9.))
-        .bg(theme::SETTINGS_CALLOUT)
-        .rounded(px(3.))
-        .text_size(px(10.))
-        .line_height(px(10. * 1.55))
-        .text_color(theme::SETTINGS_MUTED)
-        .child(icon("icons/alert-circle.svg", 13., theme::SETTINGS_MUTED))
+        .p(px(12.))
+        .bg(theme::SHEET_CALLOUT)
+        .rounded(px(6.))
+        .text_size(px(theme::TEXT_SM))
+        .line_height(px(theme::TEXT_SM * 1.55))
+        .text_color(theme::SHEET_INK)
+        .child(div().pt(px(2.)).child(icon("icons/alert-circle.svg", 14., theme::SHEET_QUILL)))
         .child(div().flex_1().min_w_0().child(text.to_string()))
 }
 
@@ -717,18 +807,7 @@ fn engine_action(
     id: &'static str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .px(px(10.))
-        .py(px(7.))
-        .rounded(px(3.))
-        .border_1()
-        .border_color(theme::SETTINGS_FOOT_LINE)
-        .text_size(px(10.))
-        .text_color(theme::SETTINGS_INK)
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::PAPER_HOVER))
+    kit::button(id, Tone::SheetQuiet, false)
         .on_click(move |event, window, cx| on_click(event, window, cx))
 }
 
@@ -760,12 +839,12 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
             .items_center()
             .gap(px(10.))
             .p(px(10.))
-            .rounded(px(3.))
+            .rounded(px(6.))
             .border_1()
             .border_color(if model.active {
-                theme::SETTINGS_INK
+                theme::SHEET_BEAK
             } else {
-                theme::SETTINGS_LINE
+                theme::SHEET_LINE
             });
 
         let mut info = div().flex().flex_col().gap(px(3.)).flex_1().min_w_0();
@@ -777,31 +856,29 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
                 .gap(px(6.))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(theme::TEXT_MD))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(model.label.clone()),
                 )
                 .when(model.recommended, |label| {
                     label.child(
                         div()
-                            .px(px(5.))
+                            .px(px(7.))
                             .py(px(1.))
-                            .rounded(px(2.))
-                            .border_1()
-                            .border_color(theme::SETTINGS_LINE)
-                            .font(theme::mono_font())
-                            .text_size(px(8.))
-                            .text_color(theme::SETTINGS_MUTED)
-                            .child("RECOMMENDED"),
+                            .rounded_full()
+                            .bg(theme::SHEET_CALLOUT)
+                            .text_size(px(theme::TEXT_XS))
+                            .text_color(theme::SHEET_BEAK)
+                            .child("Recommended"),
                     )
                 }),
         );
         info = info.child(
             div()
-                .text_size(px(10.))
-                .line_height(px(10. * 1.5))
-                .text_color(theme::SETTINGS_HELPER)
-                .child(format!("{} · {}", fmt_size(model.size_bytes), model.note)),
+                .text_size(px(theme::TEXT_SM))
+                .line_height(px(theme::TEXT_SM * 1.5))
+                .text_color(theme::SHEET_QUILL)
+                .child(format!("{}. {}", fmt_size(model.size_bytes), model.note)),
         );
 
         // Buttons by install state.
@@ -825,9 +902,8 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
                 buttons = buttons
                     .child(
                         div()
-                            .font(theme::mono_font())
-                            .text_size(px(9.))
-                            .text_color(theme::SETTINGS_MUTED)
+                            .text_size(px(theme::TEXT_SM))
+                            .text_color(theme::SHEET_QUILL)
                             .child(format!("{}%", download_percent(*done, *total))),
                     )
                     .child(
@@ -846,9 +922,8 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
             InstallState::Verifying => {
                 buttons = buttons.child(
                     div()
-                        .font(theme::mono_font())
-                        .text_size(px(9.))
-                        .text_color(theme::SETTINGS_MUTED)
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(theme::SHEET_QUILL)
                         .child("Verifying…"),
                 );
             }
@@ -856,12 +931,16 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
                 if model.active {
                     buttons = buttons.child(
                         div()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(3.))
-                            .bg(theme::SETTINGS_INK)
-                            .text_size(px(9.))
-                            .text_color(theme::SETTINGS_PRIMARY_TEXT)
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .h(px(30.))
+                            .px(px(4.))
+                            .text_size(px(theme::TEXT_SM))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::SHEET_INK)
+                            .child(icon("icons/check.svg", 14., theme::SHEET_BEAK))
                             .child("Active"),
                     );
                 } else {
@@ -882,21 +961,11 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
                 // offered for the installed, active or not (#475).
                 if measuring.as_deref() != Some(model.id.as_str()) {
                     buttons = buttons.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "model-speedcheck-{}",
-                                model.id
-                            )))
-                            .flex_none()
-                            .px(px(10.))
-                            .py(px(7.))
-                            .rounded(px(3.))
-                            .border_1()
-                            .border_color(theme::SETTINGS_FOOT_LINE)
-                            .text_size(px(10.))
-                            .text_color(theme::SETTINGS_INK)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme::PAPER_HOVER))
+                        kit::button(
+                            SharedString::from(format!("model-speedcheck-{}", model.id)),
+                            Tone::SheetQuiet,
+                            false,
+                        )
                             .on_click({
                                 let id = model.id.clone();
                                 cx.listener(move |this, _, _window, cx| {
@@ -910,9 +979,9 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
             InstallState::Failed(message) => {
                 info = info.child(
                     div()
-                        .text_size(px(10.))
-                        .line_height(px(10. * 1.5))
-                        .text_color(theme::FAILED_COPY)
+                        .text_size(px(theme::TEXT_SM))
+                        .line_height(px(theme::TEXT_SM * 1.5))
+                        .text_color(theme::SHEET_ROSE)
                         .child(message.clone()),
                 );
                 buttons = buttons.child(
@@ -936,18 +1005,11 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
             && !switching
         {
             buttons = buttons.child(
-                div()
-                    .id(SharedString::from(format!("model-delete-{}", model.id)))
-                    .flex_none()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(theme::SETTINGS_FOOT_LINE)
-                    .text_size(px(10.))
-                    .text_color(theme::DANGER)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme::PAPER_HOVER))
+                kit::button(
+                    SharedString::from(format!("model-delete-{}", model.id)),
+                    Tone::SheetDanger,
+                    false,
+                )
                     .on_click({
                         let id = model.id.clone();
                         cx.listener(move |this, _, _window, cx| {
@@ -963,10 +1025,9 @@ fn model_list(app: &StarlingApp, snapshot: &EngineSnapshot, cx: &mut Context<Sta
             info = info.child(
                 div()
                     .mt(px(4.))
-                    .font(theme::mono_font())
-                    .text_size(px(9.))
-                    .line_height(px(13.))
-                    .text_color(theme::SETTINGS_HELPER)
+                    .text_size(px(theme::TEXT_XS))
+                    .line_height(px(theme::TEXT_XS * 1.5))
+                    .text_color(theme::SHEET_QUILL)
                     .child(line),
             );
         }
@@ -1024,46 +1085,41 @@ fn render_processing_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp
                 .id(gpui::SharedString::from(format!("mode-{}", mode.id)))
                 .flex()
                 .flex_row()
-                .gap(px(10.))
-                .p(px(10.))
-                .rounded(px(3.))
+                .gap(px(12.))
+                .p(px(12.))
+                .rounded(px(6.))
                 .border_1()
                 .border_color(if selected {
-                    theme::SETTINGS_INK
+                    theme::SHEET_BEAK
                 } else {
-                    theme::SETTINGS_LINE
+                    theme::SHEET_LINE
                 })
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::PAPER_HOVER))
+                .hover(|style| style.bg(theme::SHEET_HOVER))
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.pick_draft_mode(&id, cx);
                 }))
                 .child(
-                    div()
-                        .mt(px(2.))
-                        .size(px(10.))
-                        .flex_none()
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(theme::SETTINGS_INK)
-                        .when(selected, |dot| dot.bg(theme::SETTINGS_INK)),
+                    kit::radio(selected),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_col()
+                        .flex_1()
+                        .min_w_0()
                         .gap(px(3.))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(theme::TEXT_MD))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(mode.name.clone()),
                         )
                         .child(
                             div()
-                                .text_size(px(10.))
-                                .line_height(px(10. * 1.5))
-                                .text_color(theme::SETTINGS_HELPER)
+                                .text_size(px(theme::TEXT_SM))
+                                .line_height(px(theme::TEXT_SM * 1.5))
+                                .text_color(theme::SHEET_QUILL)
                                 .child(mode.description.clone()),
                         ),
                 ),
@@ -1094,28 +1150,17 @@ fn render_processing_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp
     }
 
     div()
-        .mt(px(29.))
-        .pt(px(21.))
-        .border_t_1()
-        .border_color(theme::SETTINGS_LINE)
-        .child(
-            div()
-                .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("AFTER TRANSCRIPTION"),
-        )
+        .flex()
+        .flex_col()
         .child(rows)
         .child(
             div()
                 .id("processing-disclosure")
                 .mt(px(12.))
-                .bg(theme::SETTINGS_CALLOUT)
+                .bg(theme::SHEET_CALLOUT)
                 .p(px(12.))
-                .text_size(px(10.))
-                .line_height(px(10. * 1.55))
+                .text_size(px(theme::TEXT_SM))
+                .line_height(px(theme::TEXT_SM * 1.55))
                 .child(disclosure),
         )
         .child(fields)
@@ -1195,26 +1240,15 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
                 .id("shortcut-error")
                 .mt(px(2.))
                 .font_weight(FontWeight::NORMAL)
-                .line_height(px(10. * 1.5))
-                .text_color(theme::CORAL)
+                .line_height(px(theme::TEXT_SM * 1.5))
+                .text_color(theme::SHEET_ROSE)
                 .child(reason),
         );
     }
 
     div()
-        .mt(px(29.))
-        .pt(px(21.))
-        .border_t_1()
-        .border_color(theme::SETTINGS_LINE)
-        .child(
-            div()
-                .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("DICTATION"),
-        )
+        .flex()
+        .flex_col()
         .child(field)
         .child(rows)
         .child(div().mt(px(6.)).child(double_tap_row))
@@ -1222,10 +1256,10 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
             div()
                 .id("shortcut-reach")
                 .mt(px(12.))
-                .bg(theme::SETTINGS_CALLOUT)
+                .bg(theme::SHEET_CALLOUT)
                 .p(px(12.))
-                .text_size(px(10.))
-                .line_height(px(10. * 1.55))
+                .text_size(px(theme::TEXT_SM))
+                .line_height(px(theme::TEXT_SM * 1.55))
                 .child(reach),
         )
         .children(crate::views::system_check::render_desktop_shortcut(app, cx))
@@ -1280,12 +1314,12 @@ fn render_playback_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>)
         .flex_col()
         .gap(px(6.))
         .p(px(10.))
-        .rounded(px(3.))
+        .rounded(px(6.))
         .border_1()
         .border_color(if lowering {
-            theme::SETTINGS_INK
+            theme::SHEET_BEAK
         } else {
-            theme::SETTINGS_LINE
+            theme::SHEET_LINE
         })
         .when(!lowering, |row| row.opacity(0.5))
         .child(
@@ -1293,13 +1327,13 @@ fn render_playback_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>)
                 .flex()
                 .flex_row()
                 .justify_between()
-                .text_size(px(11.))
+                .text_size(px(theme::TEXT_MD))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("Lower playback to")
                 .child(
                     div()
-                        .font(theme::mono_font())
                         .font_weight(FontWeight::NORMAL)
+                        .text_color(theme::SHEET_QUILL)
                         .child(format!("{level}%")),
                 ),
         )
@@ -1309,25 +1343,14 @@ fn render_playback_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>)
     // Known only once a take has tried.
     let unsupported = app.playback.handle().unsupported_reason();
     let mut section = div()
-        .mt(px(29.))
-        .pt(px(21.))
-        .border_t_1()
-        .border_color(theme::SETTINGS_LINE)
+        .flex()
+        .flex_col()
         .child(
             div()
                 .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("PLAYBACK"),
-        )
-        .child(
-            div()
-                .mb(px(13.))
-                .text_size(px(11.))
-                .line_height(px(11. * 1.65))
-                .text_color(theme::SETTINGS_MUTED)
+                .text_size(px(theme::TEXT_MD))
+                .line_height(px(theme::TEXT_MD * 1.65))
+                .text_color(theme::SHEET_QUILL)
                 .child(
                     "What happens to other audio while you dictate. Your volume and mute settings \
                      are restored when each recording ends.",
@@ -1340,10 +1363,10 @@ fn render_playback_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>)
             div()
                 .id("playback-unsupported")
                 .mt(px(12.))
-                .bg(theme::SETTINGS_CALLOUT)
+                .bg(theme::SHEET_CALLOUT)
                 .p(px(12.))
-                .text_size(px(10.))
-                .line_height(px(10. * 1.55))
+                .text_size(px(theme::TEXT_SM))
+                .line_height(px(theme::TEXT_SM * 1.55))
                 .child(format!(
                     "Playback cannot be adjusted on this system ({reason}); recordings leave it \
                      as it is."
@@ -1367,28 +1390,21 @@ pub(super) fn choice_row(
         .id(id)
         .flex()
         .flex_row()
-        .gap(px(10.))
-        .p(px(10.))
-        .rounded(px(3.))
+        .gap(px(12.))
+        .p(px(12.))
+        .rounded(px(6.))
         .border_1()
         .border_color(if selected {
-            theme::SETTINGS_INK
+            theme::SHEET_BEAK
         } else {
-            theme::SETTINGS_LINE
+            theme::SHEET_LINE
         })
         .when(enabled, |row| {
             row.cursor_pointer()
-                .hover(|style| style.bg(theme::PAPER_HOVER))
+                .hover(|style| style.bg(theme::SHEET_HOVER))
         })
         .child(
-            div()
-                .mt(px(2.))
-                .size(px(10.))
-                .flex_none()
-                .rounded(px(5.))
-                .border_1()
-                .border_color(theme::SETTINGS_INK)
-                .when(selected, |dot| dot.bg(theme::SETTINGS_INK)),
+            kit::radio(selected),
         )
         .child(
             // Shrinks to the row so a long description wraps.
@@ -1400,15 +1416,15 @@ pub(super) fn choice_row(
                 .gap(px(3.))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(theme::TEXT_MD))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(name),
                 )
                 .child(
                     div()
-                        .text_size(px(10.))
-                        .line_height(px(10. * 1.5))
-                        .text_color(theme::SETTINGS_HELPER)
+                        .text_size(px(theme::TEXT_SM))
+                        .line_height(px(theme::TEXT_SM * 1.5))
+                        .text_color(theme::SHEET_QUILL)
                         .child(description),
                 ),
         )
@@ -1417,10 +1433,10 @@ pub(super) fn choice_row(
 pub(super) fn helper(text: impl Into<SharedString>) -> Div {
     div()
         .mt(px(2.))
-        .text_size(px(10.))
+        .text_size(px(theme::TEXT_SM))
         .font_weight(FontWeight::NORMAL)
-        .line_height(px(10. * 1.5))
-        .text_color(theme::SETTINGS_HELPER)
+        .line_height(px(theme::TEXT_SM * 1.5))
+        .text_color(theme::SHEET_QUILL)
         .child(text.into())
 }
 

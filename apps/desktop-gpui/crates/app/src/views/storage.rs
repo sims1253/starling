@@ -59,25 +59,14 @@ pub(crate) fn render_storage_section(app: &mut StarlingApp, cx: &mut Context<Sta
     });
 
     let mut section = div()
-        .mt(px(29.))
-        .pt(px(21.))
-        .border_t_1()
-        .border_color(theme::SETTINGS_LINE)
+        .flex()
+        .flex_col()
         .child(
             div()
                 .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("HISTORY AUDIO"),
-        )
-        .child(
-            div()
-                .mb(px(13.))
-                .text_size(px(11.))
-                .line_height(px(11. * 1.65))
-                .text_color(theme::SETTINGS_MUTED)
+                .text_size(px(theme::TEXT_MD))
+                .line_height(px(theme::TEXT_MD * 1.65))
+                .text_color(theme::SHEET_QUILL)
                 .child(
                     "Finished recordings are kept losslessly compressed (FLAC): retries send \
                      exactly the audio the first transcription did. Nothing is removed unless \
@@ -91,9 +80,9 @@ pub(crate) fn render_storage_section(app: &mut StarlingApp, cx: &mut Context<Sta
             div()
                 .mt(px(16.))
                 .mb(px(10.))
-                .text_size(px(11.))
-                .line_height(px(11. * 1.65))
-                .text_color(theme::SETTINGS_MUTED)
+                .text_size(px(theme::TEXT_MD))
+                .line_height(px(theme::TEXT_MD * 1.65))
+                .text_color(theme::SHEET_QUILL)
                 .child(
                     "Archived recordings (Archive in a take's drawer) follow their own limits. \
                      They are kept as FLAC too; a smaller lossy archival format is not available \
@@ -107,10 +96,10 @@ pub(crate) fn render_storage_section(app: &mut StarlingApp, cx: &mut Context<Sta
             div()
                 .id("history-audio-report")
                 .mt(px(12.))
-                .bg(theme::SETTINGS_CALLOUT)
+                .bg(theme::SHEET_CALLOUT)
                 .p(px(12.))
-                .text_size(px(10.))
-                .line_height(px(10. * 1.55))
+                .text_size(px(theme::TEXT_SM))
+                .line_height(px(theme::TEXT_SM * 1.55))
                 .child(format!("Last cleanup: {report}")),
         );
     }
@@ -168,7 +157,7 @@ fn limit_rows(
 fn row_label(text: &'static str) -> Div {
     div()
         .mb(px(6.))
-        .text_size(px(11.))
+        .text_size(px(theme::TEXT_MD))
         .font_weight(FontWeight::SEMIBOLD)
         .child(text)
 }
@@ -178,16 +167,16 @@ fn chip(id: SharedString, selected: bool, label: &'static str) -> gpui::Stateful
         .id(id)
         .px(px(10.))
         .py(px(6.))
-        .rounded(px(3.))
+        .rounded(px(6.))
         .border_1()
         .border_color(if selected {
-            theme::SETTINGS_INK
+            theme::SHEET_BEAK
         } else {
-            theme::SETTINGS_LINE
+            theme::SHEET_LINE
         })
         .when(selected, |chip| chip.font_weight(FontWeight::SEMIBOLD))
         .cursor_pointer()
-        .hover(|style| style.bg(theme::PAPER_HOVER))
-        .text_size(px(10.))
+        .hover(|style| style.bg(theme::SHEET_HOVER))
+        .text_size(px(theme::TEXT_SM))
         .child(label)
 }

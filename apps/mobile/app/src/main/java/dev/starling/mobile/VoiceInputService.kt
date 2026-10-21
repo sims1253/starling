@@ -1044,6 +1044,8 @@ class VoiceInputService : InputMethodService() {
     private fun renderTake() {
         val current = take
         recordButton?.setText(if (current?.capturing == true) R.string.keyboard_stop else R.string.keyboard_record)
+        // Rose while it stops a take (the button's color state list).
+        recordButton?.isActivated = current?.capturing == true
         val bound = current?.target?.let { targetGuard.isCurrent(it, currentInputConnection) } == true
         val staged = current?.staged
         modeChip?.text = getString(R.string.staging_mode_chip, (staged?.mode ?: current?.mode ?: selectedMode()).name)

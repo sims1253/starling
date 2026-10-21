@@ -4,7 +4,8 @@ use gpui::{Context, Div, FontWeight, SharedString, Stateful, div, prelude::*, px
 
 use crate::app::StarlingApp;
 use crate::theme;
-use crate::views::icon;
+use crate::views::capture::{notice_action, notice_box};
+use crate::views::{icon, kit};
 
 /// The longest transcript excerpt the notice shows; Copy and Paste last
 /// always use the whole text.
@@ -21,17 +22,7 @@ fn excerpt(text: &str) -> String {
 }
 
 fn action(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px(px(9.))
-        .py(px(7.))
-        .rounded(px(4.))
-        .border_1()
-        .border_color(theme::RECOVERY_LINE)
-        .text_size(px(9.))
-        .text_color(theme::RECOVERY_TEXT)
-        .cursor_pointer()
-        .child(label.into())
+    notice_action(id).child(label.into())
 }
 
 /// The notice for a take whose text did not land, in the capture pane's
@@ -74,35 +65,23 @@ pub(crate) fn render_recovery(
         );
     if recovery.offers_settings() {
         actions = actions.child(
-            action("recovery-settings", "Open settings")
-                .on_click(cx.listener(|this, _, _window, cx| this.open_settings(cx))),
+            action("recovery-settings", "Open settings").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.open_settings_at(crate::views::SettingsPage::AfterTake, cx)
+                },
+            )),
         );
     }
     Some(
-        div()
-            .id("delivery-recovery")
-            .absolute()
-            .left(px(28.))
-            .right(px(28.))
+        notice_box("delivery-recovery")
             .map(|card| {
                 if at_top {
-                    card.top(px(28.))
+                    card.top(px(20.))
                 } else {
-                    card.bottom(px(28.))
+                    card.bottom(px(20.))
                 }
             })
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(12.))
-            .p(px(14.))
-            .bg(theme::ERROR_BG)
-            .border_1()
-            .border_color(theme::ERROR_LINE)
-            .rounded(px(7.))
-            .text_size(px(11.))
-            .text_color(theme::ERROR_TEXT)
-            .child(icon("icons/alert-circle.svg", 18., theme::ERROR_TEXT))
+            .child(icon("icons/alert-circle.svg", 18., theme::NOTICE_TEXT))
             .child(
                 div()
                     .flex()
@@ -112,23 +91,29 @@ pub(crate) fn render_recovery(
                     // Without it the column sizes to its longest line, and
                     // the text runs past the card instead of wrapping.
                     .min_w(px(0.))
-                    .child(div().text_color(theme::ERROR_TITLE).child(recovery.title()))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::NOTICE_TITLE)
+                            .child(recovery.title()),
+                    )
                     .child(div().child(recovery.explanation()))
                     .child(
                         div()
                             .id("recovery-text")
-                            .text_color(theme::RECOVERY_TEXT)
+                            .font(theme::reading_font())
+                            .text_color(theme::NOTICE_TITLE)
                             .child(excerpt(&recovery.text)),
                     )
                     .child(actions)
-                    .child(div().text_color(theme::ERROR_SUBTLE).child(hint)),
+                    .child(div().text_color(theme::NOTICE_SUBTLE).child(hint)),
             )
             .child(
                 div()
                     .id("dismiss-recovery")
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _window, cx| this.dismiss_recovery(cx)))
-                    .child(icon("icons/x.svg", 16., theme::ERROR_TEXT)),
+                    .child(icon("icons/x.svg", 16., theme::NOTICE_TEXT)),
             ),
     )
 }
@@ -187,37 +172,11 @@ pub(crate) fn render_insertion_section(app: &StarlingApp, cx: &mut Context<Starl
     };
 
     div()
-        .mt(px(29.))
-        .pt(px(21.))
-        .border_t_1()
-        .border_color(theme::SETTINGS_LINE)
-        .child(
-            div()
-                .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("AFTER A TAKE"),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(insert)
-                .child(copy_only),
-        )
-        .child(div().mt(px(6.)).child(unverified))
-        .child(
-            div()
-                .id("insertion-note")
-                .mt(px(12.))
-                .bg(theme::SETTINGS_CALLOUT)
-                .p(px(12.))
-                .text_size(px(10.))
-                .line_height(px(10. * 1.55))
-                .child(note),
-        )
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(insert)
+        .child(copy_only)
+        .child(unverified)
+        .child(kit::sheet_callout("insertion-note").mt(px(6.)).child(note))
 }
-

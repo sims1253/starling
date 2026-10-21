@@ -7,7 +7,7 @@
     android:paddingStart="16dp"
     android:paddingTop="10dp"
     android:paddingEnd="16dp"
-    android:paddingBottom="10dp">
+    android:paddingBottom="12dp">
 
     <!-- The mode chip: tap (or long-press Record) for the mode picker. -->
     <LinearLayout
@@ -36,8 +36,7 @@
             android:accessibilityLiveRegion="polite"
             android:ellipsize="end"
             android:maxLines="3"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Meta" />
     </LinearLayout>
 
     <!-- Low storage while a take records (#342): a line of its own, so the
@@ -50,8 +49,7 @@
         android:accessibilityLiveRegion="polite"
         android:ellipsize="end"
         android:maxLines="2"
-        android:textColor="@color/starling_muted"
-        android:textSize="12sp"
+        android:textAppearance="@style/TextAppearance.Starling.Meta"
         android:visibility="gone" />
 
     <!-- Where the on-device model stands (loading, failed); hidden when
@@ -64,8 +62,7 @@
         android:accessibilityLiveRegion="polite"
         android:ellipsize="end"
         android:maxLines="3"
-        android:textColor="@color/starling_muted"
-        android:textSize="12sp"
+        android:textAppearance="@style/TextAppearance.Starling.Meta"
         android:visibility="gone" />
 
     <!-- The mode picker: one chip per mode, shown on demand. -->
@@ -100,8 +97,7 @@
             android:layout_weight="1"
             android:ellipsize="end"
             android:maxLines="2"
-            android:textColor="@color/starling_muted"
-            android:textSize="12sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Meta" />
 
         <Button
             android:id="@+id/keyboard_decision_undo"
@@ -130,8 +126,7 @@
             android:id="@+id/keyboard_transcript"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textColor="@color/starling_ink"
-            android:textSize="16sp"
+            android:textAppearance="@style/TextAppearance.Starling.Transcript"
             android:visibility="gone" />
     </ScrollView>
 
@@ -194,17 +189,23 @@
             android:text="@string/keyboard_switch_label"
             android:visibility="gone" />
 
+        <!-- Gold, and rose while it stops a take (VoiceInputService sets
+             it activated while capturing). -->
         <Button
             android:id="@+id/keyboard_record_button"
-            style="?android:attr/buttonBarButtonStyle"
+            style="@style/Widget.Starling.Button.Primary"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:drawableStart="@drawable/ic_record_hex"
+            android:drawablePadding="8dp"
+            android:gravity="center"
+            android:minHeight="52dp"
             android:text="@string/keyboard_record" />
 
         <Button
             android:id="@+id/keyboard_insert_button"
-            style="?android:attr/buttonBarButtonStyle"
+            style="@style/Widget.Starling.Button"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"
@@ -215,7 +216,7 @@
         <!-- The take's field is gone; its text can only be copied. -->
         <Button
             android:id="@+id/keyboard_copy_button"
-            style="?android:attr/buttonBarButtonStyle"
+            style="@style/Widget.Starling.Button"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"

@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The phone's one screen, in the order it is used: record, read what was
+     recorded, then the model, history audio, and the keyboard. -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/main_root"
     android:layout_width="match_parent"
@@ -12,63 +14,102 @@
         android:paddingStart="24dp"
         android:paddingTop="28dp"
         android:paddingEnd="24dp"
-        android:paddingBottom="32dp">
+        android:paddingBottom="40dp">
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/screen_title"
-            android:textColor="@color/starling_ink"
-            android:textSize="28sp"
-            android:textStyle="bold" />
+            android:textAppearance="@style/TextAppearance.Starling.Wordmark" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
+            android:layout_marginTop="2dp"
             android:text="@string/screen_subtitle"
-            android:textColor="@color/starling_muted"
-            android:textSize="15sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Body" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="28dp"
+            android:layout_marginTop="32dp"
+            android:text="@string/record_heading"
+            android:textAppearance="@style/TextAppearance.Starling.Heading" />
+
+        <TextView
+            android:id="@+id/recording_message"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textAppearance="@style/TextAppearance.Starling.Body" />
+
+        <!-- Live partial transcript while the recording is transcribed;
+             hidden when recording is plain or the live session failed (the
+             durable WAV then decides the final text). -->
+        <TextView
+            android:id="@+id/live_transcript"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textAppearance="@style/TextAppearance.Starling.Transcript"
+            android:visibility="gone" />
+
+        <!-- The one primary action: gold, rose while it stops a take
+             (MainActivity sets it activated while recording). -->
+        <Button
+            android:id="@+id/record_button"
+            style="@style/Widget.Starling.Button.Primary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:drawableStart="@drawable/ic_record_hex"
+            android:drawablePadding="10dp"
+            android:gravity="center"
+            android:text="@string/start_recording" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
+            android:text="@string/recordings_heading"
+            android:textAppearance="@style/TextAppearance.Starling.Heading" />
+
+        <LinearLayout
+            android:id="@+id/recordings_container"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
             android:text="@string/model_heading"
-            android:textColor="@color/starling_ink"
-            android:textSize="18sp"
-            android:textStyle="bold" />
+            android:textAppearance="@style/TextAppearance.Starling.Heading" />
 
         <TextView
             android:id="@+id/on_device_status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
             android:layout_marginTop="4dp"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Meta" />
 
         <!-- Filled by MainActivity.renderInstalledModels; hidden when none is installed. -->
         <TextView
             android:id="@+id/installed_models_heading"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
             android:layout_marginTop="12dp"
             android:text="@string/installed_models_heading"
-            android:textColor="@color/starling_ink"
-            android:textSize="14sp"
-            android:textStyle="bold"
+            android:textAppearance="@style/TextAppearance.Starling.Subheading"
             android:visibility="gone" />
 
         <TextView
             android:id="@+id/installed_models_help"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
             android:text="@string/installed_models_help"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp"
+            android:textAppearance="@style/TextAppearance.Starling.Meta"
             android:visibility="gone" />
 
         <LinearLayout
@@ -82,10 +123,8 @@
             android:id="@+id/model_storage_status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
             android:layout_marginTop="8dp"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Meta" />
 
         <Button
             android:id="@+id/share_models_button"
@@ -118,90 +157,29 @@
             android:layout_marginTop="4dp"
             android:text="@string/import_model" />
 
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:layout_marginTop="24dp"
-            android:background="@color/starling_line" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
-            android:text="@string/record_heading"
-            android:textColor="@color/starling_ink"
-            android:textSize="18sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:id="@+id/recording_message"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:textColor="@color/starling_muted"
-            android:textSize="14sp" />
-
-        <!-- Live partial transcript while the recording is transcribed;
-             hidden when recording is plain or the live session failed (the
-             durable WAV then decides the final text). -->
-        <TextView
-            android:id="@+id/live_transcript"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:textColor="@color/starling_ink"
-            android:textSize="15sp"
-            android:visibility="gone" />
-
-        <Button
-            android:id="@+id/record_button"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/start_recording" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/recordings_heading"
-            android:textColor="@color/starling_ink"
-            android:textSize="18sp"
-            android:textStyle="bold" />
-
-        <LinearLayout
-            android:id="@+id/recordings_container"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical" />
-
         <!-- History audio (#342): retention limits per class, all off by
              default, and what the last cleanup did. -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
+            android:layout_marginTop="40dp"
             android:text="@string/history_audio_heading"
-            android:textColor="@color/starling_ink"
-            android:textSize="18sp"
-            android:textStyle="bold" />
+            android:textAppearance="@style/TextAppearance.Starling.Heading" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
             android:text="@string/history_audio_intro"
-            android:textColor="@color/starling_muted"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Body" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
+            android:layout_marginTop="16dp"
             android:labelFor="@+id/retention_standard_age"
             android:text="@string/retention_age_label"
-            android:textColor="@color/starling_ink"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Subheading" />
 
         <Spinner
             android:id="@+id/retention_standard_age"
@@ -212,11 +190,10 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="14dp"
             android:labelFor="@+id/retention_standard_size"
             android:text="@string/retention_size_label"
-            android:textColor="@color/starling_ink"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Subheading" />
 
         <Spinner
             android:id="@+id/retention_standard_size"
@@ -229,17 +206,15 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
             android:text="@string/history_audio_archival_intro"
-            android:textColor="@color/starling_muted"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Body" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="14dp"
             android:labelFor="@+id/retention_archival_age"
             android:text="@string/retention_archival_age_label"
-            android:textColor="@color/starling_ink"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Subheading" />
 
         <Spinner
             android:id="@+id/retention_archival_age"
@@ -250,11 +225,10 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="14dp"
             android:labelFor="@+id/retention_archival_size"
             android:text="@string/retention_archival_size_label"
-            android:textColor="@color/starling_ink"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Subheading" />
 
         <Spinner
             android:id="@+id/retention_archival_size"
@@ -267,23 +241,22 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
-            android:textColor="@color/starling_muted"
-            android:textSize="13sp"
+            android:textAppearance="@style/TextAppearance.Starling.Meta"
             android:visibility="gone" />
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:layout_marginTop="18dp"
-            android:background="@color/starling_line" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
+            android:layout_marginTop="40dp"
+            android:text="@string/keyboard_heading"
+            android:textAppearance="@style/TextAppearance.Starling.Heading" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
             android:text="@string/keyboard_intro"
-            android:textColor="@color/starling_muted"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Body" />
 
         <Button
             android:id="@+id/open_keyboard_button"
@@ -297,8 +270,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="18dp"
             android:text="@string/voice_input_intro"
-            android:textColor="@color/starling_muted"
-            android:textSize="14sp" />
+            android:textAppearance="@style/TextAppearance.Starling.Body" />
 
     </LinearLayout>
 </ScrollView>

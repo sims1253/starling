@@ -52,6 +52,18 @@ impl AssetSource for Assets {
                 r#"<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>"#
             }
             "icons/play.svg" => r#"<polygon points="6 3 20 12 6 21 6 3"/>"#,
+            // The record control and the brand mark: the hexagon the
+            // logo's starling sits in, pointy end up. Filled hexes carry
+            // their own fill; the shared head only strokes.
+            "icons/hex.svg" => {
+                r##"<path d="M12 1.5 21.09 6.75v10.5L12 22.5l-9.09-5.25V6.75Z" fill="#000000"/>"##
+            }
+            "icons/hex-outline.svg" => {
+                r#"<path d="M12 1.5 21.09 6.75v10.5L12 22.5l-9.09-5.25V6.75Z" stroke-width="0.75"/>"#
+            }
+            "icons/brand.svg" => {
+                r##"<path d="M12 1.5 21.09 6.75v10.5L12 22.5l-9.09-5.25V6.75Z"/><circle cx="12" cy="12" r="2.5" fill="#000000" stroke="none"/>"##
+            }
             "icons/stop.svg" => r#"<rect width="14" height="14" x="5" y="5" rx="2"/>"#,
             _ => return Ok(None),
         };
@@ -76,6 +88,9 @@ impl AssetSource for Assets {
                 "trash",
                 "play",
                 "stop",
+                "hex",
+                "hex-outline",
+                "brand",
             ]
             .iter()
             .map(|name| SharedString::from(format!("icons/{name}.svg")))

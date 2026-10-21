@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Night palette: darkened surface/card/line, lightened ink/muted, and the
-         olive accent lifted in lightness so it keeps contrast on dark surfaces.
-         starling_ink reuses the light theme's surface tone for symmetry. -->
-    <color name="starling_ink">#E8E4D9</color>
-    <color name="starling_muted">#A6A897</color>
-    <color name="starling_accent">#9DB05F</color>
-    <color name="starling_surface">#14150F</color>
-    <color name="starling_card">#1F2018</color>
-    <color name="starling_line">#37392C</color>
+    <!-- The plumage palette, night side: the starling's indigo coat as the
+         surface, its pale specks as ink. The beak's gold reads on the
+         night as it is, so the accent and the beak are one color here. -->
+    <color name="starling_ink">#EFE9DC</color>
+    <color name="starling_muted">#A6A2C4</color>
+    <color name="starling_accent">#E3AC3B</color>
+    <color name="starling_surface">#191830</color>
+    <color name="starling_card">#211F3B</color>
+    <color name="starling_line">#34325A</color>
+    <color name="starling_beak">#E3AC3B</color>
+    <color name="starling_on_beak">#191830</color>
+    <color name="starling_rose">#E0607E</color>
+    <color name="starling_on_rose">#191830</color>
 </resources>

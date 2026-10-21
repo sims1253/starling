@@ -1,9 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.StarlingMobile" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">@color/starling_accent</item>
+    <!-- Only the framework parent and the status bar icons differ per
+         qualifier (values-night); everything else lives once, below. -->
+    <style name="Base.Theme.StarlingMobile" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+    <!-- What day and night share: the type, the controls, the surface. -->
+    <style name="Theme.StarlingMobile" parent="Base.Theme.StarlingMobile">
+        <item name="android:fontFamily">@font/atkinson</item>
+        <item name="android:textColorPrimary">@color/starling_ink</item>
+        <item name="android:textColorSecondary">@color/starling_muted</item>
+        <item name="android:colorAccent">@color/starling_accent</item>
+        <item name="android:colorControlActivated">@color/starling_accent</item>
+        <item name="android:colorControlNormal">@color/starling_muted</item>
+        <item name="android:buttonStyle">@style/Widget.Starling.Button</item>
+        <item name="android:buttonBarButtonStyle">@style/Widget.Starling.Button.Text</item>
+        <item name="android:textColorHighlight">@color/starling_line</item>
         <!-- Still honored on Android 14 and below, where edge-to-edge is not
              enforced; Android 15+ ignores these items under enforced
              edge-to-edge, where the MainActivity insets listener applies. -->
@@ -18,7 +31,84 @@
     <style name="Base.Theme.StarlingMobile.Dialog" parent="android:style/Theme.Material.Light.Dialog.NoActionBar" />
 
     <style name="Theme.StarlingMobile.Dialog" parent="Base.Theme.StarlingMobile.Dialog">
-        <item name="android:fontFamily">sans</item>
+        <item name="android:fontFamily">@font/atkinson</item>
         <item name="android:colorAccent">@color/starling_accent</item>
+        <item name="android:buttonBarButtonStyle">@style/Widget.Starling.Button.Text</item>
+        <item name="android:windowBackground">@drawable/dialog_background</item>
+    </style>
+
+    <!-- Buttons: one quiet outline, one gold primary, one text-only. -->
+    <style name="Widget.Starling.Button" parent="android:style/Widget.Material.Button">
+        <item name="android:background">@drawable/button_quiet</item>
+        <item name="android:textColor">@color/button_quiet_text</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:minWidth">48dp</item>
+        <item name="android:paddingStart">16dp</item>
+        <item name="android:paddingEnd">16dp</item>
+        <item name="android:stateListAnimator">@null</item>
+        <item name="android:elevation">0dp</item>
+    </style>
+
+    <style name="Widget.Starling.Button.Primary">
+        <item name="android:background">@drawable/button_primary</item>
+        <item name="android:textColor">@color/button_primary_text</item>
+        <item name="android:drawableTint">@color/button_primary_text</item>
+        <item name="android:textSize">17sp</item>
+        <item name="android:minHeight">60dp</item>
+        <item name="android:paddingStart">20dp</item>
+        <item name="android:paddingEnd">20dp</item>
+    </style>
+
+    <style name="Widget.Starling.Button.Text">
+        <item name="android:background">@drawable/button_text</item>
+        <item name="android:textColor">@color/button_text_text</item>
+        <item name="android:paddingStart">12dp</item>
+        <item name="android:paddingEnd">12dp</item>
+    </style>
+
+    <!-- Type: Literata's display cut for the few headings, Atkinson for
+         everything the interface says, Literata's text cut for what the
+         user said. -->
+    <style name="TextAppearance.Starling.Wordmark" parent="">
+        <item name="android:fontFamily">@font/literata_display_regular</item>
+        <item name="android:textSize">36sp</item>
+        <item name="android:textColor">@color/starling_ink</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Heading" parent="">
+        <item name="android:fontFamily">@font/literata_display_regular</item>
+        <item name="android:textSize">24sp</item>
+        <item name="android:textColor">@color/starling_ink</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Subheading" parent="">
+        <item name="android:fontFamily">@font/atkinson</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">@color/starling_ink</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Body" parent="">
+        <item name="android:fontFamily">@font/atkinson</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:lineSpacingMultiplier">1.3</item>
+        <item name="android:textColor">@color/starling_muted</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Meta" parent="">
+        <item name="android:fontFamily">@font/atkinson</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:lineSpacingMultiplier">1.25</item>
+        <item name="android:textColor">@color/starling_muted</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Transcript" parent="">
+        <item name="android:fontFamily">@font/literata_regular</item>
+        <item name="android:textSize">18sp</item>
+        <item name="android:lineSpacingMultiplier">1.4</item>
+        <item name="android:textColor">@color/starling_ink</item>
     </style>
 </resources>

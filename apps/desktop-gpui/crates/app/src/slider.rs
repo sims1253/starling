@@ -139,22 +139,24 @@ impl Element for SliderTrack {
     ) {
         let track_height = px(4.);
         let track_top = bounds.origin.y + (bounds.size.height - track_height) / 2.;
-        let thumb = px(12.);
+        let thumb = px(14.);
         let fill_width = bounds.size.width * (self.value as f32 / 100.);
         window.paint_quad(fill(
             gpui::Bounds::new(
                 point(bounds.origin.x, track_top),
                 size(bounds.size.width, track_height),
             ),
-            theme::SETTINGS_LINE,
-        ));
+            theme::SHEET_LINE,
+        )
+        .corner_radii(track_height / 2.));
         window.paint_quad(fill(
             gpui::Bounds::new(
                 point(bounds.origin.x, track_top),
                 size(fill_width, track_height),
             ),
-            theme::SETTINGS_INK,
-        ));
+            theme::SHEET_BEAK,
+        )
+        .corner_radii(track_height / 2.));
         window.paint_quad(fill(
             gpui::Bounds::new(
                 point(
@@ -163,8 +165,9 @@ impl Element for SliderTrack {
                 ),
                 size(thumb, thumb),
             ),
-            theme::SETTINGS_INK,
-        ));
+            theme::SHEET_BEAK,
+        )
+        .corner_radii(thumb / 2.));
         // Window-level, so a drag keeps tracking once the pointer leaves
         // the element.
         if self.dragging {

@@ -1,8 +1,17 @@
-//! Design tokens and small formatting helpers, mirroring
-//! `apps/desktop/src/styles.css`.
+//! Design tokens: the "plumage" palette, the type families, and small
+//! formatting helpers.
+//!
+//! The palette is taken from the bird the app is named after: the night
+//! indigo of a starling's coat, the pale specks that give it its name, the
+//! gold of its beak, and the teal and rose sheen its feathers throw in the
+//! light. Gold is the one action color; teal says "done", rose says
+//! "recording" or "something went wrong". Light "sheet" surfaces are for
+//! reading: the transcript and the settings.
+
+use std::borrow::Cow;
 
 use chrono::{DateTime, Datelike, Local, Timelike};
-use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Pixels, Rgba, px};
+use gpui::{App, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Pixels, Rgba, px};
 
 const fn rgb(hex: u32) -> Rgba {
     Rgba {
@@ -23,111 +32,159 @@ const fn rgba(hex: u32) -> Rgba {
     }
 }
 
-// Root surfaces
-pub const BG: Rgba = rgb(0x171813);
-pub const PANEL_SOFT: Rgba = rgba(0x1E1F1AB3); // rgba(30,31,26,0.7)
-pub const SCRIM: Rgba = rgba(0x060705B8); // rgba(6,7,5,0.72)
-pub const PAPER: Rgba = rgb(0xE8E4D9);
-pub const PAPER_LIGHT: Rgba = rgb(0xEFEBE0);
+// ---- Night: the window itself --------------------------------------------
+pub const NIGHT: Rgba = rgb(0x191830);
+/// The takes column and other surfaces that sit on the night.
+pub const ROOST: Rgba = rgb(0x211F3B);
+/// A selected row on the roost.
+pub const ROOST_SELECTED: Rgba = rgb(0x2C2A50);
+pub const HOVER: Rgba = rgba(0xEFE9DC0D);
+pub const LINE: Rgba = rgb(0x34325A);
+pub const SCRIM: Rgba = rgba(0x0D0C1ACC);
 
-// Text colors
-pub const INK: Rgba = rgb(0xE8E5DC);
-pub const MUTED: Rgba = rgb(0x98998E);
-pub const DIM: Rgba = rgb(0x6E7067);
-pub const EYEBROW: Rgba = rgb(0xA8AA8E);
-pub const TAKE_TITLE: Rgba = rgb(0xC9C7BF);
+/// Text on the night, and the specks of the level field.
+pub const SPECK: Rgba = rgb(0xEFE9DC);
+/// Secondary text: what something means, not what it is.
+pub const QUILL: Rgba = rgb(0xA6A2C4);
+/// Meta text that can be skipped. Still 4.5:1 on the night.
+pub const DIM: Rgba = rgb(0x8985AC);
 
-// Accents
-pub const LIME: Rgba = rgb(0xD9FF6A);
-pub const CORAL: Rgba = rgb(0xFF745B);
-pub const AMBER: Rgba = rgb(0xEFC26B);
-pub const AMBER_DEEP: Rgba = rgb(0x705A2B);
-pub const DOT_GREY: Rgba = rgb(0x6F7165);
-pub const WAVE_IDLE: Rgba = rgb(0x80836E);
-pub const BRAND_RING: Rgba = rgb(0x8B8D6E);
+// ---- Accents ----------------------------------------------------------------
+/// The action color: the record control, primary buttons, the selection.
+pub const BEAK: Rgba = rgb(0xE3AC3B);
+/// Text and icons drawn on the beak.
+pub const ON_BEAK: Rgba = rgb(0x191830);
+/// Ready and done.
+pub const SHEEN: Rgba = rgb(0x5FB3A6);
+/// Recording, and anything that failed.
+pub const ROSE: Rgba = rgb(0xE0607E);
 
-// Lines and translucent fills
-pub const LINE: Rgba = rgba(0xE8E5DC1B); // rgba(232,229,220,0.105)
-pub const HOVER_BG: Rgba = rgba(0xFFFFFF06); // rgba(255,255,255,0.025)
-pub const GEAR_HOVER_BG: Rgba = rgba(0xFFFFFF0E); // rgba(255,255,255,0.055)
-pub const ACTIVE_ROW_BG: Rgba = rgba(0xD9FF6A0E); // rgba(217,255,106,0.055)
-pub const RECORD_BORDER: Rgba = rgba(0xFFFFFF1F); // rgba(255,255,255,0.12)
-pub const RECORD_BG: Rgba = rgba(0x171813CC); // rgba(23,24,19,0.8)
-pub const IMPORT_LINE: Rgba = rgb(0x5B5C52);
-pub const MIC_FG: Rgba = rgb(0x1C2011);
+// ---- Notices on the night -----------------------------------------------
+pub const NOTICE_BG: Rgba = rgb(0x2E2244);
+pub const NOTICE_LINE: Rgba = rgba(0xE0607E59);
+pub const NOTICE_TITLE: Rgba = rgb(0xFFE3EA);
+pub const NOTICE_TEXT: Rgba = rgb(0xF3B3C2);
+pub const NOTICE_SUBTLE: Rgba = rgb(0xBE9AB5);
 
-// Error banner
-pub const ERROR_BG: Rgba = rgb(0x39241F);
-pub const ERROR_LINE: Rgba = rgba(0xFF745B47); // rgba(255,116,91,0.28)
-pub const ERROR_TEXT: Rgba = rgb(0xFFAC99);
-pub const ERROR_TITLE: Rgba = rgb(0xFFD8CF);
-pub const ERROR_SUBTLE: Rgba = rgb(0xAD8279);
-pub const RECOVERY_TEXT: Rgba = rgb(0xFFE3DC);
-pub const RECOVERY_LINE: Rgba = rgba(0xFFE3DC59); // rgba(255,227,220,0.35)
+// ---- Sheet: reading surfaces (transcript, settings) ---------------------
+pub const SHEET: Rgba = rgb(0xE7E5EE);
+/// The settings card: a step lighter than the transcript sheet.
+pub const SHEET_CARD: Rgba = rgb(0xF2F1F6);
+pub const SHEET_INK: Rgba = rgb(0x1E1C36);
+pub const SHEET_QUILL: Rgba = rgb(0x55527A);
+pub const SHEET_LINE: Rgba = rgb(0xCAC7DA);
+pub const SHEET_HOVER: Rgba = rgba(0x1E1C3612);
+pub const SHEET_FIELD: Rgba = rgba(0xFFFFFFB3);
+pub const SHEET_CALLOUT: Rgba = rgb(0xE2E0EC);
+/// The beak, deepened until it reads on the sheet: selection and focus.
+pub const SHEET_BEAK: Rgba = rgb(0x8F620A);
+/// A warning on the sheet (stale proposals, interrupted takes).
+pub const SHEET_WARN: Rgba = rgb(0x7A5512);
+/// Failed and destructive on the sheet.
+pub const SHEET_ROSE: Rgba = rgb(0xAE2F50);
 
-// Staging editor
-pub const STAGING_BG: Rgba = rgba(0x1E1F1ACC); // rgba(30,31,26,0.8)
-pub const STAGING_SELECTION: Rgba = rgba(0xD9FF6A33); // lime at 0.2
+/// The staging editor's selection, on the night.
+pub const SELECTION: Rgba = rgba(0xE3AC3B4D);
 
-// Transcript drawer (paper)
-pub const PAPER_INK: Rgba = rgb(0x24251E);
-pub const PAPER_SUBTLE: Rgba = rgb(0x7D7D71);
-pub const PAPER_EYEBROW: Rgba = rgb(0x747568);
-pub const PAPER_LINE: Rgba = rgba(0x24251E1F); // rgba(36,37,30,0.12)
-pub const PAPER_LINE_SOFT: Rgba = rgba(0x24251E1A); // rgba(36,37,30,0.1)
-pub const PAPER_HOVER: Rgba = rgba(0x24251E12); // rgba(36,37,30,0.07)
-pub const PAPER_BUTTON_LINE: Rgba = rgba(0x24251E2E); // rgba(36,37,30,0.18)
-pub const FAILED_COPY: Rgba = rgb(0x93483B);
-pub const PROCESSING: Rgba = rgb(0x68695E);
-pub const GRIP: Rgba = rgb(0xA6A399);
-pub const DANGER: Rgba = rgb(0xA04435);
+// ---- Type -----------------------------------------------------------------
+//
+// Two families. Literata, a serif drawn for long reading on screens, sets
+// what the user said: the transcript, in its text cut, and the state
+// sentence above the recorder, in its 72pt display cut. Atkinson
+// Hyperlegible Next, drawn for low-vision readers, sets everything the
+// interface says. Its mono sibling is kept for keycaps and the take timer,
+// where figures must not jump. All are embedded (OFL, see
+// `assets/fonts`), so the design does not depend on what is installed.
 
-// Settings modal
-pub const SETTINGS_INK: Rgba = rgb(0x25261F);
-pub const SETTINGS_MUTED: Rgba = rgb(0x68695E);
-pub const SETTINGS_EYEBROW: Rgba = rgb(0x77796C);
-pub const SETTINGS_LINE: Rgba = rgb(0xC4C1B8);
-pub const SETTINGS_FIELD_BG: Rgba = rgba(0xFFFFFF7A); // rgba(255,255,255,0.48)
-pub const SETTINGS_CALLOUT: Rgba = rgb(0xDEDBCF);
-pub const SETTINGS_CALLOUT_ENDPOINT: Rgba = rgb(0x737468);
-pub const SETTINGS_FOOT_LINE: Rgba = rgb(0xA9A79D);
-pub const SETTINGS_PRIMARY_TEXT: Rgba = rgb(0xEEEBDF);
-pub const SETTINGS_HELPER: Rgba = rgb(0x858579);
-pub const FOCUS_RING: Rgba = rgb(0x747E3D);
+pub const DISPLAY_FAMILY: &str = "Literata 72pt";
+pub const READING_FAMILY: &str = "Literata";
+pub const UI_FAMILY: &str = "Atkinson Hyperlegible Next";
+pub const MONO_FAMILY: &str = "Atkinson Hyperlegible Mono";
+
+/// A modular scale on a 14px base.
+pub const TEXT_XS: f32 = 12.;
+pub const TEXT_SM: f32 = 13.;
+pub const TEXT_MD: f32 = 14.;
+pub const TEXT_LG: f32 = 16.;
+pub const TEXT_XL: f32 = 18.;
+pub const HEADING: f32 = 24.;
+
+const FONTS: [&[u8]; 6] = [
+    include_bytes!("../assets/fonts/Literata72pt-Regular.ttf"),
+    include_bytes!("../assets/fonts/Literata-Regular.ttf"),
+    include_bytes!("../assets/fonts/Literata-Italic.ttf"),
+    include_bytes!("../assets/fonts/AtkinsonHyperlegibleNext-Regular.ttf"),
+    include_bytes!("../assets/fonts/AtkinsonHyperlegibleNext-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/AtkinsonHyperlegibleMono-Regular.ttf"),
+];
+
+/// Hand the embedded families to gpui's text system. A failure leaves the
+/// fallback chains below to pick installed faces.
+pub fn register_fonts(cx: &mut App) {
+    let fonts = FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect();
+    if let Err(err) = cx.text_system().add_fonts(fonts) {
+        eprintln!("Could not load Starling's fonts: {err}");
+    }
+}
 
 // gpui's font-kit fork does not consult fontconfig substitution: a missing
-// family silently falls back to the default sans. Resolve through an explicit
-// fallback chain so the serif/mono design survives on Linux.
-pub fn serif_font() -> Font {
+// family silently falls back to the default sans. Every family carries an
+// explicit chain so the design degrades to the nearest installed face.
+fn font(family: &'static str, fallbacks: &[&'static str]) -> Font {
     Font {
-        family: "Georgia".into(),
+        family: family.into(),
         features: FontFeatures::default(),
-        fallbacks: Some(FontFallbacks::from_fonts(vec![
-            "Iowan Old Style".into(),
-            "Palatino Linotype".into(),
-            "Noto Serif".into(),
-            "DejaVu Serif".into(),
-            "Liberation Serif".into(),
-            "serif".into(),
-        ])),
+        fallbacks: Some(FontFallbacks::from_fonts(
+            fallbacks.iter().map(|name| name.to_string()).collect(),
+        )),
         weight: FontWeight::default(),
         style: FontStyle::default(),
     }
 }
 
+const SERIF_FALLBACKS: [&str; 5] = [
+    "Literata",
+    "Georgia",
+    "Noto Serif",
+    "DejaVu Serif",
+    "serif",
+];
+
+/// The state sentence above the recorder.
+pub fn display_font() -> Font {
+    font(DISPLAY_FAMILY, &SERIF_FALLBACKS)
+}
+
+/// What the user said: transcripts, drafts, proposals.
+pub fn reading_font() -> Font {
+    font(READING_FAMILY, &SERIF_FALLBACKS[1..])
+}
+
+/// Everything the interface says. Set once on each window's root.
+pub fn ui_font() -> Font {
+    font(
+        UI_FAMILY,
+        &[
+            "Atkinson Hyperlegible",
+            "Segoe UI",
+            "Noto Sans",
+            "DejaVu Sans",
+            "sans-serif",
+        ],
+    )
+}
+
+/// Keycaps and the take timer.
 pub fn mono_font() -> Font {
-    Font {
-        family: "SFMono-Regular".into(),
-        features: FontFeatures::default(),
-        fallbacks: Some(FontFallbacks::from_fonts(vec![
-            "Noto Sans Mono".into(),
-            "DejaVu Sans Mono".into(),
-            "Liberation Mono".into(),
-            "monospace".into(),
-        ])),
-        weight: FontWeight::default(),
-        style: FontStyle::default(),
-    }
+    font(
+        MONO_FAMILY,
+        &[
+            "SFMono-Regular",
+            "Noto Sans Mono",
+            "DejaVu Sans Mono",
+            "monospace",
+        ],
+    )
 }
 
 /// CSS `clamp(min, value, max)` for pixel lengths.

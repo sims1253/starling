@@ -179,16 +179,19 @@ impl OverlayView {
     }
 }
 
+/// The overlay's mark: rose while it listens (the record control's
+/// recording color), gold while it works, teal once the words landed,
+/// and rose again when they did not.
 fn phase_color(phase: OverlayPhase) -> gpui::Rgba {
     match phase {
-        OverlayPhase::Listening => theme::LIME,
+        OverlayPhase::Listening => theme::ROSE,
         OverlayPhase::StartingMic
         | OverlayPhase::Finishing
         | OverlayPhase::Processing
         | OverlayPhase::Delivering
-        | OverlayPhase::InsertWaiting => theme::AMBER,
-        OverlayPhase::Ready | OverlayPhase::Delivered => theme::LIME,
-        OverlayPhase::DeliveryFailed | OverlayPhase::Stopped => theme::CORAL,
+        | OverlayPhase::InsertWaiting => theme::BEAK,
+        OverlayPhase::Ready | OverlayPhase::Delivered => theme::SHEEN,
+        OverlayPhase::DeliveryFailed | OverlayPhase::Stopped => theme::ROSE,
     }
 }
 
@@ -197,10 +200,11 @@ impl Render for OverlayView {
         let root = div()
             .id("overlay-root")
             .size_full()
-            .bg(theme::BG)
+            .bg(theme::NIGHT)
             .border_1()
-            .border_color(theme::RECORD_BORDER)
-            .text_color(theme::INK)
+            .border_color(theme::LINE)
+            .font(theme::ui_font())
+            .text_color(theme::SPECK)
             .px(px(14.))
             .py(px(9.))
             .flex()
@@ -226,7 +230,10 @@ impl Render for OverlayView {
                 | OverlayPhase::DeliveryFailed
                 | OverlayPhase::Stopped
         );
-        let dot = div().size(px(9.)).flex_none().rounded(px(5.)).bg(color);
+        let dot = div()
+            .size(px(14.))
+            .flex_none()
+            .child(crate::views::icon("icons/hex.svg", 14., color));
         let dot = if busy {
             dot.with_animation(
                 "overlay-dot",
@@ -240,37 +247,51 @@ impl Render for OverlayView {
             dot.into_any_element()
         };
 
+        // The level as a row of specks, lit from the left: the main
+        // window's level field, folded down to one line.
         let lit = (state.level * METER_BARS as f32).round() as usize;
         let meter = div()
             .id("overlay-meter")
             .flex()
             .flex_row()
-            .items_end()
-            .gap(px(2.))
+            .items_center()
+            .gap(px(3.))
             .h(px(14.))
             .children((0..METER_BARS).map(|bar| {
-                let height = 4. + 10. * (bar as f32 + 1.) / METER_BARS as f32;
                 div()
-                    .w(px(3.))
-                    .h(px(height))
-                    .rounded(px(1.))
-                    .bg(if bar < lit { theme::LIME } else { theme::LINE })
+                    .size(px(4.))
+                    .rounded_full()
+                    .bg(if bar < lit { theme::SPECK } else { theme::LINE })
             }));
 
         let weak = self.app.clone();
         let cancel = div()
             .id("overlay-cancel")
             .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
             .px(px(8.))
             .py(px(3.))
-            .rounded(px(3.))
+            .rounded(px(6.))
             .border_1()
-            .border_color(theme::RECORD_BORDER)
-            .text_size(px(10.))
-            .text_color(theme::MUTED)
+            .border_color(theme::LINE)
+            .text_size(px(theme::TEXT_XS))
+            .text_color(theme::QUILL)
             .cursor_pointer()
-            .hover(|style| style.bg(theme::GEAR_HOVER_BG).text_color(theme::INK))
-            .child("Cancel · Esc")
+            .hover(|style| style.bg(theme::HOVER).text_color(theme::SPECK))
+            .child("Cancel")
+            .child(
+                div()
+                    .px(px(4.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(theme::LINE)
+                    .font(theme::mono_font())
+                    .text_size(px(10.))
+                    .child("Esc"),
+            )
             .on_click(move |_, _window, cx| {
                 if let Some(app) = weak.upgrade() {
                     app.update(cx, |app, cx| app.overlay_cancel(cx));
@@ -291,7 +312,7 @@ impl Render for OverlayView {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(theme::TEXT_SM))
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
                             .child(state.phase.label()),
@@ -301,8 +322,8 @@ impl Render for OverlayView {
                         |column, detail| {
                             column.child(
                                 div()
-                                    .text_size(px(10.))
-                                    .text_color(theme::MUTED)
+                                    .text_size(px(theme::TEXT_XS))
+                                    .text_color(theme::QUILL)
                                     .truncate()
                                     .child(detail),
                             )
@@ -324,13 +345,13 @@ impl Render for OverlayView {
                     .pt(px(6.))
                     .border_t_1()
                     .border_color(theme::LINE)
-                    .font(theme::serif_font())
-                    .text_size(px(14.))
-                    .line_height(px(14. * 1.4))
+                    .font(theme::reading_font())
+                    .text_size(px(15.))
+                    .line_height(px(15. * 1.45))
                     .text_color(if text.is_empty() {
                         theme::DIM
                     } else {
-                        theme::INK
+                        theme::SPECK
                     })
                     .child(if text.is_empty() {
                         "Your words appear here as you speak.".to_string()

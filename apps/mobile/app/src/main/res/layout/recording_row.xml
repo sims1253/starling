@@ -5,31 +5,33 @@
     android:layout_marginTop="12dp"
     android:background="@drawable/recording_card"
     android:orientation="vertical"
-    android:padding="14dp">
+    android:paddingStart="16dp"
+    android:paddingTop="14dp"
+    android:paddingEnd="8dp"
+    android:paddingBottom="6dp">
 
     <TextView
         android:id="@+id/recording_title"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textColor="@color/starling_ink"
-        android:textSize="15sp"
-        android:textStyle="bold" />
+        android:layout_marginEnd="8dp"
+        android:textAppearance="@style/TextAppearance.Starling.Subheading" />
 
     <TextView
         android:id="@+id/recording_status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="3dp"
-        android:textColor="@color/starling_muted"
-        android:textSize="13sp" />
+        android:layout_marginEnd="8dp"
+        android:textAppearance="@style/TextAppearance.Starling.Meta" />
 
     <TextView
         android:id="@+id/recording_recovery"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="3dp"
-        android:textColor="@color/starling_muted"
-        android:textSize="13sp"
+        android:layout_marginEnd="8dp"
+        android:textAppearance="@style/TextAppearance.Starling.Meta"
         android:visibility="gone" />
 
     <TextView
@@ -37,8 +39,8 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="3dp"
-        android:textColor="@color/starling_muted"
-        android:textSize="13sp"
+        android:layout_marginEnd="8dp"
+        android:textAppearance="@style/TextAppearance.Starling.Meta"
         android:visibility="gone" />
 
     <TextView
@@ -46,18 +48,18 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="10dp"
-        android:textColor="@color/starling_ink"
-        android:textIsSelectable="true"
-        android:textSize="15sp" />
+        android:layout_marginEnd="8dp"
+        android:textAppearance="@style/TextAppearance.Starling.Transcript"
+        android:textIsSelectable="true" />
 
     <TextView
         android:id="@+id/recording_revisions"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:textColor="@color/starling_muted"
+        android:layout_marginEnd="8dp"
+        android:textAppearance="@style/TextAppearance.Starling.Meta"
         android:textIsSelectable="true"
-        android:textSize="13sp"
         android:visibility="gone" />
 
     <LinearLayout

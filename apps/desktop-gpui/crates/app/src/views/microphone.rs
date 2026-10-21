@@ -9,40 +9,27 @@ use starling_dictation::microphone::{InputProblem, InputRoute};
 use crate::app::StarlingApp;
 use crate::mic::{CheckOutcome, DeviceList, MicCheck, page_label, picker_rows, platform_pages};
 use crate::theme;
+use crate::views::kit;
 
 fn button(id: impl Into<SharedString>, label: &'static str) -> gpui::Stateful<Div> {
-    div()
-        .id(id.into())
-        .flex_none()
-        .px(px(10.))
-        .py(px(7.))
-        .rounded(px(3.))
-        .border_1()
-        .border_color(theme::SETTINGS_FOOT_LINE)
-        .text_size(px(10.))
-        .text_color(theme::SETTINGS_INK)
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::PAPER_HOVER))
-        .child(label)
+    kit::button(id.into(), kit::Tone::SheetQuiet, false).child(label)
+}
+
+/// The same action on the stage's error notice, in the notice's own ink.
+fn notice_button(id: impl Into<SharedString>, label: &'static str) -> gpui::Stateful<Div> {
+    crate::views::capture::notice_action(id.into()).child(label)
 }
 
 fn note(text: impl Into<SharedString>) -> Div {
     div()
-        .text_size(px(10.))
-        .line_height(px(10. * 1.55))
-        .text_color(theme::SETTINGS_HELPER)
+        .text_size(px(theme::TEXT_SM))
+        .line_height(px(theme::TEXT_SM * 1.55))
+        .text_color(theme::SHEET_QUILL)
         .child(text.into())
 }
 
-fn eyebrow(text: &'static str) -> Div {
-    div()
-        .mt(px(10.))
-        .mb(px(13.))
-        .font(theme::mono_font())
-        .text_size(px(10.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme::SETTINGS_EYEBROW)
-        .child(text)
+fn subheading(text: &'static str) -> Div {
+    kit::sheet_subheading(text).mt(px(24.))
 }
 
 /// "In use" wording for a route: the device, and the fallback notice when
@@ -90,39 +77,33 @@ pub(crate) fn render_microphone_section(
                 .id(SharedString::from(format!("mic-row-{index}")))
                 .flex()
                 .flex_row()
-                .gap(px(10.))
-                .p(px(10.))
-                .rounded(px(3.))
+                .gap(px(12.))
+                .p(px(12.))
+                .rounded(px(6.))
                 .border_1()
                 .border_color(if row.selected {
-                    theme::SETTINGS_INK
+                    theme::SHEET_BEAK
                 } else {
-                    theme::SETTINGS_LINE
+                    theme::SHEET_LINE
                 })
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::PAPER_HOVER))
+                .hover(|style| style.bg(theme::SHEET_HOVER))
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.pick_draft_microphone(device.clone(), cx);
                 }))
                 .child(
-                    div()
-                        .mt(px(2.))
-                        .size(px(10.))
-                        .flex_none()
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(theme::SETTINGS_INK)
-                        .when(row.selected, |dot| dot.bg(theme::SETTINGS_INK)),
+                    kit::radio(row.selected),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_col()
+                        .flex_1()
                         .gap(px(3.))
                         .min_w_0()
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(theme::TEXT_MD))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(row.label),
                         )
@@ -164,13 +145,12 @@ pub(crate) fn render_microphone_section(
     div()
         .flex()
         .flex_col()
-        .child(eyebrow("MICROPHONE"))
         .child(
             div()
                 .mb(px(10.))
-                .text_size(px(11.))
-                .line_height(px(11. * 1.65))
-                .text_color(theme::SETTINGS_MUTED)
+                .text_size(px(theme::TEXT_MD))
+                .line_height(px(theme::TEXT_MD * 1.65))
+                .text_color(theme::SHEET_QUILL)
                 .child(
                     "The input Starling records from. Playback keeps using your system output, \
                      so headphones plus a laptop or USB microphone work as expected.",
@@ -204,14 +184,14 @@ fn meter(fill: f32) -> Div {
     div()
         .h(px(6.))
         .w_full()
-        .rounded(px(3.))
-        .bg(theme::SETTINGS_LINE)
+        .rounded_full()
+        .bg(theme::SHEET_LINE)
         .child(
             div()
                 .h_full()
                 .w(relative(fill.clamp(0.0, 1.0)))
-                .rounded(px(3.))
-                .bg(theme::SETTINGS_INK),
+                .rounded_full()
+                .bg(theme::SHEET_BEAK),
         )
 }
 
@@ -219,12 +199,20 @@ fn meter(fill: f32) -> Div {
 fn settings_buttons(
     problem: &InputProblem,
     prefix: &'static str,
+    on_notice: bool,
     cx: &mut Context<StarlingApp>,
 ) -> Vec<gpui::Stateful<Div>> {
     platform_pages(problem)
         .into_iter()
         .map(|page| {
-            button(format!("{prefix}-{page:?}"), page_label(page)).on_click(
+            let id = format!("{prefix}-{page:?}");
+            let label = page_label(page);
+            if on_notice {
+                notice_button(id, label)
+            } else {
+                button(id, label)
+            }
+            .on_click(
                 cx.listener(move |this, _, _window, cx| this.open_input_settings(page, cx)),
             )
         })
@@ -232,17 +220,17 @@ fn settings_buttons(
 }
 
 fn problem_block(problem: &InputProblem, cx: &mut Context<StarlingApp>) -> Div {
-    let settings = settings_buttons(problem, "mic-check-settings", cx);
+    let settings = settings_buttons(problem, "mic-check-settings", false, cx);
     div()
         .flex()
         .flex_col()
-        .gap(px(6.))
-        .p(px(9.))
-        .bg(theme::SETTINGS_CALLOUT)
-        .rounded(px(3.))
+        .gap(px(8.))
+        .p(px(12.))
+        .bg(theme::SHEET_CALLOUT)
+        .rounded(px(6.))
         .child(
             div()
-                .text_size(px(10.))
+                .text_size(px(theme::TEXT_SM))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(problem.message()),
         )
@@ -331,7 +319,7 @@ fn render_check(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
             outcome,
         }) => {
             let summary = format!(
-                "{seconds:.1} s from {} · peak {:.0} dBFS, average {:.0} dBFS.",
+                "{seconds:.1} s from {}. Peak {:.0} dBFS, average {:.0} dBFS.",
                 route
                     .as_ref()
                     .map(|route| route.device.as_str())
@@ -344,10 +332,10 @@ fn render_check(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
                     div()
                         .id("mic-check-preview")
                         .p(px(9.))
-                        .rounded(px(3.))
+                        .rounded(px(6.))
                         .border_1()
-                        .border_color(theme::SETTINGS_LINE)
-                        .text_size(px(11.))
+                        .border_color(theme::SHEET_LINE)
+                        .text_size(px(theme::TEXT_MD))
                         .child(if text.trim().is_empty() {
                             "(The engine heard no words.)".to_string()
                         } else {
@@ -403,7 +391,7 @@ fn render_check(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
         .flex()
         .flex_col()
         .gap(px(8.))
-        .child(eyebrow("TEST MICROPHONE & SHORTCUT"))
+        .child(subheading("Test the microphone and shortcut"))
         .child(body)
         .child(div().flex().flex_row().gap(px(6.)).children(action))
         .children(app.mic.settings_launch_error.clone().map(note))
@@ -421,8 +409,8 @@ pub(crate) fn live_input_line(app: &StarlingApp) -> Option<Div> {
             div()
                 .id("live-input")
                 .max_w(px(460.))
-                .text_size(px(10.))
-                .text_color(if fallback { theme::CORAL } else { theme::DIM })
+                .text_size(px(theme::TEXT_SM))
+                .text_color(if fallback { theme::ROSE } else { theme::DIM })
                 .child(if fallback {
                     route_line(route)
                 } else if route.follows_sound_server() {
@@ -440,7 +428,7 @@ pub(crate) fn input_problem_actions(
     app: &StarlingApp,
     cx: &mut Context<StarlingApp>,
 ) -> Option<Div> {
-    let settings = settings_buttons(app.shown_input_problem()?, "input-settings", cx);
+    let settings = settings_buttons(app.shown_input_problem()?, "input-settings", true, cx);
     let actions = div()
         .mt(px(6.))
         .flex()
@@ -448,14 +436,17 @@ pub(crate) fn input_problem_actions(
         .flex_wrap()
         .gap(px(6.))
         .child(
-            button("input-retry", "Retry").on_click(cx.listener(|this, _, _window, cx| {
+            notice_button("input-retry", "Retry").on_click(cx.listener(|this, _, _window, cx| {
                 this.toggle_recording(crate::activation::RecordButton::Start, cx)
             })),
         )
         .children(settings)
         .child(
-            button("input-choose", "Choose microphone")
-                .on_click(cx.listener(|this, _, _window, cx| this.open_settings(cx))),
+            notice_button("input-choose", "Choose microphone").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.open_settings_at(crate::views::SettingsPage::Microphone, cx)
+                },
+            )),
         );
     Some(
         div().child(actions).children(
