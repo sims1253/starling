@@ -40,6 +40,63 @@ object ModelCatalog {
     )
 
     /**
+     * Underdog Bark 3.0 Pro (ConwayResearch, CC-BY-4.0): an English
+     * fine-tune of Parakeet TDT 0.6B v3 in the same q4pw layout, so the same
+     * size and speed. FLEURS en_us test (100 clips) WER 3.68 % vs
+     * Parakeet's 4.29 % (Whisper normalization;
+     * scripts/convert_parakeet_gguf.py --model-id).
+     */
+    val BARK_3_PRO = ModelDownload(
+        url = "https://huggingface.co/scholzmx/underdog-bark-3.0-pro-gguf/resolve/" +
+            "6b96418d56b68646807cdc71ee4c0a4222af2d0a/underdog-bark-3.0-pro-q4pw.gguf",
+        sizeBytes = 364_020_736L,
+        sha256 = "2370bf360720b322a54bdc4cfe6198713b347e79ebec7853956ade93618d5986",
+        label = "Bark 3.0 Pro (English)",
+        kind = ModelKind.PARAKEET,
+    )
+
+    /**
+     * Underdog Bark 3.0 Clean: Bark 3.0 Plus trained to leave out fillers,
+     * false starts and repeats while it transcribes (not verbatim). Converted
+     * exactly from its entropy-coded model.bark (convert_parakeet_gguf.py --bark),
+     * then q4pw.
+     */
+    val BARK_3_CLEAN = ModelDownload(
+        url = "https://huggingface.co/scholzmx/underdog-bark-3.0-clean-gguf/resolve/" +
+            "000c6b353d237ff647644ea2c3beb3910a21215b/underdog-bark-3.0-clean-q4pw.gguf",
+        sizeBytes = 364_020_736L,
+        sha256 = "d1eec8fc4b9aab0fb6a83ddba6a56a0f93b094d350d069f885a843e31eaee0cf",
+        label = "Bark 3.0 Clean (English, no fillers)",
+        kind = ModelKind.PARAKEET,
+    )
+
+    /**
+     * Underdog Bark 3.0 Plus: the verbatim model Clean builds on (model.bark,
+     * q4pw). Sometimes writes lowercase, unpunctuated text and spelled-out numbers.
+     */
+    val BARK_3_PLUS = ModelDownload(
+        url = "https://huggingface.co/scholzmx/underdog-bark-3.0-plus-gguf/resolve/" +
+            "1339fa59186ebacf60a40419fcd53643b2df2658/underdog-bark-3.0-plus-q4pw.gguf",
+        sizeBytes = 364_020_736L,
+        sha256 = "586e2d0306a82cf87c6d47e1fff7b80484a4143eaf5afb7da9b4a87cbcab3d29",
+        label = "Bark 3.0 Plus (English)",
+        kind = ModelKind.PARAKEET,
+    )
+
+    /**
+     * Underdog Bark 3.0: the smallest download of the family upstream; on the
+     * phone the same q4pw size as the others. Same output-style caveat as Plus.
+     */
+    val BARK_3 = ModelDownload(
+        url = "https://huggingface.co/scholzmx/underdog-bark-3.0-gguf/resolve/" +
+            "01b1d23afaaaf9c132c6d974269e91d01c84e915/underdog-bark-3.0-q4pw.gguf",
+        sizeBytes = 364_020_736L,
+        sha256 = "5650191831a0b6915003b34a8c82b45ba91d60bf6b36cfa0f08babe43a556081",
+        label = "Bark 3.0 (English)",
+        kind = ModelKind.PARAKEET,
+    )
+
+    /**
      * Qwen3-ASR-0.6B: Q8_0 encoder, Q5_K/Q6_K decoder, Q6_K head
      * (quants/recipes/qwen3-0.6b-k56x8e6.recipe).
      */
@@ -114,6 +171,10 @@ object ModelCatalog {
      */
     val ALL = listOf(
         RECOMMENDED_PARAKEET,
+        BARK_3_PRO,
+        BARK_3_CLEAN,
+        BARK_3_PLUS,
+        BARK_3,
         QWEN3_ASR_06B,
         ARK_ASR_06B,
         GRANITE_SPEECH_2B,

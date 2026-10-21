@@ -423,7 +423,10 @@ int main(int argc, char** argv) {
         std::map<std::string, starling::ggml::ImatrixEntry> aliases;
         for (const auto& kv : imap) {
             const std::string base = std::regex_replace(kv.first, kDerived, "");
-            if (base == kv.first || imap.count(base)) continue;
+            // A derived name with nothing before it (" (reshaped) (permuted)
+            // (cont)") is a view of an anonymous activation, e.g. an attention
+            // matmul, recorded by older collectors; it names no weight.
+            if (base.empty() || base == kv.first || imap.count(base)) continue;
             auto [it, fresh] = aliases.emplace(base, kv.second);
             if (fresh) continue;
             if (it->second.values.size() != kv.second.values.size()) {

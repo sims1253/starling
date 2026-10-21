@@ -19,6 +19,8 @@ convert = [
     "sentencepiece>=0.2.0",
     "librosa",
     "huggingface-hub>=1.0.0",
+    # Entropy decoding of ConwayResearch model.bark files (scripts/bark_format.py).
+    "constriction>=0.4",
 ]
 # Corpus export and calibration (benchmarks/fast_engine/export_fleurs.py,
 # benchmarks/fleurs_*.py, benchmarks/imatrix_collect.py).

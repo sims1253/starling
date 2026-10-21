@@ -24,6 +24,16 @@ Usage::
     uv run python scripts/convert_parakeet_gguf.py \\
         --model-id nvidia/parakeet-tdt-0.6b-v3 \\
         --output models/parakeet-tdt-0.6b-v3-bf16-exact.gguf
+
+The ConwayResearch Bark 3.0 family are fine-tunes of the same architecture.
+Bark 3.0 Pro is a stock safetensors checkpoint (``--model-id
+ConwayResearch/Underdog-Bark-3.0-Pro``, bf16 exact). Bark 3.0, Plus and Clean
+ship an entropy-coded ``model.bark`` (see ``scripts/bark_format.py``) whose
+weights are fp16 levels; ``--bark`` writes them as F16 (``--dtype f16``), exact::
+
+    uv run --group convert python scripts/convert_parakeet_gguf.py \\
+        --bark Underdog-Bark-3.0/model.bark \\
+        --output models/underdog-bark-3.0-f16-exact.gguf
 """
 from __future__ import annotations
 
@@ -376,18 +386,41 @@ def main() -> int:
                     help=f"HuggingFace model id (default: {DEFAULT_MODEL_ID})")
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
                     help=f"Output GGUF path (default: {DEFAULT_OUTPUT.name})")
-    ap.add_argument("--dtype", choices=["bf16", "f32"], default="bf16",
-                    help="Weight dtype: bf16 (default, byte-exact) or f32")
+    ap.add_argument("--bark", type=Path, default=None,
+                    help="Read weights and config from a ConwayResearch model.bark "
+                         "file instead of --model-id (processor from --processor-id)")
+    ap.add_argument("--processor-id", default=DEFAULT_MODEL_ID,
+                    help="HuggingFace id for the mel frontend + tokenizer when using --bark "
+                         f"(default: {DEFAULT_MODEL_ID}; the Bark fine-tunes keep its tokenizer)")
+    ap.add_argument("--dtype", choices=["bf16", "f16", "f32"], default=None,
+                    help="Linear weight dtype: bf16 (default, byte-exact for bf16 "
+                         "checkpoints), f16 (default with --bark: exact for fp16-valued "
+                         "weights; tensors that do not round-trip stay F32) or f32")
     args = ap.parse_args()
+    if args.dtype is None:
+        args.dtype = "f16" if args.bark is not None else "bf16"
+    elif args.bark is not None and args.dtype == "bf16":
+        sys.exit("--bark weights are fp16 levels, which bf16 rounds: use --dtype f16 (the default) or f32")
 
-    print(f"[convert_parakeet] loading {args.model_id} via transformers ...")
     from transformers import AutoModelForTDT, AutoProcessor
 
-    model = AutoModelForTDT.from_pretrained(args.model_id)
-    processor = AutoProcessor.from_pretrained(args.model_id)
-    config = model.config
+    if args.bark is not None:
+        print(f"[convert_parakeet] decoding {args.bark} ...")
+        from transformers import ParakeetTDTConfig
 
-    state_dict = model.state_dict()
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from bark_format import read_bark
+
+        bark_sd, bark_config = read_bark(args.bark)
+        state_dict = {k: torch.from_numpy(v) for k, v in bark_sd.items()}
+        config = ParakeetTDTConfig.from_dict(bark_config)
+        processor = AutoProcessor.from_pretrained(args.processor_id)
+    else:
+        print(f"[convert_parakeet] loading {args.model_id} via transformers ...")
+        model = AutoModelForTDT.from_pretrained(args.model_id)
+        processor = AutoProcessor.from_pretrained(args.model_id)
+        config = model.config
+        state_dict = model.state_dict()
     print(f"[convert_parakeet] state_dict has {len(state_dict)} tensors")
 
     # Extract mel filterbank + window.
@@ -417,7 +450,7 @@ def main() -> int:
     w = gguf.GGUFWriter(str(args.output), "parakeet_tdt", use_temp_file=True)
 
     # Metadata.
-    profile = "bf16_exact" if args.dtype == "bf16" else "f32_exact"
+    profile = f"{args.dtype}_exact"
     add_metadata(w, config, frontend_params, profile)
 
     # Tokenizer pieces (STRING array KV).
@@ -466,6 +499,11 @@ def main() -> int:
             a = np.ascontiguousarray(tensor.view(torch.uint16).numpy())
             w.add_tensor(gguf_name, a, raw_shape=a.shape,
                         raw_dtype=gguf.GGMLQuantizationType.BF16)
+        elif args.dtype == "f16" and kind == "bf16" and torch.equal(
+                tensor.to(torch.float16).float(), tensor.float()):
+            a = np.ascontiguousarray(tensor.to(torch.float16).numpy())
+            w.add_tensor(gguf_name, a, raw_shape=a.shape,
+                        raw_dtype=gguf.GGMLQuantizationType.F16)
         elif kind == "f16":
             a = np.ascontiguousarray(tensor.to(torch.float16).numpy())
             w.add_tensor(gguf_name, a, raw_shape=a.shape,
