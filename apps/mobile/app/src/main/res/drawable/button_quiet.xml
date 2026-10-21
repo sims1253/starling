@@ -1,10 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The mask bounds the ripple to the whole button: without it the ripple
+     is masked by the content, which is transparent apart from the outline. -->
 <ripple xmlns:android="http://schemas.android.com/apk/res/android"
     android:color="?android:attr/colorControlHighlight">
     <item>
         <shape android:shape="rectangle">
             <solid android:color="@android:color/transparent" />
             <stroke android:width="1dp" android:color="@color/starling_line" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+    <item android:id="@android:id/mask">
+        <shape android:shape="rectangle">
+            <solid android:color="@android:color/white" />
             <corners android:radius="10dp" />
         </shape>
     </item>
