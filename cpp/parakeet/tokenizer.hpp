@@ -3,7 +3,8 @@
 // Starling-authored port of parakeet.cpp's tokenizer.cpp:8-40. Detokenizes the
 // greedy-decode id stream (including blanks) into text:
 //   1. Concatenate pieces[id] for each id in [0, vocab_size); blank id
-//      (vocab_size = 8192) and any out-of-range id contribute nothing.
+//      (vocab_size = 8192), any out-of-range id and the special pieces
+//      <unk>, <pad> and <|endoftext|> contribute nothing.
 //   2. Replace every U+2581 (▁, SentencePiece meta-space; UTF-8 0xE2 0x96 0x81)
 //      with an ASCII space.
 //   3. Strip a single leading space (SentencePiece decode_ids behaviour).

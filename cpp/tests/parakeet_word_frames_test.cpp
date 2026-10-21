@@ -60,6 +60,12 @@ int main() {
     const auto split = word_frames(spaced, {1, 0, 2}, {0, 1, 2}, {1, 1, 1}, text);
     check(text == "a b" && split.size() == 2 && split[1].first_frame == 2,
           "a lone meta-space splits words");
+    // <unk> (a character outside the vocabulary) is dropped, as
+    // SentencePiece decode does; its word still gets its other tokens' times.
+    const std::vector<std::string> unk = {"<unk>", sp + "term", "s"};
+    const auto quoted = word_frames(unk, {1, 0, 2, 0}, {0, 1, 2, 3}, {1, 1, 1, 1}, text);
+    check(text == "terms" && quoted.size() == 1 && quoted[0].end_frame == 3,
+          "<unk> pieces are skipped");
 
     if (failures) {
         std::fprintf(stderr, "PARAKEET WORD FRAMES FAILED (%d)\n", failures);

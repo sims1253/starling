@@ -52,9 +52,11 @@ The app embeds the repository's native engine (`libstarling_ggml`). Tap
 **Download recommended model** to fetch
 `parakeet-tdt-0.6b-v3-q4pw-fullimx.gguf` (364 MB) from
 [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf),
-or **Download another model…** for the phone quants of Qwen3-ASR (0.6B,
-1.7B), ARK-ASR 0.6B, Granite Speech and MOSS-Transcribe (see the *Phone
-recipes* section of `docs/quantization.md`). Every download is pinned to a
+or **Download another model…** for the phone quants of the Underdog Bark
+3.0 family (Pro, Clean, Plus, 3.0: English Parakeet fine-tunes in the same
+364 MB layout), Qwen3-ASR (0.6B, 1.7B), ARK-ASR 0.6B, Granite Speech and
+MOSS-Transcribe (see the *Phone recipes* section of `docs/quantization.md`
+and [models](../../docs/models.md)). Every download is pinned to a
 repository revision, resumes where it stopped after a dropped connection
 or app restart, and is checked against its SHA-256 before it replaces the
 active model (`engine/ModelCatalog.kt`). Any other Parakeet-TDT GGUF can

@@ -14,6 +14,13 @@ namespace starling::ggml::parakeet {
 static constexpr unsigned char META_SPACE[3] = { 0xE2, 0x96, 0x81 };
 static constexpr size_t META_SPACE_LEN = 3;
 
+// The pieces SentencePiece decode (and transformers' skip_special_tokens)
+// drops. Fine-tunes such as Bark 3.0 Pro emit <unk> where the source text had
+// a character outside the vocabulary (curly quotes, dashes).
+static bool is_skipped_piece(const std::string& p) {
+    return p == "<unk>" || p == "<pad>" || p == "<|endoftext|>";
+}
+
 // detokenize(); with `owner` set, also the index into `ids` of the token
 // each output byte came from.
 static std::string detokenize_owned(const std::vector<std::string>& pieces,
@@ -25,7 +32,7 @@ static std::string detokenize_owned(const std::vector<std::string>& pieces,
     result.reserve(ids.size() * 4);
     for (size_t k = 0; k < ids.size(); ++k) {
         const int32_t id = ids[k];
-        if (id >= 0 && (size_t)id < pieces.size()) {
+        if (id >= 0 && (size_t)id < pieces.size() && !is_skipped_piece(pieces[(size_t)id])) {
             result += pieces[(size_t)id];
             if (owner) from.resize(result.size(), k);
         }

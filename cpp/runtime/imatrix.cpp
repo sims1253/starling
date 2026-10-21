@@ -57,7 +57,9 @@ bool ImatrixCollector::observe(ggml_tensor* node, bool ask) {
     // Only weight tensors cloned from the loader carry names; activations and
     // graph inputs are anonymous. This automatically excludes attention
     // score matmuls (both operands are activations).
-    if (w->name[0] == '\0') return false;
+    // Views of an anonymous tensor get derived names with an empty base
+    // (" (reshaped) (permuted)"); those are activations too.
+    if (w->name[0] == '\0' || w->name[0] == ' ') return false;
     if (x->type != GGML_TYPE_F32) return false;
 
     if (ask) return true;  // observe this node — NOTE: the callback does NOT
