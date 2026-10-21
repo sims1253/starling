@@ -19,7 +19,7 @@ bytes = "1.9"
 # is removed; md-5 checks the FLAC STREAMINFO signature on every load.
 # All pure Rust, Apache-2.0 / MIT.
 claxon = "0.4.3"
-cpal = "0.17"
+cpal = "0.18"
 dirs = "6"
 # No `par` (the store encodes one take at a time on a background
 # thread), no `serde`/`log`.
