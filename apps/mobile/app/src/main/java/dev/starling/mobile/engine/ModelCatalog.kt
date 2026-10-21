@@ -42,8 +42,9 @@ object ModelCatalog {
     /**
      * Underdog Bark 3.0 Pro (ConwayResearch, CC-BY-4.0): an English
      * fine-tune of Parakeet TDT 0.6B v3 in the same q4pw layout, so the same
-     * size and speed. FLEURS en100 WER 3.68 % vs Parakeet's 4.29 % (Whisper
-     * normalization; scripts/convert_parakeet_gguf.py --model-id).
+     * size and speed. FLEURS en_us test (100 clips) WER 3.68 % vs
+     * Parakeet's 4.29 % (Whisper normalization;
+     * scripts/convert_parakeet_gguf.py --model-id).
      */
     val BARK_3_PRO = ModelDownload(
         url = "https://huggingface.co/scholzmx/underdog-bark-3.0-pro-gguf/resolve/" +

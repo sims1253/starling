@@ -134,6 +134,22 @@ def test_derived_name_imatrix_entries_of_one_weight_merge(quantize, tmp_path):
     assert by_split[PW1] == by_whole[PW1]
 
 
+def test_imatrix_views_of_anonymous_activations_are_ignored(quantize, tmp_path):
+    # Older collectors recorded attention matmuls on anonymous activations
+    # under derived names with an empty base, at different widths; those name
+    # no weight and must not abort the build ("disagree on width").
+    rng = np.random.default_rng(7)
+    values = np.exp(rng.normal(0.0, 3.0, 256))
+    recipe = f"default q4_0\n{PW1}$ q4_0\n"
+    noisy = imatrix_file(tmp_path / "noisy.imx", imatrix_entry(PW1 + " (copy)", 256, values),
+                         imatrix_entry(" (reshaped) (permuted) (cont)", 128, values[:128]),
+                         imatrix_entry(" (reshaped) (permuted) (cont) (permuted) (cont)", 93, values[:93]))
+    clean = imatrix_file(tmp_path / "clean.imx", imatrix_entry(PW1, 256, values))
+    by_noisy, _ = quantize("parakeet_tdt", PARAKEET, recipe, imatrix=noisy, payload=True)
+    by_clean, _ = quantize("parakeet_tdt", PARAKEET, recipe, imatrix=clean, payload=True)
+    assert by_noisy[PW1] == by_clean[PW1]
+
+
 def test_derived_name_imatrix_weights_the_quantization(quantize, tmp_path):
     # A strongly non-uniform matrix under the derived name must change the
     # Q4_0 payload compared with the same matrix filed under another name

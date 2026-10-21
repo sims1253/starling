@@ -29,10 +29,10 @@ The ConwayResearch Bark 3.0 family are fine-tunes of the same architecture.
 Bark 3.0 Pro is a stock safetensors checkpoint (``--model-id
 ConwayResearch/Underdog-Bark-3.0-Pro``, bf16 exact). Bark 3.0, Plus and Clean
 ship an entropy-coded ``model.bark`` (see ``scripts/bark_format.py``) whose
-weights are fp16 levels, so convert them with ``--dtype f16`` to stay exact::
+weights are fp16 levels; ``--bark`` writes them as F16 (``--dtype f16``), exact::
 
     uv run --group convert python scripts/convert_parakeet_gguf.py \\
-        --bark Underdog-Bark-3.0/model.bark --dtype f16 \\
+        --bark Underdog-Bark-3.0/model.bark \\
         --output models/underdog-bark-3.0-f16-exact.gguf
 """
 from __future__ import annotations
@@ -392,11 +392,15 @@ def main() -> int:
     ap.add_argument("--processor-id", default=DEFAULT_MODEL_ID,
                     help="HuggingFace id for the mel frontend + tokenizer when using --bark "
                          f"(default: {DEFAULT_MODEL_ID}; the Bark fine-tunes keep its tokenizer)")
-    ap.add_argument("--dtype", choices=["bf16", "f16", "f32"], default="bf16",
+    ap.add_argument("--dtype", choices=["bf16", "f16", "f32"], default=None,
                     help="Linear weight dtype: bf16 (default, byte-exact for bf16 "
-                         "checkpoints), f16 (exact for fp16-valued weights such as "
-                         ".bark levels; tensors that do not round-trip stay F32) or f32")
+                         "checkpoints), f16 (default with --bark: exact for fp16-valued "
+                         "weights; tensors that do not round-trip stay F32) or f32")
     args = ap.parse_args()
+    if args.dtype is None:
+        args.dtype = "f16" if args.bark is not None else "bf16"
+    elif args.bark is not None and args.dtype == "bf16":
+        sys.exit("--bark weights are fp16 levels, which bf16 rounds: use --dtype f16 (the default) or f32")
 
     from transformers import AutoModelForTDT, AutoProcessor
 

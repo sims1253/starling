@@ -53,6 +53,8 @@ def _decode_levels_codes(classes: np.ndarray, counts: np.ndarray, words: np.ndar
     codes = np.empty((rows, cols), np.uint8)
     for c in range(len(counts)):
         idx = np.nonzero(classes == c)[0]
+        if len(idx) == 0:  # an unused class decodes no symbols
+            continue
         model = constriction.stream.model.Categorical(counts[c] / counts[c].sum(), perfect=False)
         codes[:, idx] = coder.decode(model, rows * len(idx)).reshape(len(idx), rows).T
     return codes
