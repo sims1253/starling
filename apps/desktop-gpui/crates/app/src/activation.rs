@@ -1449,6 +1449,10 @@ mod tests {
             Some("Release to finish, or press Esc to cancel.")
         );
         assert_eq!(
+            finish_hint(Some(Latch::Latched), "F9").as_deref(),
+            Some("Press F9 to finish, or Esc to cancel.")
+        );
+        assert_eq!(
             finish_hint(Some(Latch::HandsFree), "F9").as_deref(),
             Some("Hands-free. Press F9 to finish, or Esc to cancel.")
         );

@@ -161,27 +161,28 @@ pub fn render_capture(
                                 }),
                         ),
                 )
-                .when(!has_transcript, |head| {
-                    head.child(
-                        div()
-                            .max_w(px(470.))
-                            .text_size(px(theme::TEXT_MD))
-                            .line_height(px(theme::TEXT_MD * 1.6))
-                            .text_color(theme::QUILL)
-                            // #220: takes record in Starling's recording
-                            // service; while it is not reachable, say so.
-                            .child(
-                                app.host_unavailable()
-                                    .filter(|_| !recording)
-                                    .unwrap_or_else(|| {
-                                        "Your recording is saved on this computer, sent only to \
-                                         the engine you chose, and shown exactly as the model \
-                                         returned it."
-                                            .to_string()
-                                    }),
-                            ),
-                    )
-                }),
+                // #220: takes record in Starling's recording service;
+                // while it is not reachable, say so — compact or not. The
+                // standing promise only shows on the roomy stage.
+                .children(
+                    app.host_unavailable()
+                        .filter(|_| !recording)
+                        .or_else(|| {
+                            (!has_transcript).then(|| {
+                                "Your recording is saved on this computer, sent only to the \
+                                 engine you chose, and shown exactly as the model returned it."
+                                    .to_string()
+                            })
+                        })
+                        .map(|line| {
+                            div()
+                                .max_w(px(470.))
+                                .text_size(px(theme::TEXT_MD))
+                                .line_height(px(theme::TEXT_MD * 1.6))
+                                .text_color(theme::QUILL)
+                                .child(line)
+                        }),
+                ),
         )
         .child(render_recorder(app, cx, record_button, has_transcript))
         .children(render_engine_card(app, cx))

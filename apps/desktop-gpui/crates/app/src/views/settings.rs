@@ -171,7 +171,9 @@ pub fn render_settings_modal(
                 .text_color(theme::SHEET_QUILL)
                 .child("Engine actions apply at once; everything else applies on Save."),
         )
-        .when(manual, |footer| {
+        // The probe's outcome shows on the Engine page, so the button
+        // lives there too.
+        .when(manual && page == SettingsPage::Engine, |footer| {
             // B06 (#207): one probe at a time — while the newest press is
             // in flight the button carries no click handler at all (and
             // `test_connection` drops re-entrant presses as the
@@ -687,8 +689,14 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
             .items_center()
             .gap(px(6.))
             .text_size(px(theme::TEXT_SM));
+        // A stage outside the ladder is its own line above it.
         if let Some(note) = note {
-            line = line.child(div().text_color(theme::SHEET_QUILL).child(format!("{note} ")));
+            section = section.child(
+                div()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(theme::SHEET_QUILL)
+                    .child(note),
+            );
         }
         for (index, step) in steps.iter().enumerate() {
             if index > 0 {

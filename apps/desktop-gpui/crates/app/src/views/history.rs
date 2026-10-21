@@ -250,6 +250,8 @@ fn when_column(when: String) -> Div {
         .pt(px(2.))
         .text_size(px(theme::TEXT_XS))
         .text_color(theme::QUILL)
+        // An unparsable timestamp falls back to the raw string.
+        .truncate()
         .child(when)
 }
 
