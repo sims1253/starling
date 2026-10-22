@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# npu_compile_all.sh — one command: compile the TPU audio encoder of every
-# Qwen3-ASR model the installed Starling app has loaded, on a Pixel (Tensor G5),
-# and install it into the app.
+# npu_compile_all.sh — one command: compile the TPU encoder of every
+# Qwen3-ASR and Parakeet-TDT model the installed Starling app has loaded, on a
+# Pixel (Tensor G5), and install it into the app.
 #
 #   scripts/npu/npu_compile_all.sh [--gguf HOST_GGUF ...] [--models DIR ...]
 #                                  [--all] [--app PKG] [--wait SECONDS] [--dry-run]
 #
 # WARNING: the phone's on-device compiler can exhaust the phone's memory and
-# panic its kernel (the phone reboots). Only the Qwen3-ASR encoder, a graph
-# with a clean record, is built here, and npu_compile_phone.sh refuses to
+# panic its kernel (the phone reboots). Only the Qwen3-ASR encoder and
+# Parakeet's encoder pieces, graphs with a clean record, are built here, and
+# npu_compile_phone.sh refuses to
 # compile with less than 4 GB available; still, save your work on the phone
 # first. See docs/fast-engine.md, "Pixel TPU encoder".
 #
@@ -26,7 +27,7 @@
 #      .debug / .experimental variants; --app picks one);
 #   3. reads their status files (run-as for a debuggable package, the
 #      external files dir otherwise) and, for every missing or stale
-#      Qwen3-ASR encoder (--all: also the ok ones), finds the GGUF with that
+#      encoder (--all: also the ok ones), finds the GGUF with that
 #      model hash on this host and compiles it with npu_compile.sh into every
 #      package that asked for it.
 # The graph is exported from the very GGUF the app loads (its own encoder
@@ -73,6 +74,12 @@ if [ ${#MODELS[@]} = 0 ]; then
   fi
 fi
 EXPORTER=$ROOT/scripts/npu/export_encoder.py
+PK_EXPORTER=$ROOT/scripts/npu/export_parakeet.py
+# The model hash of a GGUF (Parakeet-TDT, else Qwen3-ASR), or fail.
+hash_of() {
+  "$PY" -I "$PK_EXPORTER" --model-hash "$1" 2>/dev/null | awk 'NR == 1 {print $1}' | grep . ||
+    "$PY" -I "$EXPORTER" --model-hash "$1" 2>/dev/null | awk 'NR == 1 {print $1}' | grep .
+}
 # One argument quoted for the phone's shell.
 q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 same_hash() { "$PY" -I -c 'import sys; print(int(sys.argv[1], 16) == int(sys.argv[2], 16))' "$1" "$2" 2>/dev/null | grep -qx True; }
@@ -142,8 +149,8 @@ for line in open(sys.argv[1]):
         cur[k] = v
 want = {}
 for r in recs:
-    if r.get("piece") != "qwen3-asr-enc" or not r.get("hash"):
-        continue                                  # the only piece built here
+    if r.get("piece") not in ("qwen3-asr-enc", "parakeet-enc") or not r.get("hash"):
+        continue                                  # the pieces built here
     m = dict(kv.split("=", 1) for kv in r.get("model", "").split() if "=" in kv)
     state = r.get("state", "")
     if state not in ("missing", "stale", "error") and not (sys.argv[2] == "1" and state == "ok"):
@@ -160,8 +167,8 @@ for (piece, h), w in sorted(want.items()):
 EOF
 )
 if [ -z "$PLAN" ]; then
-  echo "nothing to compile: every Qwen3-ASR TPU encoder the app asked for is up to date."
-  echo "(Load a Qwen3-ASR model in the app once so it reports what it needs, then rerun.)"
+  echo "nothing to compile: every TPU encoder the app asked for is up to date."
+  echo "(Load a Qwen3-ASR or Parakeet model in the app once so it reports what it needs, then rerun.)"
   exit 0
 fi
 echo "to compile:"; echo "$PLAN" | cut -f1-5 | tr '\t' ' ' | sed 's/^/  /'
@@ -170,7 +177,7 @@ echo "to compile:"; echo "$PLAN" | cut -f1-5 | tr '\t' ' ' | sed 's/^/  /'
 # ---- 4. the GGUF of each, on this host ----
 GIVEN=()   # "hash<TAB>path" of each --gguf
 for g in "${GGUFS[@]}"; do
-  h=$("$PY" -I "$EXPORTER" --model-hash "$g" | awk 'NR == 1 {print $1}') || { echo "!! --gguf $g: not a Qwen3-ASR GGUF" >&2; exit 2; }
+  h=$(hash_of "$g") || { echo "!! --gguf $g: not a Qwen3-ASR or Parakeet-TDT GGUF" >&2; exit 2; }
   GIVEN+=("$h"$'\t'"$g")
 done
 USED=()   # the GGUFs compiled
@@ -185,24 +192,28 @@ pull() {
   else
     "${PHONE_LOCK[@]}" adb exec-out "cat $(q "$3")" </dev/null >"$dest" 2>/dev/null || true
   fi
-  if [ -s "$dest" ] && same_hash "$1" "$("$PY" -I "$EXPORTER" --model-hash "$dest" 2>/dev/null | awk '{print $1}')"; then
+  if [ -s "$dest" ] && same_hash "$1" "$(hash_of "$dest")"; then
     echo "$dest"
   else
     rm -f "$dest"
     return 1
   fi
 }
-# gguf_for HASH HD [PKG PATH]...: a host GGUF whose model hash is HASH.
+# gguf_for PIECE HASH HD [PKG PATH]...: a host GGUF whose model hash is HASH.
 gguf_for() {
-  local want=$1 hd=$2 e f
-  shift 2
+  local piece=$1 want=$2 hd=$3 e f
+  shift 3
   for e in "${GIVEN[@]}"; do
     if same_hash "$want" "${e%%$'\t'*}"; then echo "${e#*$'\t'}"; return 0; fi
   done
   if [ ${#MODELS[@]} -gt 0 ]; then
-    local hdarg=()
-    [ "$hd" != - ] && hdarg=(--hd "$hd")
-    if f=$("$PY" -I "$EXPORTER" --find "$want" "${hdarg[@]}" "${MODELS[@]}"); then echo "$f"; return 0; fi
+    if [ "$piece" = parakeet-enc ]; then
+      if f=$("$PY" -I "$PK_EXPORTER" --find "$want" "${MODELS[@]}"); then echo "$f"; return 0; fi
+    else
+      local hdarg=()
+      [ "$hd" != - ] && hdarg=(--hd "$hd")
+      if f=$("$PY" -I "$EXPORTER" --find "$want" "${hdarg[@]}" "${MODELS[@]}"); then echo "$f"; return 0; fi
+    fi
   fi
   while [ $# -ge 2 ]; do
     echo "   not on this host; pulling $2 from $1" >&2
@@ -217,7 +228,7 @@ fail=0
 while IFS=$'\t' read -r -a F; do
   piece=${F[0]} hash=${F[1]} hd=${F[2]} states=${F[3]} pkgs=${F[4]}
   echo "== $piece $hash ($states) -> $pkgs"
-  if ! gguf=$(gguf_for "$hash" "$hd" "${F[@]:5}"); then
+  if ! gguf=$(gguf_for "$piece" "$hash" "$hd" "${F[@]:5}"); then
     echo "!! $piece $hash: no GGUF with this model hash on this host${MODELS[*]:+ (searched ${MODELS[*]})}" >&2
     for ((i = 5; i + 1 < ${#F[@]}; i += 2)); do echo "   ${F[i]} loads ${F[i+1]}" >&2; done
     echo "   pass --gguf HOST_GGUF with a copy of the file the app loads" >&2

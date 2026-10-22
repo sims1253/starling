@@ -183,4 +183,64 @@ inline std::string qwen3_enc_artifact_name(uint64_t model_hash) {
     return b;
 }
 
+// ---- Parakeet-TDT FastConformer encoder (scripts/npu/export_parakeet.py) ----
+// One encoder window of kParakeetTpuRows subsampled frames (~33 s) in five
+// pieces, each its own artifact: "sub" (one subsampling chunk of
+// kParakeetTpuChunk frames from a (8 * chunk + 7)-row mel window; the engine
+// runs it per chunk) and "l0-6" .. "l18-24" (six conformer layers each over
+// all rows in batch layout [4, rows / 4, d], the last one with the joint
+// encoder projection). The model hash is the digest above over the encoder
+// and joint-encoder tensors (encoder.*, joint.enc.*) and the encoder
+// metadata (parakeet.encoder.*, parakeet.preprocessor.n_mels).
+inline bool is_parakeet_encoder_tensor(const std::string& name) {
+    return name.rfind("encoder.", 0) == 0 || name.rfind("joint.enc.", 0) == 0;
+}
+inline bool is_parakeet_encoder_key(const std::string& key) {
+    return key.rfind("parakeet.encoder.", 0) == 0 || key == "parakeet.preprocessor.n_mels";
+}
+
+inline constexpr const char* kParakeetEncContract = "parakeet-enc/1";
+inline constexpr uint32_t kParakeetTpuChunk = 26;     // subsampled frames per "sub" call
+inline constexpr uint32_t kParakeetTpuRows = 416;     // frames per window (16 chunks)
+inline constexpr uint32_t kParakeetTpuRowBlocks = 4;  // segment batch layout [4, rows / 4, d]
+inline constexpr uint32_t kParakeetTpuSegLayers = 6;  // conformer layers per segment piece
+
+inline std::vector<std::string> parakeet_enc_pieces(uint32_t layers) {
+    std::vector<std::string> p{"sub"};
+    for (uint32_t a = 0; a < layers; a += kParakeetTpuSegLayers)
+        p.push_back("l" + std::to_string(a) + "-" + std::to_string(a + kParakeetTpuSegLayers));
+    return p;
+}
+
+inline std::string parakeet_enc_key(const std::string& piece, uint32_t n_mels, uint32_t d, uint32_t layers,
+                                    uint32_t heads, uint32_t ff, uint32_t conv_kernel, uint32_t sub_channels,
+                                    uint32_t joint_hidden) {
+    char b[256];
+    std::snprintf(b, sizeof b, "%s piece=%s mels=%u chunk=%u rows=%u d=%u L=%u H=%u ff=%u ck=%u sc=%u jh=%u",
+                  kParakeetEncContract, piece.c_str(), n_mels, kParakeetTpuChunk, kParakeetTpuRows, d, layers, heads,
+                  ff, conv_kernel, sub_channels, joint_hidden);
+    return b;
+}
+
+// Byte sizes of a piece's f32 inputs and output (export_parakeet.py piece_io).
+inline void parakeet_enc_io(const std::string& piece, uint32_t n_mels, uint32_t d, uint32_t layers,
+                            uint32_t joint_hidden, std::vector<uint64_t>& in, std::vector<uint64_t>& out) {
+    const uint64_t C = kParakeetTpuChunk, R = kParakeetTpuRows;
+    if (piece == "sub") {
+        in = {(8 * C + 7) * n_mels * 4, (4 * C + 3) * 4, (2 * C + 1) * 4, C * 4};
+        out = {C * d * 4};
+        return;
+    }
+    const bool last = piece.size() > 3 && piece.compare(piece.size() - std::to_string(layers).size() - 1,
+                                                        std::string::npos, "-" + std::to_string(layers)) == 0;
+    in = {R * d * 4, R * 4, R * 4};
+    out = {R * (last ? joint_hidden : d) * 4};
+}
+
+inline std::string parakeet_enc_artifact_name(uint64_t model_hash, const std::string& piece) {
+    char b[96];
+    std::snprintf(b, sizeof b, "parakeet-enc-%016llx-%s.stnpu", (unsigned long long)model_hash, piece.c_str());
+    return b;
+}
+
 }  // namespace starling::npu

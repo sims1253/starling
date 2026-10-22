@@ -1,30 +1,33 @@
 #!/usr/bin/env bash
 # Phone half of npu_compile.sh (run under the phone lock):
 #   npu_compile_phone.sh NPU_TOOL TFLITE HASH KEY DIR APPS WORKDIR
-# compiles TFLITE, a Qwen3-ASR audio encoder window from export_encoder.py,
-# into the artifact qwen3-asr-enc-<HASH>.stnpu. The phone's compiler can
+# compiles TFLITE, a Qwen3-ASR audio encoder window from export_encoder.py
+# or one Parakeet-TDT encoder piece from export_parakeet.py, into the artifact
+# qwen3-asr-enc-<HASH>.stnpu or parakeet-enc-<HASH>-<piece>.stnpu. The phone's compiler can
 # exhaust the phone's memory and panic its kernel (graphs below the size cap
 # did), so this entry point checks everything itself, however it is called:
-#  * KEY is one of the supported encoder windows (Qwen3-ASR 0.6B or 1.7B,
-#    cpp/npu/encoder_contract.hpp), and TFLITE's single subgraph has exactly
+#  * KEY is one of the supported encoder windows (Qwen3-ASR 0.6B or 1.7B) or
+#    Parakeet pieces (cpp/npu/encoder_contract.hpp), and TFLITE's single subgraph has exactly
 #    that window's inputs and output and the operator signature (operator and
-#    tensor counts, operators per builtin) export_encoder.py produces for it;
+#    tensor counts, operators per builtin) its exporter (export_encoder.py or
+#    export_parakeet.py) produces for it;
 #    the artifact's I/O sizes follow from KEY;
 #  * HASH (0x...) is the model hash export_encoder.py printed for the GGUF
 #    TFLITE's weights came from (the digest of its encoder tensors and
 #    metadata, which the engine computes from the GGUF it loads); it names
-#    the artifact, and TFLITE must carry it: export_encoder.py stamps the
+#    the artifact, and TFLITE must carry it: the exporter stamps the
 #    model hash and KEY into the graph's metadata (starling_npu_provenance),
 #    so another model's graph cannot be compiled under this one's hash;
 #  * the phone has at least NPU_MIN_MEM_MB (default 4096) available and TFLITE
-#    is no larger than its window's graph has been (0.6B: 640 MB; 1.7B, which
-#    exports with f32 weights: 1300 MB; both compiled cleanly).
+#    is no larger than its window's graph has been (Qwen3-ASR 0.6B: 640 MB;
+#    1.7B, which exports with f32 weights: 1300 MB; Parakeet segment: 340 MB;
+#    all compiled cleanly).
 # APPS: comma-separated packages; a debuggable one gets the artifact in
 # files/npu (run-as), any other in its external files dir
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 7 ] || { sed -n 2,25p "$0" >&2; exit 2; }
+[ $# -eq 7 ] || { sed -n 2,28p "$0" >&2; exit 2; }
 NPU_TOOL=$1; TFL=$2; HASH=$3; KEY=$4; DIR=$5; APPS=$6; T=$7
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
@@ -62,18 +65,35 @@ HC=$(canon "$HASH")
 # only its constants); a converter that emits a different graph needs these
 # updated (and the graph compiled once with care: see docs/fast-engine.md,
 # Pixel TPU encoder).
+PK="mels=128 chunk=26 rows=416 d=1024 L=24 H=8 ff=4096 ck=9 sc=256 jh=640"   # Parakeet-TDT 0.6B v3
+PK_SEG="1463 1203 0:180 4:6 6:146 9:150 14:60 18:186 22:241 25:6 39:48 40:60 41:36 76:30 99:30 126:24"
 case $KEY in
   "qwen3-asr-enc/2 mels=128 frames=800 tokens=104 d=896 L=18 H=14 ff=3584 ds=480 out=1024")
-    OUTD=1024 MAXMB=640
+    MAXMB=640 SHAPES_IN="1,128,800;1,1,1,104" SHAPES_OUT="1,104,1024"
     GRAPH="1294 1046 0:129 3:2 4:1 6:114 9:111 18:74 22:277 25:18 34:3 39:74 40:74 41:37 76:37 99:37 126:36 150:22" ;;
   "qwen3-asr-enc/2 mels=128 frames=800 tokens=104 d=1024 L=24 H=16 ff=4096 ds=480 out=2048")
-    OUTD=2048 MAXMB=1300
+    MAXMB=1300 SHAPES_IN="1,128,800;1,1,1,104" SHAPES_OUT="1,104,2048"
     GRAPH="1871 1452 0:171 3:2 4:1 9:244 18:219 22:367 25:24 34:3 39:100 40:98 41:49 76:49 99:49 126:48 150:28" ;;
-  *) echo "refusing '$KEY': only the Qwen3-ASR 0.6B/1.7B encoder windows compile safely on the phone" >&2; exit 2 ;;
+  # Parakeet's encoder window in five pieces (export_parakeet.py): the
+  # subsampling chunk (a few MB) and four 6-layer segments (~320 MB each).
+  "parakeet-enc/1 piece=sub $PK")
+    MAXMB=16 SHAPES_IN="1,1,215,128;1,1,107,1;1,1,53,1;1,26,1" SHAPES_OUT="1,26,1024"
+    GRAPH="46 24 0:1 3:2 4:3 6:6 9:1 18:3 22:4 34:3 39:1" ;;
+  "parakeet-enc/1 piece=l0-6 $PK"|"parakeet-enc/1 piece=l6-12 $PK"|"parakeet-enc/1 piece=l12-18 $PK")
+    MAXMB=340 SHAPES_IN="4,104,1024;4,104,1;1,1,1,416" SHAPES_OUT="4,104,1024" GRAPH=$PK_SEG ;;
+  "parakeet-enc/1 piece=l18-24 $PK")
+    MAXMB=340 SHAPES_IN="4,104,1024;4,104,1;1,1,1,416" SHAPES_OUT="4,104,640"
+    GRAPH="1464 1203 0:179 4:6 6:147 9:151 14:60 18:185 22:241 25:6 39:48 40:60 41:36 76:30 99:30 126:24" ;;
+  *) echo "refusing '$KEY': only the Qwen3-ASR 0.6B/1.7B encoder windows and Parakeet-TDT 0.6B's encoder pieces compile safely on the phone" >&2; exit 2 ;;
 esac
-MELS=128 FRAMES=800 TOKENS=104
-IN=$((MELS * FRAMES * 4)),$((TOKENS * 4))
-OUT=$((TOKENS * OUTD * 4))
+# Byte sizes of the f32 inputs / output, from the shapes.
+bytes() { local IFS=';' out="" s d n; for s in $1; do n=4; IFS=','; for d in $s; do n=$((n * d)); done; IFS=';'; out+="${out:+,}$n"; done; echo "$out"; }
+IN=$(bytes "$SHAPES_IN")
+OUT=$(bytes "$SHAPES_OUT")
+case $KEY in
+  parakeet-enc/*) PIECE=${KEY#* piece=}; PIECE=${PIECE%% *}; NAME="parakeet-enc-${HC#0x}-$PIECE.stnpu" ;;
+  *) NAME="qwen3-asr-enc-${HC#0x}.stnpu" ;;
+esac
 SIZE=$(stat -c %s "$TFL")
 [ "$SIZE" -le $((MAXMB << 20)) ] || { echo "graph is $((SIZE >> 20)) MB, above this window's $MAXMB MB safety limit" >&2; exit 1; }
 # The .tflite's own inputs, output and operators (flatbuffer: Model.
@@ -81,16 +101,17 @@ SIZE=$(stat -c %s "$TFL")
 # operators} -> Tensor.{shape, type}, Operator.opcode_index,
 # OperatorCode.{deprecated_builtin_code, custom_code, builtin_code}).
 # shellcheck disable=SC2086
-"$PY" -I - "$TFL" "$HC" "$KEY" "$MELS" "$FRAMES" "$TOKENS" "$OUTD" $GRAPH <<'EOF' || exit 2
+"$PY" -I - "$TFL" "$HC" "$KEY" "$SHAPES_IN" "$SHAPES_OUT" $GRAPH <<'EOF' || exit 2
 import mmap
 import struct
 import sys
 
 path, want_hash, want_key = sys.argv[1:4]
-mels, frames, tokens, outd, want_tensors, want_ops = map(int, sys.argv[4:10])
-want_hist = {int(c): int(n) for c, n in (a.split(":") for a in sys.argv[10:])}
+shapes_in, shapes_out = sys.argv[4:6]
+want_tensors, want_ops = map(int, sys.argv[6:8])
+want_hist = {int(c): int(n) for c, n in (a.split(":") for a in sys.argv[8:])}
 NAMES = {0: "ADD", 3: "CONV_2D", 4: "DEPTHWISE_CONV_2D", 6: "DEQUANTIZE", 9: "FULLY_CONNECTED",
-         18: "MUL", 22: "RESHAPE", 25: "SOFTMAX", 34: "PAD", 39: "TRANSPOSE", 40: "MEAN", 41: "SUB",
+         14: "LOGISTIC", 18: "MUL", 22: "RESHAPE", 25: "SOFTMAX", 34: "PAD", 39: "TRANSPOSE", 40: "MEAN", 41: "SUB",
          76: "RSQRT", 99: "SQUARED_DIFFERENCE", 126: "BATCH_MATMUL", 150: "GELU"}
 
 
@@ -156,8 +177,11 @@ def io(i):
     return out
 
 
-want_in = [([1, mels, frames], 0), ([1, 1, 1, tokens], 0)]
-want_out = [([1, tokens, outd], 0)]
+def shapes(spec):   # "1,128,800;1,1,1,104" -> [([1, 128, 800], 0), ...] (type 0: FLOAT32)
+    return [([int(d) for d in s.split(",")], 0) for s in spec.split(";")]
+
+
+want_in, want_out = shapes(shapes_in), shapes(shapes_out)
 got_in, got_out = io(1), io(2)
 if got_in != want_in or got_out != want_out:
     fail(f"inputs {got_in} / outputs {got_out} are not the encoder window's {want_in} / {want_out}")
@@ -185,7 +209,7 @@ if (len(tensors), n_ops, hist) != (want_tensors, want_ops, want_hist):
     def show(h):
         order = sorted(h, key=lambda c: (isinstance(c, str), str(c).zfill(4)))
         return ", ".join(f"{NAMES.get(c, c)} {h[c]}" for c in order)
-    fail(f"not the encoder window export_encoder.py builds: {len(tensors)} tensors, {n_ops} operators "
+    fail(f"not the encoder graph export_encoder.py / export_parakeet.py builds: {len(tensors)} tensors, {n_ops} operators "
          f"({show(hist)}); expected {want_tensors} tensors, {want_ops} operators ({show(want_hist)})")
 
 
@@ -220,7 +244,6 @@ if stamps[0] != want:
          f"compiled under this model hash")
 EOF
 
-NAME="qwen3-asr-enc-${HC#0x}.stnpu"
 echo "model hash $HC -> $NAME"
 
 # ---- compile ----

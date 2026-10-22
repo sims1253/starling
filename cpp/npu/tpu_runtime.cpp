@@ -413,6 +413,10 @@ bool TpuModel::read_output(size_t i, void* data, size_t bytes, std::string& err)
     return true;
 }
 
+void TpuModel::drop_mapped_pages() {
+    if (map_) madvise(map_, map_len_, MADV_DONTNEED);
+}
+
 bool TpuModel::run(std::string& err) {
     auto* ic = static_cast<ThrInvocationContext*>(ictx_);
     if (!ic) {

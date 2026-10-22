@@ -17,10 +17,10 @@ namespace {
 
 // The encoder metadata, normalized as ModelLoader reads it (model_loader.cpp:
 // integers to int64, floats to double, strings; booleans skipped).
-bool encoder_meta(const gguf_context* g, std::vector<EncoderMeta>& out, std::string& err) {
+bool gguf_encoder_meta(const gguf_context* g, NamePredicate is_key, std::vector<EncoderMeta>& out, std::string& err) {
     for (int64_t i = 0; i < gguf_get_n_kv(g); ++i) {
         const std::string key = gguf_get_key(g, i);
-        if (!is_qwen3_encoder_key(key)) continue;
+        if (!is_key(key)) continue;
         EncoderMeta m;
         m.key = key;
         switch (gguf_get_kv_type(g, i)) {
@@ -83,8 +83,15 @@ bool gguf_model_hash(const std::string& path, uint64_t& hash, std::string& err) 
         t->data = buf.data();
         return t;
     };
+    const int64_t arch = gguf_find_key(g.get(), "general.architecture");
+    const bool parakeet = arch >= 0 && gguf_get_kv_type(g.get(), arch) == GGUF_TYPE_STRING &&
+                          std::string(gguf_get_val_str(g.get(), arch)) == "parakeet_tdt";
     std::vector<EncoderMeta> enc_meta;
-    if (!encoder_meta(g.get(), enc_meta, err) || !qwen3_model_hash(names, read, enc_meta, hash, err)) {
+    const bool ok = parakeet ? gguf_encoder_meta(g.get(), is_parakeet_encoder_key, enc_meta, err) &&
+                                   parakeet_model_hash(names, read, enc_meta, hash, err)
+                             : gguf_encoder_meta(g.get(), is_qwen3_encoder_key, enc_meta, err) &&
+                                   qwen3_model_hash(names, read, enc_meta, hash, err);
+    if (!ok) {
         err += " (" + path + ")";
         return false;
     }

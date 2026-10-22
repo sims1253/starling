@@ -50,6 +50,10 @@ public:
     bool read_output(size_t i, void* data, size_t bytes, std::string& err);
     AHardwareBuffer* output_ahwb(size_t i) const { return i < out_.size() ? out_[i].ahwb : nullptr; }
     bool run(std::string& err);   // synchronous: prepare, invoke, wait
+    // Drops this process's resident pages of the mapped artifact (madvise
+    // MADV_DONTNEED on the read-only private mapping: whatever the firmware
+    // reads again refaults from the file).
+    void drop_mapped_pages();
     const ArtifactInfo& info() const { return info_; }
 
 private:
