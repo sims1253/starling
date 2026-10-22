@@ -74,7 +74,7 @@ case $KEY in
     MAXMB=1300 SHAPES_IN="1,128,800;1,1,1,104" SHAPES_OUT="1,104,2048"
     GRAPH="1871 1452 0:171 3:2 4:1 9:244 18:219 22:367 25:24 34:3 39:100 40:98 41:49 76:49 99:49 126:48 150:28" ;;
   # Parakeet's encoder window in five pieces (export_parakeet.py): the
-  # subsampling chunk and four 6-layer segments, each ~320 MB.
+  # subsampling chunk (a few MB) and four 6-layer segments (~320 MB each).
   "parakeet-enc/1 piece=sub $PK")
     MAXMB=16 SHAPES_IN="1,1,215,128;1,1,107,1;1,1,53,1;1,26,1" SHAPES_OUT="1,26,1024"
     GRAPH="46 24 0:1 3:2 4:3 6:6 9:1 18:3 22:4 34:3 39:1" ;;

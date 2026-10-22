@@ -270,7 +270,7 @@ PkNpuStart pk_npu_start(const pk::ParakeetModel& m) {
     const ggml_tensor* jenc = m.loader.tensor("joint.enc.weight");
     // The shapes export_parakeet.py builds graphs for.
     if (!jenc || c.conv_norm_type != "batch_norm" || c.xscaling || c.n_mels % 8 || c.d_model % c.n_heads ||
-        c.n_layers % npu::kParakeetTpuSegLayers || c.conv_kernel % 2 == 0 || c.ff_dim % 4)
+        c.n_layers == 0 || c.n_layers % npu::kParakeetTpuSegLayers || c.conv_kernel % 2 == 0 || c.ff_dim % 4)
         return r;
     j.dirs = npu::npu_dirs();
     if (j.dirs.empty()) return note("no STARLING_NPU_DIR");
