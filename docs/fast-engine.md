@@ -51,6 +51,8 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
 | `STARLING_NPU_DIR=dir[:dir…]` | where TPU artifacts are looked up and `status-*.txt` written (default: `STARLING_FAST_CACHE_DIR`); see *Pixel TPU encoder* below |
 | `STARLING_NPU=0` | never use a TPU artifact (GPU encoder) |
+| `STARLING_NPU_WAIT=1` | Parakeet: the first call waits for the TPU artifacts to open instead of running on the GPU meanwhile (measurements) |
+| `STARLING_NPU_KEEP_MAP=1` | Parakeet: keep the mapped artifacts' pages resident after the warm-up (diagnostic; the firmware has its own copy) |
 
 ## Design
 
@@ -253,13 +255,107 @@ it), stale and error states are logged once per process (logcat tag
 `StarlingNpu`: "TPU … not used (stale), the GPU runs it: … — recompile via
 adb"), and `describe()` carries the stale note.
 
-*Compiler limits, and why only Qwen3-ASR* (firmware 0.21.0, Pixel 10 Pro).
+**Pixel TPU encoder (Parakeet-TDT and its fine-tunes).** Parakeet's whole
+FastConformer encoder (subsampling, 24 conformer layers, joint encoder
+projection) runs on the TPU for inputs of up to one TPU window, 416
+subsampled frames (~33 s; the app's 32 s windows fit); the TDT decoder stays
+on the CPU, and the GPU encoder stays loaded for longer inputs,
+`STARLING_NPU=0` and any TPU error. `npu_compile_all.sh` builds it like
+Qwen3-ASR's (the engine reports `status-parakeet-enc-<model hash>.txt`); by
+hand, `npu_compile.sh MODEL.gguf` exports five graphs with
+`scripts/npu/export_parakeet.py` and compiles each into
+`parakeet-enc-<model hash>-<piece>.stnpu`:
+
+* `sub`, one subsampling chunk: 26 output frames from a 215-row mel window
+  (the 7-row halos included) with convolutions that are VALID in time, and
+  per-stage row masks that reproduce the zero padding the GPU convolutions
+  read past each stage's length. The engine calls it per chunk, only for
+  chunks with frames (`npu encoder: subsampling N chunks` in the timing
+  line). Batching the 16 chunks into one call compiles but returns wrong rows;
+  the whole 32 s mel in one call does not fit on-chip memory;
+* `l0-6` .. `l18-24`, six conformer layers each (~300 MB of fp16 weights) over
+  all 416 rows, the last one with the joint encoder projection. Inputs: the
+  rows, a row mask (the GPU path's `row_valid`: rows past the valid length
+  are bias-only, their attention and GLU output zero) and the additive key
+  mask.
+
+What the compiler needed, found with probe graphs on firmware 0.21.0: row-wise
+work in batch layout `[4, 104, 1024]` (a LayerNorm or a linear over
+`[1, 416, 1024]` fails with "Failed to further shard"; batch 4 compiles);
+the feed-forward projections split into four 1024-column pieces (one
+1024 × 4096 linear does not fit, even at 104 rows); attention over all 416
+keys as one batched matmul and softmax, which compiles in this layout; no
+activation slices and no last-axis concatenation (a probe concatenating two
+`[1, 404, 202]` score halves crashed the compile service, `DEAD_OBJECT`).
+NeMo's `rel_shift` (pad, reshape, slice) is replaced by an identity: with
+`u_i` the query times `linear_pos` and `pe(r) = (sin r·w_k, cos r·w_k)`,
+`u_i · pe(i − j) = Σ_k cos(j·w_k) α_k(i) + sin(j·w_k) β_k(i)`, where `α`, `β`
+rotate `u_i`'s sine/cosine coefficients by `i·w_k` — two matmuls with
+constant sin/cos tables, no gather. The TPU computes in fp16, and Parakeet's
+residual stream overflows fp16 in the LayerNorms' squared deviations (it
+reaches ~7000 after the subsampling and ~1500 in later layers), so the graphs
+carry it scaled — the subsampling output and layer 0 by 1/256, later layers
+by 1/16, folded into the weights (each layer's `norm_out` writes the next
+layer's scale) — with the LayerNorm epsilon floored at fp16's smallest normal
+number so padding rows stay finite. In f32 the five graphs give the GPU
+path's encoder output to rel-L2 3–4e-4 (`export_parakeet.py --check`; the
+epsilon floor), and on the phone the TPU's output is within 4.5e-3 of that
+(fp16).
+
+Every weight comes from the GGUF (any quantization, dequantized, stored as
+fp16): the model hash covers `encoder.*`, `joint.enc.*` and the
+`parakeet.encoder.*` metadata plus `parakeet.preprocessor.n_mels`, so each
+fine-tune (the Underdog Bark variants, any quantization of them) gets its own
+artifacts. They cost ~1.26 GB of storage per model and, while loaded, ~1 GB
+of memory on top of the GPU path's (the firmware loads the bytecode, fp16
+weights included, into its own buffers; the GPU weights of a q4 GGUF stay
+loaded for the fallback).
+
+A worker started with the load hashes the GGUF's encoder from the file
+(0.35–0.75 s on the phone) and then opens and warms up the five pieces
+(1.3–1.8 s); neither the load nor a transcription waits for it: calls before
+it is done run on the GPU encoder (`STARLING_NPU_WAIT=1` makes the first call
+wait, for measurements). After the warm-up the engine drops its resident
+pages of the mapped artifacts (`TpuModel::drop_mapped_pages`; peak RSS
+1.3 GB → 0.38 GB, run times unchanged).
+
+Pixel 10 Pro, 2026-10-22, `pk-q4pw.gguf` (the app's Parakeet), one
+starling-bench binary, `STARLING_NPU=0` (GPU) against the TPU, ABBA rounds,
+screen off with the wake hold, each process started below a skin-temperature
+gate. Energy is the SoC + DRAM power rails (perfetto `android.power` rail
+counters, readable on the charger too), marginal per transcription: two
+processes per point (2 and 22 timed runs after a warm-up), the difference
+over 20 runs, so load and warm-up cancel; mean of 2 rounds.
+
+| clip | GPU wall | TPU wall | GPU energy | TPU energy |
+| --- | --- | --- | --- | --- |
+| short, 7.4 s | 562 ms | **346 ms** | 2.02 J | **1.19 J** |
+| medium, 22.3 s | 1390 ms | **416 ms** | — | — |
+| 32 s window (the app's) | 1938 ms | **465 ms** | 8.50 J | **1.54 J** |
+| long, 74.4 s in the app's windows (32 + 32 + 14.4 s) | 4.89 s | **1.32 s** | — | — |
+
+Per 32 s window the rails split as CPU 2.43 / GPU 4.40 / DRAM 0.26 J on the
+GPU path against CPU 0.67 / TPU 0.48 / DRAM 0.09 J with the TPU encoder; the
+TPU graph has a fixed 416-frame window, so a short clip pays most of it
+(subsampling only runs for chunks with frames; the conformer segments take
+~165 ms whatever the length). FLEURS en_us 100 on the phone (WER through
+`compare_wer.py`): Parakeet q4pw 5.37 % GPU → 5.37 % TPU (paired clip-WER
++0.000 pt, 95 % CI [+0.000, +0.000], 1/100 transcripts differ), Underdog Bark
+3.0 Pro q4pw 7.26 % → 7.26 % (+0.000 pt, CI [+0.000, +0.000], 3/100 differ);
+RTF 0.075 → 0.037 on both. Memory: the firmware holds the weights, so
+MemAvailable dropped by 1.56 GB during a TPU process against 0.59 GB on the
+GPU path (32 s window), and the five artifacts take 1.26 GB of storage per
+model. The bench's load time is the GPU path's (~0.4–0.5 s); the TPU takes
+over ~1.8 s after the load starts.
+
+*Compiler limits, and why only Qwen3-ASR and Parakeet* (firmware 0.21.0, Pixel 10 Pro).
 The on-device compiler accepts graphs whose tensors stay window-sized; the
 other audio encoders were exported (exact against HF on the host) but do not
 compile or run correctly:
-* a batched matmul with more than 256 keys fails ("Reshape input/output slice
-  mismatch"), so 30 s of global (ARK-ASR) or long sliding-window attention
-  does not compile as is;
+* a batched matmul with more than 256 keys failed in those encoders' graphs
+  ("Reshape input/output slice mismatch": 1500 positions, interleaved RoPE),
+  so 30 s of global (ARK-ASR) or long sliding-window attention does not
+  compile as is (Parakeet's 416-key attention does, in the layout above);
 * slicing an activation fails — the last dimension of a 64-wide head (RoPE's
   rotate-half; a constant `[hd, hd]` matmul works instead), K/V or GLU halves
   ("Cannot remove elements due to shape mismatch"), blocks along the sequence;
@@ -286,9 +382,10 @@ before the compile: once on a 4 MB probe graph (four 256-row slices of a
 `[1, 1024, 1024]` input, each through a linear layer, concatenated:
 "pslice-1024"), once on MOSS's adapter alone (`[1, 104, 2048]` → 8192 →
 2048, 100 MB). Neither size nor free memory predicts it. The compile scripts
-therefore build only the graph with a clean record (the Qwen3-ASR encoder),
-with fixed shapes, refuse graphs larger than the window has been
-(640 MB for 0.6B, 1300 MB for 1.7B), and refuse to compile with less than 4 GB available
+therefore build only the graphs with a clean record (the Qwen3-ASR encoder,
+Parakeet-TDT 0.6B's five pieces), with fixed shapes and the exact operator
+signature `npu_compile_phone.sh` knows, refuse graphs larger than they have been
+(640 MB for 0.6B, 1300 MB for 1.7B, 340 MB per Parakeet segment), and refuse to compile with less than 4 GB available
 (`NPU_MIN_MEM_MB`); save your work on the phone before running them.
 
 ## Kernels

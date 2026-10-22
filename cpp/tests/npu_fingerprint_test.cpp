@@ -109,7 +109,51 @@ bool write_model(const char* path, int tweak) {
     return ok;
 }
 
-// The engine's path: ModelLoader's mapped tensors and its metadata.
+// The encoder digest of write_parakeet_model(path, 0): pinned like
+// kDigestVector (tests/test_npu_fingerprint.py pins the same value for
+// scripts/npu/export_parakeet.py).
+constexpr uint64_t kParakeetDigestVector = 0x29faef0bc7c1f073ull;
+
+// A tiny Parakeet-TDT-like GGUF: encoder tensors (a Q8_0 matrix, F32
+// vectors, the joint encoder projection's bias) and tensors outside the
+// encoder (the prediction network, the joint output); encoder metadata (u32,
+// string) and parakeet.preprocessor.n_mels, plus keys outside the hash.
+// `tweak`: 1 a byte of the encoder matrix, 2 a byte of a decoder tensor,
+// 3 n_mels, 4 the hop length (outside the hash).
+bool write_parakeet_model(const char* path, int tweak) {
+    ggml_context* ctx = ggml_init({1 << 20, nullptr, false});
+    gguf_context* g = gguf_init_empty();
+    gguf_set_val_str(g, "general.architecture", "parakeet_tdt");
+    gguf_set_val_u32(g, "parakeet.encoder.d_model", 1024);
+    gguf_set_val_u32(g, "parakeet.encoder.n_layers", 24);
+    gguf_set_val_str(g, "parakeet.encoder.conv_norm_type", "batch_norm");
+    gguf_set_val_u32(g, "parakeet.preprocessor.n_mels", tweak == 3 ? 80 : 128);
+    gguf_set_val_u32(g, "parakeet.preprocessor.hop_length", tweak == 4 ? 320 : 160);
+    gguf_set_val_u32(g, "parakeet.decoder.pred_hidden", 640);
+    auto add = [&](const char* name, ggml_type type, std::vector<int64_t> ne) {
+        ggml_tensor* t = ggml_new_tensor(ctx, type, (int)ne.size(), ne.data());
+        ggml_set_name(t, name);
+        uint8_t* p = static_cast<uint8_t*>(t->data);
+        for (size_t i = 0; i < ggml_nbytes(t); ++i) p[i] = (uint8_t)(i * 37 + 11 + std::strlen(name));
+        return t;
+    };
+    ggml_tensor* q = add("encoder.layers.0.self_attn.linear_q.weight", GGML_TYPE_Q8_0, {32, 2});
+    add("encoder.pre_encode.out.bias", GGML_TYPE_F32, {4});
+    add("encoder.layers.0.norm_out.weight", GGML_TYPE_F32, {4});
+    add("joint.enc.bias", GGML_TYPE_F32, {3});
+    ggml_tensor* dec = add("decoder.prediction.embed.weight", GGML_TYPE_F32, {4, 2});
+    add("joint.joint_net.2.bias", GGML_TYPE_F32, {5});
+    if (tweak == 1) static_cast<uint8_t*>(q->data)[40] ^= 1;
+    if (tweak == 2) static_cast<uint8_t*>(dec->data)[3] ^= 1;
+    for (ggml_tensor* t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) gguf_add_tensor(g, t);
+    const bool ok = gguf_write_to_file(g, path, false);
+    gguf_free(g);
+    ggml_free(ctx);
+    return ok;
+}
+
+// The engine's path: ModelLoader's mapped tensors and its metadata (the
+// Parakeet engine's digest for a parakeet_tdt GGUF, else Qwen3-ASR's).
 bool loaded_model_hash(const char* path, uint64_t& hash, double& digest_ms, std::string& err) {
     starling::ggml::ModelLoader ml;
     if (!ml.load(path)) {
@@ -117,12 +161,60 @@ bool loaded_model_hash(const char* path, uint64_t& hash, double& digest_ms, std:
         return false;
     }
     const TensorLookup tensor = [&ml](const std::string& n) -> const ggml_tensor* { return ml.tensor(n.c_str()); };
+    const auto arch = ml.kv().find("general.architecture");
+    const bool parakeet = arch != ml.kv().end() && arch->second.s == "parakeet_tdt";
     std::vector<EncoderMeta> meta;
-    if (!qwen3_encoder_meta(ml.kv(), meta, err)) return false;
+    if (!(parakeet ? parakeet_encoder_meta(ml.kv(), meta, err) : qwen3_encoder_meta(ml.kv(), meta, err))) return false;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = qwen3_model_hash(ml.tensor_names(), tensor, meta, hash, err);
+    const bool ok = parakeet ? parakeet_model_hash(ml.tensor_names(), tensor, meta, hash, err)
+                             : qwen3_model_hash(ml.tensor_names(), tensor, meta, hash, err);
     digest_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return ok;
+}
+
+void test_parakeet() {
+    char path[5][256];
+    for (int t = 0; t < 5; ++t) {
+        std::snprintf(path[t], sizeof path[t], "/tmp/npu_fingerprint_test_pk_%d_%d.gguf", (int)getpid(), t);
+        if (!write_parakeet_model(path[t], t)) {
+            check(false, "synthesized Parakeet GGUFs written");
+            return;
+        }
+    }
+    uint64_t f[5] = {}, l[5] = {};
+    std::string err;
+    double ms = 0;
+    bool ok = true;
+    for (int t = 0; t < 5; ++t)
+        ok = ok && gguf_model_hash(path[t], f[t], err) && loaded_model_hash(path[t], l[t], ms, err);
+    check(ok, "Parakeet: hashes of the synthesized GGUFs " + err);
+    if (ok) {
+        check_hex(f[0], kParakeetDigestVector, "Parakeet encoder digest (pinned, = export_parakeet.py's)");
+        for (int t = 0; t < 5; ++t) check_hex(l[t], f[t], "Parakeet: digest from the loaded model = from the file");
+        check(f[1] != f[0], "Parakeet: one changed byte of an encoder matrix: another digest");
+        check_hex(f[2], f[0], "Parakeet: a changed decoder tensor leaves the digest alone");
+        check(f[3] != f[0], "Parakeet: another n_mels: another digest");
+        check_hex(f[4], f[0], "Parakeet: a key outside the encoder leaves the digest alone");
+    }
+    // The artifact contract the engine and export_parakeet.py share.
+    const std::vector<std::string> pieces = parakeet_enc_pieces(24);
+    check(pieces.size() == 5 && pieces[0] == "sub" && pieces[1] == "l0-6" && pieces[4] == "l18-24",
+          "Parakeet: pieces sub, l0-6 .. l18-24");
+    std::vector<uint64_t> in, out;
+    parakeet_enc_io("sub", 128, 1024, 24, 640, in, out);
+    check(in == std::vector<uint64_t>{110080, 428, 212, 104} && out == std::vector<uint64_t>{106496},
+          "Parakeet: sub I/O sizes");
+    parakeet_enc_io("l6-12", 128, 1024, 24, 640, in, out);
+    check(in == std::vector<uint64_t>{1703936, 1664, 1664} && out == std::vector<uint64_t>{1703936},
+          "Parakeet: segment I/O sizes");
+    parakeet_enc_io("l18-24", 128, 1024, 24, 640, in, out);
+    check(out == std::vector<uint64_t>{1064960}, "Parakeet: the last segment outputs the joint projection");
+    check(parakeet_enc_key("l0-6", 128, 1024, 24, 8, 4096, 9, 256, 640) ==
+              "parakeet-enc/1 piece=l0-6 mels=128 chunk=26 rows=416 d=1024 L=24 H=8 ff=4096 ck=9 sc=256 jh=640",
+          "Parakeet: contract key (= export_parakeet.py piece_key)");
+    check(parakeet_enc_artifact_name(0x0f2812c9375238b0ull, "sub") == "parakeet-enc-0f2812c9375238b0-sub.stnpu",
+          "Parakeet: artifact name");
+    for (auto& p : path) std::remove(p);
 }
 
 void test_vectors() {
@@ -186,6 +278,7 @@ void test_synthesized() {
 int main(int argc, char** argv) {
     test_vectors();
     test_synthesized();
+    test_parakeet();
     for (int i = 1; i < argc; ++i) {
         uint64_t file = 0, loaded = 0;
         std::string err;

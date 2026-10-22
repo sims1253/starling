@@ -187,7 +187,8 @@ target_link_libraries(starling_ggml_core PUBLIC ${CMAKE_DL_LIBS})
 # touch a TPU; the engine then runs the GPU encoder as before.
 if(ANDROID)
   set(STARLING_NPU_SRC ${STARLING_REPO_ROOT}/cpp/npu)
-  target_sources(starling_ggml_core PRIVATE ${STARLING_NPU_SRC}/tpu_runtime.cpp ${STARLING_NPU_SRC}/npu_status.cpp)
+  target_sources(starling_ggml_core PRIVATE ${STARLING_NPU_SRC}/tpu_runtime.cpp ${STARLING_NPU_SRC}/npu_status.cpp
+    ${STARLING_NPU_SRC}/gguf_fingerprint.cpp)
   target_compile_definitions(starling_ggml_core PUBLIC STARLING_HAVE_NPU=1)
   target_include_directories(starling_ggml_core PUBLIC ${STARLING_NPU_SRC})
   target_link_libraries(starling_ggml_core PUBLIC nativewindow log)

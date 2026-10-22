@@ -17,12 +17,21 @@
 
 #include "ggml.h"
 
+#if defined(STARLING_HAVE_NPU)
+#include "gguf_fingerprint.hpp"    // cpp/npu: Pixel TPU encoder artifacts
+#include "npu_status.hpp"
+#include "tpu_runtime.hpp"
+
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <map>
 
 namespace starling::fast {
@@ -51,6 +60,15 @@ struct Layer {
     int ff1_b1 = -1, ff1_b2 = -1, ff2_b1 = -1, ff2_b2 = -1;
     int k_b = -1, v_b = -1, o_b = -1, pos_b = -1, pw1_b = -1, pw2_b = -1;
 };
+
+#if defined(STARLING_HAVE_NPU)
+// The opened TPU pieces: the subsampling chunk and the conformer segments.
+struct PkTpu {
+    std::unique_ptr<npu::TpuModel> sub;
+    std::vector<std::unique_ptr<npu::TpuModel>> segs;
+};
+using PkTpuResult = std::pair<std::unique_ptr<PkTpu>, std::string>;
+#endif
 
 } // namespace
 
@@ -108,6 +126,24 @@ struct ParakeetEngine::Impl {
 
     vk::Ref R(Arena::Id id) const { return ar.ref(id); }
     vk::Ref Ropt(int id) const { return id >= 0 ? ar.ref((Arena::Id)id) : vk::Ref(); }
+
+    // ---- the encoder on the Pixel TPU (cpp/npu, scripts/npu/export_parakeet.py) ----
+    // With all parakeet-enc-<model hash>-<piece>.stnpu artifacts of this GGUF
+    // in STARLING_NPU_DIR (else STARLING_FAST_CACHE_DIR), inputs of up to one
+    // TPU window (kParakeetTpuRows subsampled frames, ~33 s) run the whole
+    // encoder on the TPU: the subsampling per 26-frame chunk, then the
+    // conformer segments; the GPU encoder stays loaded for longer inputs,
+    // STARLING_NPU=0 and any TPU error.
+#if defined(STARLING_HAVE_NPU)
+    std::unique_ptr<PkTpu> npu;
+    std::future<PkTpuResult> npu_pending;
+#endif
+    std::string npu_note;   // why the TPU path is (not) used, for describe()
+    bool npu_ready();
+    bool npu_encode(const std::vector<float>& feats, int T, std::vector<float>& enc_out, int& Tp, std::string& err);
+    // The encoder on the TPU when it can take T mel frames, else (or after a
+    // TPU error) on the GPU.
+    bool encode_mel(const std::vector<float>& feats, int T, std::vector<float>& enc_out, int& Tp, std::string& err);
 };
 
 ParakeetEngine::ParakeetEngine() : impl_(new Impl) {}
@@ -118,8 +154,167 @@ ParakeetEngine::~ParakeetEngine() {
         impl_->ctx->fn().vkDeviceWaitIdle(impl_->ctx->device());
 }
 
+namespace {
+// ---- Parakeet encoder artifacts on the Pixel TPU (cpp/npu) ----
+// Only where a TPU can be used at all (a supported encoder shape, an
+// artifact directory, a device whose firmware lists the TPU runtime) does
+// anything run, and then on a worker that starts before the GPU weight load:
+// it computes the model hash from the GGUF file itself (gguf_fingerprint:
+// its own reads, so neither create() nor the caller, which releases the
+// model, waits for it), then finds, checks, opens and warms up every piece;
+// Impl::npu_ready picks the result up once it is there. Elsewhere nothing is
+// hashed and the load is unchanged.
+struct PkNpuStart {
+    std::string note;
+#if defined(STARLING_HAVE_NPU)
+    std::future<PkTpuResult> fut;
+#endif
+};
+
+#if defined(STARLING_HAVE_NPU)
+struct PkNpuJob {
+    std::string model, gguf, dirs;
+    uint32_t nm = 0, d = 0, layers = 0, heads = 0, ff = 0, ck = 0, sc = 0, jh = 0;
+    bool verbose = false;
+};
+
+PkTpuResult pk_npu_open(const PkNpuJob& j, uint64_t h) {
+    PkTpuResult out;
+    auto finish = [&](const std::string& s) {
+        out.second = s;
+        if (j.verbose) std::fprintf(stderr, "[fast-parakeet] npu: %s\n", s.c_str());
+        return std::move(out);
+    };
+    auto report = [&](npu::PieceState st, const std::string& msg) {
+        npu::report_piece("parakeet-enc", h, j.gguf, j.model, st, msg);
+    };
+    const std::vector<std::string> pieces = npu::parakeet_enc_pieces(j.layers);
+    std::vector<std::string> paths, missing;
+    for (const std::string& piece : pieces) {
+        const std::string name = npu::parakeet_enc_artifact_name(h, piece);
+        std::string path;
+        for (size_t b = 0; b <= j.dirs.size() && path.empty();) {
+            size_t e = j.dirs.find(':', b);
+            if (e == std::string::npos) e = j.dirs.size();
+            const std::string cand = j.dirs.substr(b, e - b) + "/" + name;
+            if (e > b && access(cand.c_str(), R_OK) == 0) path = cand;
+            b = e + 1;
+        }
+        if (path.empty()) missing.push_back(name);
+        paths.push_back(path);
+    }
+    if (!missing.empty()) {
+        std::string list;
+        for (const std::string& n : missing) list += (list.empty() ? "" : ", ") + n;
+        report(npu::PieceState::Missing, "no " + list);
+        return finish("no artifact " + list + " in " + j.dirs);
+    }
+    std::string err;
+    auto stale = [&](const std::string& why) {
+        report(npu::PieceState::Stale, why);
+        return finish("TPU file stale, recompile via adb: " + why);
+    };
+    if (!npu::load_southbound(err)) return finish("TPU runtime unavailable: " + err);
+    const std::string vendor = npu::vendor_version();
+    auto tpu = std::make_unique<PkTpu>();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        npu::ArtifactInfo info;
+        if (!npu::read_artifact_info(paths[i], info, err)) return stale(err);
+        std::vector<uint64_t> in_bytes, out_bytes;
+        npu::parakeet_enc_io(pieces[i], j.nm, j.d, j.layers, j.jh, in_bytes, out_bytes);
+        const std::string key = npu::parakeet_enc_key(pieces[i], j.nm, j.d, j.layers, j.heads, j.ff, j.ck, j.sc, j.jh);
+        if (info.key != key || info.model_hash != h || info.in_bytes != in_bytes || info.out_bytes != out_bytes)
+            return stale(paths[i] + " was built by another exporter version ('" + info.key + "')");
+        if (info.vendor != vendor)
+            return stale(paths[i] + " was compiled for TPU firmware " + info.vendor + ", this phone has " + vendor);
+        auto m = std::make_unique<npu::TpuModel>();
+        if (!m->open(paths[i], err)) {
+            report(npu::PieceState::Error, "open " + paths[i] + ": " + err);
+            return finish("open " + paths[i] + ": " + err);
+        }
+        // One zero call: the first invocation pays the weight transfer.
+        std::vector<float> z;
+        for (size_t k = 0; k < in_bytes.size() && err.empty(); ++k) {
+            z.assign(in_bytes[k] / 4, 0.0f);
+            if (!m->write_input(k, z.data(), in_bytes[k], err)) break;
+        }
+        if (!err.empty() || !m->run(err)) {
+            report(npu::PieceState::Error, "warm-up " + paths[i] + ": " + err);
+            return finish("warm-up " + paths[i] + ": " + err);
+        }
+        if (!env_on("STARLING_NPU_KEEP_MAP")) m->drop_mapped_pages();
+        if (i == 0) tpu->sub = std::move(m);
+        else tpu->segs.push_back(std::move(m));
+    }
+    char b[96];
+    std::snprintf(b, sizeof b, " (%zu pieces, load + warm-up %.1f ms)", pieces.size(), ms_since(t0));
+    report(npu::PieceState::Ok, paths[0]);
+    out.first = std::move(tpu);
+    return finish(std::string("encoder on the TPU") + b);
+}
+#endif
+
+PkNpuStart pk_npu_start(const pk::ParakeetModel& m) {
+    PkNpuStart r;
+#if defined(STARLING_HAVE_NPU)
+    PkNpuJob j;
+    j.verbose = env_on("STARLING_FAST_VERBOSE") || env_on("STARLING_FAST_TIMING");
+    auto note = [&](const std::string& s) {
+        r.note = s;
+        if (j.verbose) std::fprintf(stderr, "[fast-parakeet] npu: %s\n", s.c_str());
+        return std::move(r);
+    };
+    if (const char* e = std::getenv("STARLING_NPU"); e && std::strcmp(e, "0") == 0) return note("disabled (STARLING_NPU=0)");
+    const pk::Config& c = m.config;
+    const ggml_tensor* jenc = m.loader.tensor("joint.enc.weight");
+    // The shapes export_parakeet.py builds graphs for.
+    if (!jenc || c.conv_norm_type != "batch_norm" || c.xscaling || c.n_mels % 8 || c.d_model % c.n_heads ||
+        c.n_layers % npu::kParakeetTpuSegLayers || c.conv_kernel % 2 == 0 || c.ff_dim % 4)
+        return r;
+    j.dirs = npu::npu_dirs();
+    if (j.dirs.empty()) return note("no STARLING_NPU_DIR");
+    if (!npu::tpu_present()) return note("no TPU runtime on this device");
+    j.nm = c.n_mels;
+    j.d = c.d_model;
+    j.layers = c.n_layers;
+    j.heads = c.n_heads;
+    j.ff = c.ff_dim;
+    j.ck = c.conv_kernel;
+    j.sc = c.subsampling_conv_channels;
+    j.jh = (uint32_t)jenc->ne[1];
+    j.model = "arch=parakeet";
+    j.gguf = m.loader.path();
+    r.note = "checking the TPU artifacts";
+    auto work = [j]() {
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t h = 0;
+        std::string e;
+        bool ok = false;
+        try {
+            ok = npu::gguf_model_hash(j.gguf, h, e);
+        } catch (const std::exception& x) {
+            e = x.what();
+        }
+        if (!ok) return PkTpuResult{nullptr, "no model fingerprint: " + e};
+        if (j.verbose) std::fprintf(stderr, "[fast-parakeet] npu: encoder digest %.1f ms\n", ms_since(t0));
+        return pk_npu_open(j, h);
+    };
+    try {
+        r.fut = std::async(std::launch::async, std::move(work));
+    } catch (const std::system_error& e) {   // no thread: the GPU encoder stays in charge
+        return note(std::string("no worker thread: ") + e.what());
+    }
+#else
+    (void)m;
+#endif
+    return r;
+}
+} // namespace
+
 std::unique_ptr<ParakeetEngine> ParakeetEngine::create(const pk::ParakeetModel& m, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
+    PkNpuStart ns = pk_npu_start(m);   // TPU artifact hashing + open overlap the GPU load
     std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
     if (!hold) return nullptr;
     vk::Context* ctx = hold.get();
@@ -133,7 +328,116 @@ std::unique_ptr<ParakeetEngine> ParakeetEngine::create(const pk::ParakeetModel& 
     if (env_on("STARLING_FAST_TIMING"))
         std::fprintf(stderr, "[fast-parakeet] create: device %.1f ms, kernels %.1f ms, weights %.1f ms\n",
                      t_ctx, t_kinit - t_ctx, ms_since(t0) - t_kinit);
+    e->impl_->npu_note = std::move(ns.note);
+#if defined(STARLING_HAVE_NPU)
+    e->impl_->npu_pending = std::move(ns.fut);
+#endif
     return e;
+}
+
+bool ParakeetEngine::Impl::npu_ready() {
+#if defined(STARLING_HAVE_NPU)
+    // Does not wait (unless STARLING_NPU_WAIT=1, for measurements): while the
+    // worker still opens the artifacts (~1.5 s for 1.2 GB on a Pixel 10
+    // Pro), calls run on the GPU encoder as before.
+    static const bool wait = env_on("STARLING_NPU_WAIT");
+    if (npu_pending.valid() &&
+        (wait || npu_pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready)) {
+        try {
+            auto r = npu_pending.get();
+            npu = std::move(r.first);
+            npu_note = std::move(r.second);
+        } catch (const std::exception& e) {
+            npu.reset();
+            npu_note = std::string("open failed: ") + e.what();
+        }
+    }
+    return npu != nullptr;
+#else
+    return false;
+#endif
+}
+
+bool ParakeetEngine::Impl::npu_encode(const std::vector<float>& feats, int T, std::vector<float>& enc_out, int& Tp,
+                                      std::string& err) {
+#if defined(STARLING_HAVE_NPU)
+    const uint32_t C = npu::kParakeetTpuChunk, R = npu::kParakeetTpuRows;
+    const int T1 = stage_len(T), T2 = stage_len(T1), T3 = stage_len(T2);
+    int valid = T - 1;
+    for (int s = 0; s < 3; ++s) valid = stage_len(valid);
+    valid = std::min(valid, T3);
+    if (T3 > (int)R) {
+        err = "longer than one TPU window";
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    // Subsampling, per 26-frame chunk: the mel rows it reads (zero outside
+    // [0, T)), and which of its stage-1/2 rows lie inside the clip (the GPU
+    // convs read zero padding past each stage's length). Chunks past the
+    // last frame are not run: their rows are padding, masked below.
+    const uint32_t LM = 8 * C + 7, L1 = 4 * C + 3, L2 = 2 * C + 1;
+    std::vector<float> x((size_t)R * D, 0.0f), mel((size_t)LM * NM), m1(L1), m2(L2), rmc(C);
+    int chunks = 0;
+    for (uint32_t k = 0; C * k < (uint32_t)T3; ++k, ++chunks) {
+        const int g0 = (int)(8 * C * k) - 7, g1 = (int)(4 * C * k) - 3, g2 = (int)(2 * C * k) - 1;
+        for (uint32_t r = 0; r < LM; ++r) {
+            const int g = g0 + (int)r;
+            float* d = &mel[(size_t)r * NM];
+            if (g >= 0 && g < T) std::memcpy(d, &feats[(size_t)g * NM], NM * 4);
+            else std::fill(d, d + NM, 0.0f);
+        }
+        for (uint32_t r = 0; r < L1; ++r) m1[r] = (g1 + (int)r >= 0 && g1 + (int)r < T1) ? 1.0f : 0.0f;
+        for (uint32_t r = 0; r < L2; ++r) m2[r] = (g2 + (int)r >= 0 && g2 + (int)r < T2) ? 1.0f : 0.0f;
+        for (uint32_t r = 0; r < C; ++r) rmc[r] = (int)(C * k + r) < valid ? 1.0f : 0.0f;
+        npu::TpuModel& s = *npu->sub;
+        if (!s.write_input(0, mel.data(), mel.size() * 4, err) || !s.write_input(1, m1.data(), m1.size() * 4, err) ||
+            !s.write_input(2, m2.data(), m2.size() * 4, err) || !s.write_input(3, rmc.data(), rmc.size() * 4, err) ||
+            !s.run(err) || !s.read_output(0, &x[(size_t)C * k * D], (size_t)C * D * 4, err))
+            return false;
+    }
+    const double t_sub = ms_since(t0);
+    // Conformer segments over all rows: row mask (valid frames) and additive
+    // key mask.
+    std::vector<float> rm(R), km(R);
+    for (uint32_t r = 0; r < R; ++r) {
+        rm[r] = (int)r < valid ? 1.0f : 0.0f;
+        km[r] = (int)r < valid ? 0.0f : -1e4f;
+    }
+    std::vector<float> out((size_t)R * JH);
+    for (size_t i = 0; i < npu->segs.size(); ++i) {
+        npu::TpuModel& s = *npu->segs[i];
+        const bool last = i + 1 == npu->segs.size();
+        if (!s.write_input(0, x.data(), x.size() * 4, err) || !s.write_input(1, rm.data(), R * 4, err) ||
+            !s.write_input(2, km.data(), R * 4, err) || !s.run(err) ||
+            !s.read_output(0, last ? out.data() : x.data(), (last ? out.size() : x.size()) * 4, err))
+            return false;
+    }
+    Tp = T3;
+    enc_out.assign(out.begin(), out.begin() + (size_t)T3 * JH);
+    if (env_on("STARLING_FAST_TIMING"))
+        std::fprintf(stderr, "[fast-parakeet] npu encoder: subsampling %d chunks %.1f ms, layers %.1f ms\n", chunks,
+                     t_sub, ms_since(t0) - t_sub);
+    return true;
+#else
+    (void)feats; (void)T; (void)enc_out; (void)Tp;
+    err = "built without the TPU path";
+    return false;
+#endif
+}
+
+bool ParakeetEngine::Impl::encode_mel(const std::vector<float>& feats, int T, std::vector<float>& enc_out, int& Tp,
+                                      std::string& err) {
+#if defined(STARLING_HAVE_NPU)
+    if (npu_ready() && stage_len(stage_len(stage_len(T))) <= (int)npu::kParakeetTpuRows) {
+        std::string nerr;
+        if (npu_encode(feats, T, enc_out, Tp, nerr)) return true;
+        // Any TPU error: the GPU encoder from here on.
+        npu.reset();
+        npu_note = "failed: " + nerr;
+        std::fprintf(stderr, "[fast-parakeet] TPU encoder failed (%s); the GPU runs it from now on\n", nerr.c_str());
+    }
+#endif
+    return run_encoder(feats, T, enc_out, Tp, err);
 }
 
 std::string ParakeetEngine::describe() const {
@@ -141,7 +445,10 @@ std::string ParakeetEngine::describe() const {
     std::snprintf(buf, sizeof buf, "fast/vulkan '%s' weights=%.0f MiB cpu=%s",
                   impl_->ctx->info().name.c_str(), impl_->ar.total_bytes() / 1048576.0,
                   cpu::isa_name());
-    return buf;
+    std::string d = buf;
+    if (impl_->npu_ready()) d += " encoder=npu";
+    if (impl_->npu_note.find("stale") != std::string::npos) d += " [" + impl_->npu_note + "]";
+    return d;
 }
 
 bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
@@ -773,7 +1080,7 @@ bool ParakeetEngine::encode(const float* pcm, size_t n, std::vector<float>& enc,
     std::vector<float> feats;
     int T = 0;
     I.fmel->compute(pcm, n, feats, T);
-    return I.run_encoder(feats, T, enc, Tp, err);
+    return I.encode_mel(feats, T, enc, Tp, err);
 }
 
 bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>& ids, std::string& err,
@@ -805,7 +1112,7 @@ bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>
     if (aborted()) return false;
     std::vector<float> enc;
     int Tp = 0;
-    if (!I.run_encoder(feats, T, enc, Tp, err)) return false;
+    if (!I.encode_mel(feats, T, enc, Tp, err)) return false;
     const double t_enc = ms_since(t0);
     if (aborted()) return false;
     bool decode_aborted = false;
