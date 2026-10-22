@@ -1609,13 +1609,11 @@ fn start_on_device(
             shared.wake.notify_all();
         }
         let _ = writer.join();
-        let (unavailable, detail) = match err {
-            cpal::PlayStreamError::DeviceNotAvailable => (true, err.to_string()),
-            cpal::PlayStreamError::BackendSpecific { err } => (false, err.description),
-        };
+        let kind = err.kind();
+        let detail = err.to_string();
         return Err(fail(microphone::classify_backend(
             &route.device,
-            unavailable,
+            kind,
             format!("the stream did not start ({detail})"),
         )));
     }
@@ -1641,16 +1639,11 @@ fn pick_input_config(
     let ranges: Vec<_> = device
         .supported_input_configs()
         .map_err(|err| {
-            let (unavailable, detail) = match err {
-                cpal::SupportedStreamConfigsError::DeviceNotAvailable => (true, err.to_string()),
-                cpal::SupportedStreamConfigsError::BackendSpecific { err } => {
-                    (false, err.description)
-                }
-                other => (false, other.to_string()),
-            };
+            let kind = err.kind();
+            let detail = err.to_string();
             microphone::classify_backend(
                 name,
-                unavailable,
+                kind,
                 format!("could not query its configurations ({detail})"),
             )
         })?
@@ -1666,14 +1659,11 @@ fn pick_input_config(
     }
 
     device.default_input_config().map_err(|err| {
-        let (unavailable, detail) = match err {
-            cpal::DefaultStreamConfigError::DeviceNotAvailable => (true, err.to_string()),
-            cpal::DefaultStreamConfigError::BackendSpecific { err } => (false, err.description),
-            other => (false, other.to_string()),
-        };
+        let kind = err.kind();
+        let detail = err.to_string();
         microphone::classify_backend(
             name,
-            unavailable,
+            kind,
             format!("could not choose a configuration ({detail})"),
         )
     })
@@ -1707,10 +1697,12 @@ fn open_stream(
     let attempted = match sample_format {
         cpal::SampleFormat::I8 => Some(build_stream::<i8>(device, config, shared)),
         cpal::SampleFormat::I16 => Some(build_stream::<i16>(device, config, shared)),
+        cpal::SampleFormat::I24 => Some(build_stream::<cpal::I24>(device, config, shared)),
         cpal::SampleFormat::I32 => Some(build_stream::<i32>(device, config, shared)),
         cpal::SampleFormat::I64 => Some(build_stream::<i64>(device, config, shared)),
         cpal::SampleFormat::U8 => Some(build_stream::<u8>(device, config, shared)),
         cpal::SampleFormat::U16 => Some(build_stream::<u16>(device, config, shared)),
+        cpal::SampleFormat::U24 => Some(build_stream::<cpal::U24>(device, config, shared)),
         cpal::SampleFormat::U32 => Some(build_stream::<u32>(device, config, shared)),
         cpal::SampleFormat::U64 => Some(build_stream::<u64>(device, config, shared)),
         cpal::SampleFormat::F32 => Some(build_stream::<f32>(device, config, shared)),
@@ -1726,14 +1718,11 @@ fn open_stream(
             detail: format!("its sample format {sample_format} is not supported."),
         })?
         .map_err(|err| {
-            let (unavailable, detail) = match err {
-                cpal::BuildStreamError::DeviceNotAvailable => (true, err.to_string()),
-                cpal::BuildStreamError::BackendSpecific { err } => (false, err.description),
-                other => (false, other.to_string()),
-            };
+            let kind = err.kind();
+            let detail = err.to_string();
             microphone::classify_backend(
                 name,
-                unavailable,
+                kind,
                 format!("the stream could not be opened ({detail})"),
             )
         })
@@ -1743,7 +1732,7 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     shared: &Arc<Shared>,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
@@ -1755,7 +1744,7 @@ where
     // capture (FnMut storage) or lock-free atomics on `shared`.
     let mut callback = CallbackState::new(channels);
     device.build_input_stream(
-        config,
+        *config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             callback.process(data, &shared);
         },
@@ -1771,6 +1760,17 @@ mod tests {
     use super::*;
     use crate::journal::testing::FaultSink;
     use tempfile::TempDir;
+
+    #[test]
+    fn downmixes_24_bit_pcm_selected_by_cpal_defaults() {
+        let signed = [-8_388_608, 0, 4_194_304].map(|n| cpal::I24::new(n).unwrap());
+        let unsigned = [0, 8_388_608, 12_582_912].map(|n| cpal::U24::new(n).unwrap());
+        let mut mono = Vec::new();
+        downmix_into(&signed, 1, &mut mono);
+        assert_eq!(mono, [-1.0, 0.0, 0.5]);
+        downmix_into(&unsigned, 1, &mut mono);
+        assert_eq!(mono, [-1.0, 0.0, 0.5]);
+    }
 
     /// A `Shared` with an arbitrary (power-of-two) ring capacity for
     /// callback-side simulation without a real device.

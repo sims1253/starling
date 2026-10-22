@@ -10,7 +10,7 @@
 //! mid-take surfaces as a fatal [`crate::recorder::RecorderFault`].
 //!
 //! Device identity is currently the host's device name, so two devices
-//! reporting the same name resolve to the first one listed. CPAL 0.17
+//! reporting the same name resolve to the first one listed. CPAL
 //! exposes stable IDs; adopting them requires migrating saved preferences.
 
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -101,6 +101,16 @@ impl InputRoute {
     }
 }
 
+// Keep the names saved by CPAL 0.17. ALSA used the PCM identifier, now
+// exposed as the description's driver, rather than its friendly name.
+fn input_device_name(description: cpal::DeviceDescription) -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(driver) = description.driver() {
+        return driver.to_string();
+    }
+    description.name().to_string()
+}
+
 /// Lists the default host's capture devices, default first-flagged.
 /// Devices whose name cannot be read are skipped (they cannot be selected
 /// or remembered). Blocking: on ALSA, listing probes each PCM, so call it
@@ -109,11 +119,11 @@ pub fn list_input_devices() -> Result<Vec<InputDevice>, String> {
     let host = cpal::default_host();
     let default_name = host
         .default_input_device()
-        .and_then(|device| device.name().ok());
+        .and_then(|device| device.description().map(input_device_name).ok());
     let devices = host
         .input_devices()
         .map_err(|err| err.to_string())?
-        .filter_map(|device| device.name().ok())
+        .filter_map(|device| device.description().map(input_device_name).ok())
         .map(|name| InputDevice {
             is_default: default_name.as_deref() == Some(name.as_str()),
             name,
@@ -133,9 +143,11 @@ pub(crate) fn open_input(
         None => RouteReason::FollowingDefault,
         Some(name) => match host.input_devices() {
             Ok(mut devices) => {
-                if let Some(device) =
-                    devices.find(|device| device.name().is_ok_and(|listed| listed == name))
-                {
+                if let Some(device) = devices.find(|device| {
+                    device
+                        .description()
+                        .is_ok_and(|description| input_device_name(description) == name)
+                }) {
                     let route = InputRoute {
                         preferred: Some(name.to_string()),
                         device: name.to_string(),
@@ -159,7 +171,8 @@ pub(crate) fn open_input(
             },
         })?;
     let name = device
-        .name()
+        .description()
+        .map(input_device_name)
         .unwrap_or_else(|_| "system default input".to_string());
     Ok((
         device,
@@ -261,14 +274,21 @@ impl std::fmt::Display for InputProblem {
     }
 }
 
-/// Classifies a backend error by its typed cpal kind first: only an
-/// opaque `BackendSpecific` description is inspected for the access-denied
+/// Classifies a backend error by its typed cpal kind first. Opaque
+/// backend descriptions are inspected for the access-denied
 /// wording each OS uses (WASAPI `E_ACCESSDENIED`, `EACCES`/`EPERM`), and
 /// only to choose the explanation shown — never to decide whether a take
 /// survives (that is [`crate::recorder::RecorderFault::is_fatal`]).
-pub(crate) fn classify_backend(device: &str, unavailable: bool, detail: String) -> InputProblem {
+pub(crate) fn classify_backend(
+    device: &str,
+    kind: cpal::ErrorKind,
+    detail: String,
+) -> InputProblem {
     let device = device.to_string();
-    if unavailable {
+    if matches!(
+        kind,
+        cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::DeviceBusy
+    ) {
         return InputProblem::Unavailable { device, detail };
     }
     let lower = detail.to_ascii_lowercase();
@@ -281,7 +301,7 @@ pub(crate) fn classify_backend(device: &str, unavailable: bool, detail: String) 
     ]
     .iter()
     .any(|needle| lower.contains(needle));
-    if denied {
+    if kind == cpal::ErrorKind::PermissionDenied || denied {
         InputProblem::PermissionDenied { device, detail }
     } else {
         InputProblem::Failed { device, detail }
@@ -371,9 +391,45 @@ mod tests {
     }
 
     #[test]
+    fn device_names_preserve_saved_preferences() {
+        let description = cpal::DeviceDescriptionBuilder::new("USB microphone")
+            .driver("hw:USB,0")
+            .manufacturer("Microphone vendor")
+            .build();
+        let expected = if cfg!(target_os = "linux") {
+            "hw:USB,0"
+        } else {
+            "USB microphone"
+        };
+        assert_eq!(input_device_name(description), expected);
+        assert_eq!(
+            input_device_name(cpal::DeviceDescriptionBuilder::new("default").build()),
+            "default"
+        );
+    }
+
+    #[test]
     fn backend_errors_classify_by_kind_then_by_denial_wording() {
         assert!(matches!(
-            classify_backend("USB Mic", true, "gone".to_string()),
+            classify_backend("USB Mic", cpal::ErrorKind::DeviceBusy, "busy".to_string()),
+            InputProblem::Unavailable { .. }
+        ));
+        // The typed denial must win even when the backend's message has
+        // none of the English permission-denied wording below.
+        assert!(matches!(
+            classify_backend(
+                "Mic",
+                cpal::ErrorKind::PermissionDenied,
+                "refused".to_string()
+            ),
+            InputProblem::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            classify_backend(
+                "USB Mic",
+                cpal::ErrorKind::DeviceNotAvailable,
+                "gone".to_string()
+            ),
             InputProblem::Unavailable { .. }
         ));
         for denied in [
@@ -383,14 +439,18 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    classify_backend("Mic", false, denied.to_string()),
+                    classify_backend("Mic", cpal::ErrorKind::BackendError, denied.to_string()),
                     InputProblem::PermissionDenied { .. }
                 ),
                 "{denied}"
             );
         }
         assert!(matches!(
-            classify_backend("Mic", false, "format not supported".to_string()),
+            classify_backend(
+                "Mic",
+                cpal::ErrorKind::BackendError,
+                "format not supported".to_string()
+            ),
             InputProblem::Failed { .. }
         ));
     }
