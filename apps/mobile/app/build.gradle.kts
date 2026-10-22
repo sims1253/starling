@@ -1,3 +1,5 @@
+import java.security.MessageDigest
+
 plugins {
     id("com.android.application")
 }
@@ -149,7 +151,7 @@ abstract class ThirdPartyNoticesTask : DefaultTask() {
         val texts = sortedMapOf<String, String>()
         val missing = mutableListOf<String>()
         fun addText(text: String): String {
-            val digest = java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
+            val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
             val key = digest.joinToString("") { "%02x".format(it) }.take(16)
             texts.putIfAbsent(key, text)
             return key
