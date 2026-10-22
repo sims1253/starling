@@ -8,7 +8,14 @@
 
     <!-- What day and night share: the type, the controls, the surface. -->
     <style name="Theme.StarlingMobile" parent="Base.Theme.StarlingMobile">
-        <item name="android:fontFamily">@font/atkinson</item>
+        <!-- Atkinson reaches text through the default text appearances, not
+             a theme-level android:fontFamily: that would outrank every
+             view's own textAppearance and keep Literata off the headings
+             and transcripts. -->
+        <item name="android:textAppearance">@style/TextAppearance.Starling</item>
+        <item name="android:textAppearanceSmall">@style/TextAppearance.Starling.Small</item>
+        <item name="android:textAppearanceMedium">@style/TextAppearance.Starling.Medium</item>
+        <item name="android:textAppearanceLarge">@style/TextAppearance.Starling.Large</item>
         <item name="android:textColorPrimary">@color/starling_ink</item>
         <item name="android:textColorSecondary">@color/starling_muted</item>
         <item name="android:colorAccent">@color/starling_accent</item>
@@ -31,7 +38,10 @@
     <style name="Base.Theme.StarlingMobile.Dialog" parent="android:style/Theme.Material.Light.Dialog.NoActionBar" />
 
     <style name="Theme.StarlingMobile.Dialog" parent="Base.Theme.StarlingMobile.Dialog">
-        <item name="android:fontFamily">@font/atkinson</item>
+        <item name="android:textAppearance">@style/TextAppearance.Starling</item>
+        <item name="android:textAppearanceSmall">@style/TextAppearance.Starling.Small</item>
+        <item name="android:textAppearanceMedium">@style/TextAppearance.Starling.Medium</item>
+        <item name="android:textAppearanceLarge">@style/TextAppearance.Starling.Large</item>
         <item name="android:colorAccent">@color/starling_accent</item>
         <item name="android:buttonBarButtonStyle">@style/Widget.Starling.Button.Text</item>
         <item name="android:windowBackground">@drawable/dialog_background</item>
@@ -39,6 +49,7 @@
 
     <!-- Buttons: one quiet outline, one gold primary, one text-only. -->
     <style name="Widget.Starling.Button" parent="android:style/Widget.Material.Button">
+        <item name="android:fontFamily">@font/atkinson</item>
         <item name="android:background">@drawable/button_quiet</item>
         <item name="android:textColor">@color/button_quiet_text</item>
         <item name="android:textSize">15sp</item>
@@ -72,6 +83,23 @@
     <!-- Type: Literata's display cut for the few headings, Atkinson for
          everything the interface says, Literata's text cut for what the
          user said. -->
+    <!-- The defaults every text view starts from (see the theme). -->
+    <style name="TextAppearance.Starling" parent="android:style/TextAppearance.Material">
+        <item name="android:fontFamily">@font/atkinson</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Small" parent="android:style/TextAppearance.Material.Small">
+        <item name="android:fontFamily">@font/atkinson</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Medium" parent="android:style/TextAppearance.Material.Medium">
+        <item name="android:fontFamily">@font/atkinson</item>
+    </style>
+
+    <style name="TextAppearance.Starling.Large" parent="android:style/TextAppearance.Material.Large">
+        <item name="android:fontFamily">@font/atkinson</item>
+    </style>
+
     <style name="TextAppearance.Starling.Wordmark" parent="">
         <item name="android:fontFamily">@font/literata_display_regular</item>
         <item name="android:textSize">36sp</item>
