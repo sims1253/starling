@@ -60,6 +60,7 @@
     <string name="disk_low_in_take">Low disk space: about %1$d minutes left before Starling stops this recording.</string>
     <string name="recording_stopped_low_disk">Storage is almost full, so the recording stopped. Everything up to that point is saved; free up space to record again.</string>
     <string name="history_audio_heading">History audio</string>
+    <string name="keyboard_heading">Voice keyboard</string>
     <string name="history_audio_intro">Finished recordings are kept losslessly compressed (FLAC): retries send exactly the audio the first transcription did. Nothing is removed unless you set a limit; a limit removes audio only and keeps transcripts, and never touches recordings from the last day, ones still transcribing, or ones that never got a transcript.</string>
     <string name="history_audio_archival_intro">Archived recordings (Archive on a recording) follow their own limits. They are kept as FLAC too; a smaller lossy archival format is not available yet.</string>
     <string name="retention_age_label">Remove audio older than</string>

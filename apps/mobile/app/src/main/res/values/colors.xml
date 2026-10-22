@@ -1,9 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="starling_ink">#24251E</color>
-    <color name="starling_muted">#646657</color>
-    <color name="starling_accent">#526526</color>
-    <color name="starling_surface">#E8E4D9</color>
-    <color name="starling_card">#F5F1E7</color>
-    <color name="starling_line">#D2CEC1</color>
+    <!-- The plumage palette, day side: a pale lavender sheet with the
+         starling's night indigo as ink. The beak's gold is the one action
+         color; it is deepened to starling_accent wherever it has to read
+         as text or a thin mark on the sheet. Rose means recording or
+         failed. -->
+    <color name="starling_ink">#1E1C36</color>
+    <color name="starling_muted">#55527A</color>
+    <color name="starling_accent">#8F620A</color>
+    <color name="starling_surface">#ECEAF2</color>
+    <color name="starling_card">#F7F6FA</color>
+    <color name="starling_line">#CAC7DA</color>
+    <color name="starling_beak">#E3AC3B</color>
+    <color name="starling_on_beak">#1E1C36</color>
+    <color name="starling_rose">#AE2F50</color>
+    <color name="starling_on_rose">#FFFFFF</color>
 </resources>

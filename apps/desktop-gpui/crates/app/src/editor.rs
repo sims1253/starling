@@ -1267,9 +1267,9 @@ fn runs_for(
             let color: Hsla = match kind {
                 Some(RegionKind::Partial) => {
                     font.style = FontStyle::Italic;
-                    theme::MUTED.into()
+                    theme::QUILL.into()
                 }
-                Some(RegionKind::Command) => theme::EYEBROW.into(),
+                Some(RegionKind::Command) => theme::SHEEN.into(),
                 _ => base.color,
             };
             let underline = marked
@@ -1353,8 +1353,8 @@ impl Element for EditorElement {
                 layout.position_for(editor.buffer.cursor())
             };
             cursor = Some(fill(
-                Bounds::new(bounds.origin + at, size(px(1.5), line_height)),
-                theme::LIME,
+                Bounds::new(bounds.origin + at, size(px(2.), line_height)),
+                theme::BEAK,
             ));
         } else {
             for row in layout.rows() {
@@ -1370,7 +1370,7 @@ impl Element for EditorElement {
                         bounds.origin + point(from, top),
                         bounds.origin + point(to.max(from + px(4.)), top + line_height),
                     ),
-                    theme::STAGING_SELECTION,
+                    theme::SELECTION,
                 ));
             }
         }

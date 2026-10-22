@@ -6,28 +6,17 @@ use gpui::{Context, Div, FontWeight, SharedString, div, prelude::*, px};
 use crate::app::StarlingApp;
 use crate::system_check::Verdict;
 use crate::theme;
+use crate::views::kit;
 
 fn button(id: impl Into<SharedString>, label: &'static str) -> gpui::Stateful<Div> {
-    div()
-        .id(id.into())
-        .flex_none()
-        .px(px(10.))
-        .py(px(7.))
-        .rounded(px(3.))
-        .border_1()
-        .border_color(theme::SETTINGS_FOOT_LINE)
-        .text_size(px(10.))
-        .text_color(theme::SETTINGS_INK)
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::PAPER_HOVER))
-        .child(label)
+    kit::button(id.into(), kit::Tone::SheetQuiet, false).child(label)
 }
 
 fn note(text: impl Into<SharedString>) -> Div {
     div()
-        .text_size(px(10.))
-        .line_height(px(10. * 1.55))
-        .text_color(theme::SETTINGS_HELPER)
+        .text_size(px(theme::TEXT_SM))
+        .line_height(px(theme::TEXT_SM * 1.55))
+        .text_color(theme::SHEET_QUILL)
         .child(text.into())
 }
 
@@ -69,9 +58,9 @@ pub(crate) fn render_desktop_shortcut(
             .mt(px(12.))
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(px(theme::TEXT_SM))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::SETTINGS_INK)
+                    .text_color(theme::SHEET_INK)
                     .child("Desktop shortcut (Wayland)"),
             )
             .child(note(status.describe()))
@@ -112,10 +101,10 @@ pub(crate) fn render_system_check(
         Some(lines) => {
             for (index, line) in lines.into_iter().enumerate() {
                 let (mark, color) = match line.verdict {
-                    Verdict::Ok => ("✓", theme::SETTINGS_INK),
-                    Verdict::Limited => ("◐", theme::SETTINGS_INK),
-                    Verdict::Missing => ("✗", theme::DANGER),
-                    Verdict::Info => ("·", theme::SETTINGS_HELPER),
+                    Verdict::Ok => ("✓", theme::SHEET_INK),
+                    Verdict::Limited => ("◐", theme::SHEET_INK),
+                    Verdict::Missing => ("✗", theme::SHEET_ROSE),
+                    Verdict::Info => ("·", theme::SHEET_QUILL),
                 };
                 body = body.child(
                     div()
@@ -127,7 +116,7 @@ pub(crate) fn render_system_check(
                             div()
                                 .w(px(12.))
                                 .flex_none()
-                                .text_size(px(10.))
+                                .text_size(px(theme::TEXT_SM))
                                 .text_color(color)
                                 .child(mark),
                         )
@@ -140,9 +129,9 @@ pub(crate) fn render_system_check(
                                 .min_w(px(0.))
                                 .child(
                                     div()
-                                        .text_size(px(10.))
-                                        .line_height(px(10. * 1.55))
-                                        .text_color(theme::SETTINGS_INK)
+                                        .text_size(px(theme::TEXT_SM))
+                                        .line_height(px(theme::TEXT_SM * 1.55))
+                                        .text_color(theme::SHEET_INK)
                                         .child(format!("{}: {}", line.topic, line.summary)),
                                 )
                                 .children(line.fix.map(|fix| note(format!("Fix: {fix}")))),
@@ -163,9 +152,9 @@ pub(crate) fn render_system_check(
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(px(theme::TEXT_SM))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::SETTINGS_INK)
+                            .text_color(theme::SHEET_INK)
                             .child("System check"),
                     )
                     .child(run),

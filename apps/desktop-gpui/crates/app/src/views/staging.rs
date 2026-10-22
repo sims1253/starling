@@ -8,6 +8,7 @@ use crate::delivery::StagedInsert;
 use crate::processing::ProcessingState;
 use crate::staging::StagingPhase;
 use crate::theme;
+use crate::views::kit::{self, Tone};
 use crate::views::spinner;
 
 fn panel_button(
@@ -15,45 +16,26 @@ fn panel_button(
     disabled: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.))
-        .px(px(10.))
-        .py(px(6.))
-        .rounded(px(5.))
-        .border_1()
-        .border_color(theme::LINE)
-        .text_size(px(11.))
-        .text_color(theme::INK)
-        .when(!disabled, |button| {
-            button
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::GEAR_HOVER_BG).border_color(theme::LIME))
-        })
-        .when(disabled, |button| button.opacity(0.35))
-        .on_click(move |event, window, cx| {
-            if !disabled {
-                on_click(event, window, cx);
-            }
-        })
+    kit::button(id, Tone::Quiet, disabled).on_click(move |event, window, cx| {
+        if !disabled {
+            on_click(event, window, cx);
+        }
+    })
 }
 
-fn eyebrow(text: impl Into<SharedString>) -> Div {
+/// A heading inside the panel, in the interface's voice.
+fn heading(text: impl Into<SharedString>) -> Div {
     div()
-        .font(theme::mono_font())
-        .text_size(px(10.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme::EYEBROW)
+        .text_size(px(theme::TEXT_MD))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::SPECK)
         .child(text.into())
 }
 
 fn note(text: impl Into<SharedString>, color: gpui::Rgba) -> Div {
     div()
-        .text_size(px(11.))
-        .line_height(px(11. * 1.5))
+        .text_size(px(theme::TEXT_SM))
+        .line_height(px(theme::TEXT_SM * 1.5))
         .text_color(color)
         .child(text.into())
 }
@@ -101,17 +83,17 @@ pub fn render_staging_panel(
 
     let mut panel = div()
         .w_full()
-        .max_w(px(620.))
+        .max_w(px(680.))
         .mt(px(6.))
         .mb(px(14.))
         .flex()
         .flex_col()
         .gap(px(10.))
-        .p(px(14.))
-        .rounded(px(7.))
+        .p(px(16.))
+        .rounded(px(8.))
         .border_1()
         .border_color(theme::LINE)
-        .bg(theme::STAGING_BG)
+        .bg(theme::ROOST)
         .child(
             div()
                 .flex()
@@ -119,32 +101,32 @@ pub fn render_staging_panel(
                 .items_center()
                 .justify_between()
                 .gap(px(12.))
-                .child(eyebrow("DRAFT"))
+                .child(heading("Draft"))
                 .child(
                     div()
-                        .text_size(px(11.))
-                        .text_color(theme::MUTED)
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(theme::QUILL)
                         .child(status),
                 ),
         )
         .child(
             div()
                 .h(px(210.))
-                .font(theme::serif_font())
-                .text_size(px(18.))
-                .line_height(px(27.))
-                .text_color(theme::INK)
+                .font(theme::reading_font())
+                .text_size(px(theme::TEXT_XL))
+                .line_height(px(theme::TEXT_XL * 1.5))
+                .text_color(theme::SPECK)
                 .child(editor),
         );
 
     if let Some(notice) = notice {
-        panel = panel.child(note(notice, theme::AMBER));
+        panel = panel.child(note(notice, theme::BEAK));
     }
     if insert == Some(StagedInsert::Waiting) {
         panel = panel.child(note(
             "Now switch back to the window you dictated into: Starling types the draft there \
              once its own window loses focus. Nothing is submitted.",
-            theme::MUTED,
+            theme::QUILL,
         ));
     }
 
@@ -166,9 +148,9 @@ pub fn render_staging_panel(
                         .flex_row()
                         .items_center()
                         .gap(px(8.))
-                        .text_size(px(11.))
-                        .text_color(theme::MUTED)
-                        .child(spinner("staging-processing-spinner", 14., theme::MUTED))
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(theme::QUILL)
+                        .child(spinner("staging-processing-spinner", 14., theme::QUILL))
                         .child(format!(
                             "Processing with {label}… your text stays as it is."
                         )),
@@ -188,29 +170,27 @@ pub fn render_staging_panel(
                 );
             }
             ProcessingState::Proposal { row, current } => {
-                let heading = [
-                    Some("PROPOSAL".to_string()),
-                    Some(label.clone()).filter(|l| !l.is_empty()),
-                    seconds(row.stop_to_result_ms),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
-                block = block.child(eyebrow(heading));
+                let mut title = match Some(label.clone()).filter(|l| !l.is_empty()) {
+                    Some(label) => format!("Proposal from {label}"),
+                    None => "Proposal".to_string(),
+                };
+                if let Some(seconds) = seconds(row.stop_to_result_ms) {
+                    title.push_str(&format!(", ready {seconds} after you stopped"));
+                }
+                block = block.child(heading(title));
                 if !current {
                     block = block.child(note(
                         "Stale: the text changed after this was requested. Use it anyway only if \
                          you want to replace your edits.",
-                        theme::AMBER,
+                        theme::BEAK,
                     ));
                 }
                 block = block.child(
                     div()
-                        .font(theme::serif_font())
-                        .text_size(px(16.))
-                        .line_height(px(16. * 1.45))
-                        .text_color(theme::INK)
+                        .font(theme::reading_font())
+                        .text_size(px(theme::TEXT_LG))
+                        .line_height(px(theme::TEXT_LG * 1.5))
+                        .text_color(theme::SPECK)
                         .when(!current, |text| text.opacity(0.6))
                         .child(if row.text.trim().is_empty() {
                             "(nothing left after cleanup)".to_string()
@@ -249,10 +229,10 @@ pub fn render_staging_panel(
                     );
             }
             ProcessingState::Failed { message } | ProcessingState::Blocked { message } => {
-                block = block.child(note(message, theme::ERROR_TEXT));
+                block = block.child(note(message, theme::NOTICE_TEXT));
             }
             ProcessingState::Cancelled => {
-                block = block.child(note("Cancelled. Your text is unchanged.", theme::MUTED));
+                block = block.child(note("Cancelled. Your text is unchanged.", theme::QUILL));
             }
             ProcessingState::Idle => {}
         }
@@ -334,22 +314,16 @@ pub fn render_staging_panel(
             "Ctrl+⌫ word · Ctrl+Shift+K visual line · Ctrl+←/→ jump · Ctrl+Z undo · Ctrl+Shift+Enter insert · Ctrl+Enter done · Esc leave"
         }
     };
-    panel = panel.child(
+    panel = panel.child(actions).child(
         div()
             .flex()
             .flex_row()
             .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap(px(10.))
-            .child(actions)
-            .child(
-                div()
-                    .font(theme::mono_font())
-                    .text_size(px(9.))
-                    .text_color(theme::DIM)
-                    .child(hints),
-            ),
+            .gap_x(px(14.))
+            .gap_y(px(4.))
+            .text_size(px(theme::TEXT_XS))
+            .text_color(theme::DIM)
+            .children(hints.split(" · ").map(|hint| div().child(hint.to_string()))),
     );
     Some(panel)
 }

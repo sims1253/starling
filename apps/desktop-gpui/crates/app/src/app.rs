@@ -14,7 +14,7 @@ use std::{
 
 use gpui::{
     AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render,
-    Subscription, Task, Timer, Window, div, prelude::*,
+    Subscription, Task, Timer, Window, div, prelude::*, px,
 };
 use starling_dictation::{
     client::{self, StarlingClient},
@@ -384,6 +384,8 @@ pub struct StarlingApp {
     pub user_set_model: bool,
 
     pub settings_open: bool,
+    /// The settings page on show; kept between openings.
+    pub settings_page: views::SettingsPage,
     pub draft_endpoint: Entity<TextField>,
     pub draft_model: Entity<TextField>,
     pub draft_terms: Entity<TextField>,
@@ -1000,6 +1002,7 @@ impl StarlingApp {
             expected_terms_input: terms_input,
             user_set_model: settings.user_set_model,
             settings_open: false,
+            settings_page: views::SettingsPage::Engine,
             draft_endpoint,
             draft_model,
             draft_terms,
@@ -1360,6 +1363,12 @@ impl StarlingApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Open settings on one page: the page a notice's own action is about.
+    pub fn open_settings_at(&mut self, page: views::SettingsPage, cx: &mut Context<Self>) {
+        self.settings_page = page;
+        self.open_settings(cx);
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -2252,7 +2261,6 @@ impl Render for StarlingApp {
             None => {}
         }
 
-        let has_transcript = self.selected().is_some();
         let root_focus = self.root_focus.clone();
 
         div()
@@ -2274,13 +2282,12 @@ impl Render for StarlingApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme::BG)
-            .text_color(theme::INK)
+            .bg(theme::NIGHT)
+            .font(theme::ui_font())
+            .text_size(px(theme::TEXT_MD))
+            .text_color(theme::SPECK)
             .child(views::render_topbar(self, window, cx))
             .child(views::render_workspace(self, window, cx))
-            .when(has_transcript, |root| {
-                root.child(views::render_drawer(self, window, cx))
-            })
             .when(self.settings_open, |root| {
                 root.child(views::render_settings_modal(self, window, cx))
             })

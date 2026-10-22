@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The primary action is the beak's gold; while it means "stop recording"
+     (activated) it turns rose, like the record control on the desktop. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:color="@color/starling_line" android:state_enabled="false" />
+    <item android:color="@color/starling_rose" android:state_activated="true" />
+    <item android:color="@color/starling_beak" />
+</selector>

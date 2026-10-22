@@ -6,6 +6,7 @@ use starling_dictation::settings::OverlayMode;
 
 use crate::app::StarlingApp;
 use crate::theme;
+use crate::views::kit;
 use crate::views::settings::{choice_row, helper};
 
 const OVERLAY_CHOICES: [(OverlayMode, &str, &str); 3] = [
@@ -83,12 +84,12 @@ pub(crate) fn render_feedback_section(app: &mut StarlingApp, cx: &mut Context<St
         .flex_col()
         .gap(px(6.))
         .p(px(10.))
-        .rounded(px(3.))
+        .rounded(px(6.))
         .border_1()
         .border_color(if cues {
-            theme::SETTINGS_INK
+            theme::SHEET_BEAK
         } else {
-            theme::SETTINGS_LINE
+            theme::SHEET_LINE
         })
         .when(!cues, |row| row.opacity(0.5))
         .child(
@@ -97,7 +98,7 @@ pub(crate) fn render_feedback_section(app: &mut StarlingApp, cx: &mut Context<St
                 .flex_row()
                 .justify_between()
                 .items_center()
-                .text_size(px(11.))
+                .text_size(px(theme::TEXT_MD))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("Sound volume")
                 .child(
@@ -108,22 +109,12 @@ pub(crate) fn render_feedback_section(app: &mut StarlingApp, cx: &mut Context<St
                         .gap(px(9.))
                         .child(
                             div()
-                                .font(theme::mono_font())
                                 .font_weight(FontWeight::NORMAL)
+                                .text_color(theme::SHEET_QUILL)
                                 .child(format!("{volume}%")),
                         )
                         .child(
-                            div()
-                                .id("cue-preview")
-                                .px(px(8.))
-                                .py(px(3.))
-                                .rounded(px(3.))
-                                .border_1()
-                                .border_color(theme::PAPER_BUTTON_LINE)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_size(px(10.))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme::PAPER_HOVER))
+                            kit::button("cue-preview", kit::Tone::SheetQuiet, false)
                                 .child("Preview")
                                 .on_click(cx.listener(|this, _, _window, cx| {
                                     this.preview_cues(cx);
@@ -139,28 +130,17 @@ pub(crate) fn render_feedback_section(app: &mut StarlingApp, cx: &mut Context<St
         ));
 
     div()
-        .mt(px(29.))
-        .pt(px(21.))
-        .border_t_1()
-        .border_color(theme::SETTINGS_LINE)
-        .child(
-            div()
-                .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("FEEDBACK"),
-        )
+        .flex()
+        .flex_col()
         .child(rows)
         .child(
             div()
                 .id("overlay-reach")
                 .mt(px(12.))
-                .bg(theme::SETTINGS_CALLOUT)
+                .bg(theme::SHEET_CALLOUT)
                 .p(px(12.))
-                .text_size(px(10.))
-                .line_height(px(10. * 1.55))
+                .text_size(px(theme::TEXT_SM))
+                .line_height(px(theme::TEXT_SM * 1.55))
                 .child(overlay_reach_note()),
         )
         .child(div().mt(px(12.)).child(cue_row))

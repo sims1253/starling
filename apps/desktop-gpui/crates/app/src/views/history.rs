@@ -1,7 +1,7 @@
-//! The 350px history column: archive head, the session row list, and the
+//! The 300px takes column: its head, the take rows, and the
 //! damaged-record rows G02 appends after them.
 
-use gpui::{Context, Div, FontWeight, SharedString, Window, div, prelude::*, px};
+use gpui::{Context, Div, SharedString, Window, div, prelude::*, px};
 use starling_dictation::storage::{DamagedRecord, SessionStatus, SessionSummary};
 
 use crate::app::StarlingApp;
@@ -28,51 +28,42 @@ pub fn render_history(
         .iter()
         .map(|damaged| render_damaged_row(damaged, cx))
         .collect();
+    let count = app.sessions.len() + app.damaged.len();
 
     div()
         .id("history-pane")
-        .w(px(350.))
-        .min_w_0()
+        .w(px(300.))
+        .flex_none()
         .flex()
         .flex_col()
         .min_h_0()
-        .border_l_1()
+        .border_r_1()
         .border_color(theme::LINE)
-        .bg(theme::PANEL_SOFT)
+        .bg(theme::ROOST)
         .child(
             div()
-                .h(px(92.))
                 .flex()
                 .flex_row()
-                .items_center()
+                .items_baseline()
                 .justify_between()
-                .px(px(23.))
-                .border_b_1()
-                .border_color(theme::LINE)
-                .text_color(theme::DIM)
+                .px(px(20.))
+                .pt(px(20.))
+                .pb(px(14.))
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .mb(px(5.))
-                                .font(theme::mono_font())
-                                .text_size(px(10.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::EYEBROW)
-                                .child("ARCHIVE"),
-                        )
-                        .child(
-                            div()
-                                .font(theme::serif_font())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_size(px(21.))
-                                .text_color(theme::INK)
-                                .child("Recent takes"),
-                        ),
+                        .font(theme::display_font())
+                        .text_size(px(theme::HEADING))
+                        .text_color(theme::SPECK)
+                        .child("Takes"),
                 )
-                .child(icon("icons/clock.svg", 18., theme::DIM)),
+                .when(count > 0, |head| {
+                    head.child(
+                        div()
+                            .text_size(px(theme::TEXT_SM))
+                            .text_color(theme::DIM)
+                            .child(count.to_string()),
+                    )
+                }),
         )
         .child(
             div()
@@ -82,16 +73,20 @@ pub fn render_history(
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .when(app.sessions.is_empty(), |list| {
+                .border_t_1()
+                .border_color(theme::LINE)
+                .when(app.sessions.is_empty() && app.damaged.is_empty(), |list| {
                     list.child(
                         div()
-                            .max_w(px(280.))
-                            .px(px(24.))
-                            .py(px(28.))
-                            .text_size(px(12.))
-                            .line_height(px(12. * 1.65))
-                            .text_color(theme::DIM)
-                            .child("Your recordings will collect here, ready to retry or export."),
+                            .px(px(20.))
+                            .py(px(20.))
+                            .text_size(px(theme::TEXT_SM))
+                            .line_height(px(theme::TEXT_SM * 1.6))
+                            .text_color(theme::QUILL)
+                            .child(
+                                "Every take you record or import lands here. Select one to read, \
+                                 retry, or export it.",
+                            ),
                     )
                 })
                 .children(rows)
@@ -103,7 +98,10 @@ struct RowData {
     id: String,
     active: bool,
     title: String,
-    meta: String,
+    /// When it was recorded: a time today, a date before.
+    when: String,
+    /// The duration, then anything unusual about the take, in words.
+    detail: String,
     status: SessionStatus,
 }
 
@@ -128,28 +126,42 @@ fn row_data(app: &StarlingApp, session: &SessionSummary) -> RowData {
             }
         });
 
-    let mut meta = format!(
-        "{} · {}",
-        theme::fmt_when(&session.created_at),
-        theme::fmt_duration(session.duration_ms)
-    );
+    let mut detail = vec![theme::fmt_duration(session.duration_ms)];
     if session.attempt_count > 1 {
-        meta.push_str(&format!(" · {} attempts", session.attempt_count));
+        detail.push(format!("{} attempts", session.attempt_count));
     }
     if session.archival {
-        meta.push_str(" · archival");
+        detail.push("archived".to_string());
     }
     // #356: the take's own interruption stays visible after a retry.
     if session.interrupted && session.status != SessionStatus::Interrupted {
-        meta.push_str(" · interrupted");
+        detail.push("interrupted".to_string());
     }
 
     RowData {
         id: session.id.clone(),
         active: app.selected_id.as_deref() == Some(session.id.as_str()),
         title,
-        meta,
+        when: theme::fmt_when(&session.created_at),
+        detail: detail.join(", "),
         status: session.status,
+    }
+}
+
+/// The state of a take as a small mark beside its duration: a spinner
+/// while it transcribes, otherwise a dot in the state's color.
+fn state_mark(id: &str, status: SessionStatus) -> gpui::AnyElement {
+    let dot = |color| div().size(px(6.)).rounded_full().bg(color).into_any_element();
+    match status {
+        // R04: one id per transcribing row, not a shared
+        // "history-spinner" shared by all of them.
+        SessionStatus::Transcribing => {
+            spinner(history_spinner_id(id), 12., theme::QUILL).into_any_element()
+        }
+        SessionStatus::Transcribed => dot(theme::SHEEN),
+        SessionStatus::Failed => dot(theme::ROSE),
+        SessionStatus::Interrupted => dot(theme::BEAK),
+        SessionStatus::Captured => dot(theme::DIM),
     }
 }
 
@@ -160,104 +172,87 @@ fn render_row(data: RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<Di
         id,
         active,
         title,
-        meta,
+        when,
+        detail,
         status,
     } = data;
     let click_id = id.clone();
+    let mark = state_mark(&id, status);
 
-    let state = div()
-        .size(px(16.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .flex_none()
-        .child(match status {
-            SessionStatus::Transcribing => {
-                // R04: one id per transcribing row, not a shared
-                // "history-spinner" shared by all of them.
-                spinner(history_spinner_id(&id), 14., theme::DIM).into_any_element()
-            }
-            SessionStatus::Transcribed => div()
-                .size(px(6.))
-                .rounded_full()
-                .bg(theme::LIME)
-                .into_any_element(),
-            SessionStatus::Failed => div()
-                .size(px(6.))
-                .rounded_full()
-                .bg(theme::CORAL)
-                .into_any_element(),
-            SessionStatus::Interrupted => div()
-                .size(px(6.))
-                .rounded_full()
-                .bg(theme::AMBER)
-                .into_any_element(),
-            SessionStatus::Captured => div()
-                .size(px(6.))
-                .rounded_full()
-                .bg(theme::DOT_GREY)
-                .into_any_element(),
-        });
-
-    div()
-        .id(SharedString::from(format!("history-row-{id}")))
-        .relative()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(10.))
-        .w_full()
-        .min_h(px(78.))
-        .px(px(18.))
-        .py(px(15.))
-        .border_b_1()
-        .border_color(theme::LINE)
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::HOVER_BG))
-        .when(active, |row| row.bg(theme::ACTIVE_ROW_BG))
+    take_row(SharedString::from(format!("history-row-{id}")), active)
         .on_click(cx.listener(move |this, _, _window, cx| {
             this.select_session(click_id.clone(), cx);
         }))
-        .when(active, |row| {
-            row.child(
-                div()
-                    .absolute()
-                    .top(px(0.))
-                    .bottom(px(0.))
-                    .left(px(0.))
-                    .w(px(2.))
-                    .bg(theme::LIME),
-            )
-        })
-        .child(state)
+        .child(when_column(when))
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(px(4.))
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
                 .child(
                     div()
-                        .text_size(px(11.))
-                        .text_color(theme::TAKE_TITLE)
+                        .text_size(px(theme::TEXT_MD))
+                        .text_color(theme::SPECK)
                         .truncate()
                         .child(title),
                 )
                 .child(
                     div()
-                        .font(theme::mono_font())
-                        .text_size(px(9.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(7.))
+                        .text_size(px(theme::TEXT_XS))
                         .text_color(theme::DIM)
-                        .child(meta),
+                        .child(div().size(px(12.)).flex().items_center().justify_center().child(mark))
+                        .child(div().min_w_0().truncate().child(detail)),
                 ),
         )
-        .child(icon(
-            "icons/chevron-right.svg",
-            16.,
-            if active { theme::LIME } else { theme::DIM },
-        ))
+}
+
+/// A row in the takes column: the time on the left, the take beside it.
+/// The selected row is lifted and marked with the beak on its edge.
+fn take_row(id: SharedString, active: bool) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(12.))
+        .w_full()
+        .px(px(20.))
+        .py(px(12.))
+        .border_b_1()
+        .border_color(theme::LINE)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::HOVER))
+        .when(active, |row| {
+            row.bg(theme::ROOST_SELECTED).child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .w(px(3.))
+                    .bg(theme::BEAK),
+            )
+        })
+}
+
+fn when_column(when: String) -> Div {
+    div()
+        .w(px(58.))
+        .flex_none()
+        .pt(px(2.))
+        .text_size(px(theme::TEXT_XS))
+        .text_color(theme::QUILL)
+        // An unparsable timestamp falls back to the raw string.
+        .truncate()
+        .child(when)
 }
 
 /// A quarantined record (G02): visible, explained, never deletable by the
@@ -269,53 +264,35 @@ fn render_damaged_row(
 ) -> gpui::Stateful<Div> {
     let id = damaged.id.clone();
 
-    div()
-        .id(SharedString::from(format!("history-row-{}", damaged.id)))
-        .relative()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(10.))
-        .w_full()
-        .min_h(px(78.))
-        .px(px(18.))
-        .py(px(15.))
-        .border_b_1()
-        .border_color(theme::LINE)
-        .opacity(0.8)
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::HOVER_BG))
+    take_row(SharedString::from(format!("history-row-{}", damaged.id)), false)
         .on_click(cx.listener(move |this, _, _window, cx| {
             this.surface_damage(&id, cx);
         }))
         .child(
             div()
-                .size(px(16.))
-                .flex()
-                .items_center()
-                .justify_center()
+                .w(px(58.))
                 .flex_none()
-                .child(icon("icons/alert-circle.svg", 12., theme::CORAL)),
+                .pt(px(2.))
+                .child(icon("icons/alert-circle.svg", 14., theme::ROSE)),
         )
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(px(4.))
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
                 .child(
                     div()
-                        .text_size(px(11.))
-                        .text_color(theme::DIM)
+                        .text_size(px(theme::TEXT_MD))
+                        .text_color(theme::QUILL)
                         .truncate()
-                        .child("Damaged recording — kept as-is"),
+                        .child("Damaged recording, kept as it is"),
                 )
                 .child(
                     div()
-                        .font(theme::mono_font())
-                        .text_size(px(9.))
+                        .text_size(px(theme::TEXT_XS))
                         .text_color(theme::DIM)
                         .truncate()
                         .child(damaged.reason.clone()),

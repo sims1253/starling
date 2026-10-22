@@ -675,6 +675,8 @@ class MainActivity : Activity() {
         activeTake = recorded
         shownTake = recorded
         recordButton.setText(R.string.stop_and_transcribe)
+        // Rose while it stops a take (the button's color state list).
+        recordButton.isActivated = true
         liveTranscript.visibility = View.GONE
         liveTranscript.text = null
         diskNotice = application.diskWarning(disk)
@@ -729,6 +731,7 @@ class MainActivity : Activity() {
         activeTake = null
         diskNotice = null
         recordButton.setText(R.string.start_recording)
+        recordButton.isActivated = false
         var notice: String? = null
         recorded.stop(
             onStopped = { result ->
@@ -820,6 +823,7 @@ class MainActivity : Activity() {
         if (recordings.isEmpty()) {
             val empty = TextView(this).apply {
                 setText(R.string.no_recordings)
+                setTextAppearance(R.style.TextAppearance_Starling_Body)
                 setPadding(0, 12, 0, 12)
             }
             recordingsContainer.addView(empty)

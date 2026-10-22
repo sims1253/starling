@@ -424,7 +424,7 @@ impl Element for TextFieldElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), theme::SETTINGS_LINE.into())
+            (input.placeholder.clone(), theme::SHEET_QUILL.into())
         } else {
             (SharedString::from(content), style.color)
         };
@@ -451,7 +451,7 @@ impl Element for TextFieldElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(1.), bounds.bottom() - bounds.top()),
                     ),
-                    theme::SETTINGS_INK,
+                    theme::SHEET_INK,
                 )),
             )
         } else {
@@ -575,20 +575,20 @@ impl Render for TextField {
             .w_full()
             .px(px(12.))
             .py(px(11.))
-            .rounded(px(3.))
-            .font(theme::mono_font())
-            .text_size(px(11.))
-            .text_color(theme::SETTINGS_INK)
-            .bg(theme::SETTINGS_FIELD_BG)
+            .rounded(px(6.))
+            .font(theme::ui_font())
+            .text_size(px(theme::TEXT_MD))
+            .text_color(theme::SHEET_INK)
+            .bg(theme::SHEET_FIELD)
             .border_1()
             .border_color(if focused {
-                theme::FOCUS_RING
+                theme::SHEET_BEAK
             } else {
-                theme::SETTINGS_LINE
+                theme::SHEET_LINE
             })
             .when(focused, |el| {
                 el.shadow(vec![gpui::BoxShadow {
-                    color: rgba(0x747E3D1A).into(),
+                    color: rgba(0x8F620A33).into(),
                     offset: point(px(0.), px(0.)),
                     blur_radius: px(0.),
                     spread_radius: px(2.),

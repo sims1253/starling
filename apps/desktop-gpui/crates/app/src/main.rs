@@ -49,6 +49,7 @@ fn main() {
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx| {
+            theme::register_fonts(cx);
             input::bind_keys(cx);
             editor::bind_keys(cx);
 

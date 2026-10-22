@@ -1,11 +1,11 @@
-//! The capture pane: headline copy, waveform recorder block, import button,
-//! and the pinned error/recovery banner.
+//! The stage: the state sentence, the level field around the hex record
+//! control, the import action, and the pinned error/recovery banner.
 
 use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, Context, Div, ElementId, FontWeight, Stateful, Window, div,
-    ease_in_out, point, prelude::*, px, rgba,
+    ease_in_out, prelude::*, px,
 };
 use starling_dictation::engine::{EnginePhase, InstallState, SwitchStage};
 use starling_dictation::playback::NoticeKind;
@@ -13,6 +13,7 @@ use starling_dictation::settings::EngineMode;
 
 use crate::app::StarlingApp;
 use crate::theme;
+use crate::views::kit::{self, Tone};
 use crate::views::{icon, spinner};
 
 /// Whether the first-run model card shows (#363): builtin mode, no model
@@ -63,18 +64,31 @@ pub(crate) fn first_run_progress(
     }
 }
 
-const BAR_COUNT: usize = 52;
-const BAR_STRIDE: f32 = 7.0; // 2px bar + 5px gap
-const WAVEFORM_WIDTH: f32 = BAR_STRIDE * BAR_COUNT as f32 - 5.0;
+/// The level field: one column of specks per level, like the pale spots
+/// on a starling's coat. A quiet room is a dotted line; speech raises the
+/// columns symmetrically around it.
+const COLUMN_COUNT: usize = 52;
+const SPECK_SIZE: f32 = 3.0;
+const SPECK_GAP: f32 = 4.0;
+const COLUMN_GAP: f32 = 6.0;
+const COLUMN_STRIDE: f32 = SPECK_SIZE + COLUMN_GAP;
+const FIELD_WIDTH: f32 = COLUMN_STRIDE * COLUMN_COUNT as f32 - COLUMN_GAP;
+/// Specks either side of the centre line at full level.
+const MAX_REACH: f32 = 7.0;
 
-/// Approximation of the CSS `mask-image` edge fade: linear ramp over the
-/// first and last 18% of the waveform width.
+/// The field's edges thin out over the first and last 18% of its width,
+/// so it reads as a sound rising out of silence rather than a box.
 fn edge_fade(index: usize) -> f32 {
-    let center = index as f32 * BAR_STRIDE + 1.0;
-    let fade_zone = WAVEFORM_WIDTH * 0.18;
+    let center = index as f32 * COLUMN_STRIDE + SPECK_SIZE / 2.0;
+    let fade_zone = FIELD_WIDTH * 0.18;
     let left = (center / fade_zone).min(1.0);
-    let right = ((WAVEFORM_WIDTH - center) / fade_zone).min(1.0);
+    let right = ((FIELD_WIDTH - center) / fade_zone).min(1.0);
     left.min(right)
+}
+
+/// How many specks a column shows either side of its centre speck.
+pub(crate) fn speck_reach(level: f32) -> usize {
+    (level.clamp(0.0, 1.0) * MAX_REACH).round() as usize
 }
 
 pub fn render_capture(
@@ -96,16 +110,15 @@ pub fn render_capture(
     let staging_panel = crate::views::staging::render_staging_panel(app, window, cx);
     let viewport = window.viewport_size();
     let pad_top = if has_transcript {
-        px(18.)
+        px(20.)
     } else {
-        theme::clamp_px(viewport.height * 0.04, 25., 55.)
+        theme::clamp_px(viewport.height * 0.05, 28., 56.)
     };
-    let pad_x = theme::clamp_px(viewport.width * 0.07, 46., 110.);
-    let pad_bottom = if has_transcript { px(14.) } else { px(24.) };
+    let pad_x = theme::clamp_px(viewport.width * 0.045, 36., 72.);
     let h1_size = if has_transcript {
-        theme::clamp_px(viewport.width * 0.042, 40., 60.)
+        theme::clamp_px(viewport.width * 0.03, 32., 40.)
     } else {
-        theme::clamp_px(viewport.width * 0.052, 45., 76.)
+        theme::clamp_px(viewport.width * 0.045, 42., 64.)
     };
 
     div()
@@ -114,36 +127,26 @@ pub fn render_capture(
         .relative()
         .flex()
         .flex_col()
-        .items_center()
+        .items_start()
         .flex_1()
         .min_h_0()
-        .min_w(px(560.))
+        .min_w(px(520.))
         .pt(pad_top)
         .px(pad_x)
-        .pb(pad_bottom)
+        .pb(px(20.))
         .child(
             div()
                 .w_full()
-                .max_w(px(570.))
                 .flex()
                 .flex_col()
+                .gap(px(10.))
                 .child(
                     div()
-                        .mb(px(13.))
-                        .font(theme::mono_font())
-                        .text_size(px(10.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::EYEBROW)
-                        .child("LOCAL DICTATION"),
-                )
-                .child(
-                    div()
-                        .max_w(px(640.))
-                        .font(theme::serif_font())
-                        .font_weight(FontWeight::MEDIUM)
+                        .max_w(px(680.))
+                        .font(theme::display_font())
                         .text_size(h1_size)
-                        .line_height(h1_size * 0.96)
-                        .text_color(theme::INK)
+                        .line_height(h1_size * 1.04)
+                        .text_color(theme::SPECK)
                         // Never "listening" to a silent or dead input.
                         .child(
                             app.live_input_headline()
@@ -158,25 +161,27 @@ pub fn render_capture(
                                 }),
                         ),
                 )
-                .child(
-                    div()
-                        .max_w(px(480.))
-                        .mt(px(8.))
-                        .mb(if has_transcript { px(4.) } else { px(0.) })
-                        .text_size(px(13.))
-                        .line_height(px(13. * 1.65))
-                        .text_color(theme::MUTED)
-                        // #220: takes record in Starling's recording
-                        // service; while it is not reachable, say so.
-                        .child(
-                            app.host_unavailable()
-                                .filter(|_| !recording)
-                                .unwrap_or_else(|| {
-                                    "Your recording is saved locally, sent only to your selected \
-                                     server, and shown exactly as the model returned it."
-                                        .to_string()
-                                }),
-                        ),
+                // #220: takes record in Starling's recording service;
+                // while it is not reachable, say so — compact or not. The
+                // standing promise only shows on the roomy stage.
+                .children(
+                    app.host_unavailable()
+                        .filter(|_| !recording)
+                        .or_else(|| {
+                            (!has_transcript).then(|| {
+                                "Your recording is saved on this computer, sent only to the \
+                                 engine you chose, and shown exactly as the model returned it."
+                                    .to_string()
+                            })
+                        })
+                        .map(|line| {
+                            div()
+                                .max_w(px(470.))
+                                .text_size(px(theme::TEXT_MD))
+                                .line_height(px(theme::TEXT_MD * 1.6))
+                                .text_color(theme::QUILL)
+                                .child(line)
+                        }),
                 ),
         )
         .child(render_recorder(app, cx, record_button, has_transcript))
@@ -185,9 +190,12 @@ pub fn render_capture(
         .when(recording && app.staging.is_none() && !app.live_partial.is_empty(), |pane| {
             pane.child(
                 div()
-                    .max_w(px(620.))
-                    .text_size(px(18.))
-                    .text_color(theme::INK)
+                    .max_w(px(640.))
+                    .mb(px(12.))
+                    .font(theme::reading_font())
+                    .text_size(px(theme::TEXT_XL))
+                    .line_height(px(theme::TEXT_XL * 1.5))
+                    .text_color(theme::SPECK)
                     .child(app.live_partial.clone()),
             )
         })
@@ -196,9 +204,10 @@ pub fn render_capture(
         .when_some(app.stream_degradation.clone().filter(|_| recording), |pane, reason| {
             pane.child(
                 div()
-                    .max_w(px(620.))
-                    .text_size(px(13.))
-                    .text_color(theme::MUTED)
+                    .max_w(px(640.))
+                    .mb(px(12.))
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(theme::QUILL)
                     .child(reason),
             )
         })
@@ -213,168 +222,170 @@ pub fn render_capture(
         })
 }
 
+/// The specks of one column, centre out: `reach` either side of a centre
+/// speck, each a little fainter the further it sits from the centre line.
+fn speck_column(index: usize, level: f32, recording: bool) -> Div {
+    let reach = speck_reach(level);
+    let fade = edge_fade(index);
+    let color = if recording { theme::SPECK } else { theme::QUILL };
+    let base = if recording { 1.0 } else { 0.55 };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(SPECK_GAP))
+        .children((0..reach * 2 + 1).map(move |row| {
+            let distance = (row as f32 - reach as f32).abs();
+            let falloff = 1.0 - 0.6 * distance / (MAX_REACH + 1.0);
+            div()
+                .size(px(SPECK_SIZE))
+                .rounded_full()
+                .bg(color)
+                .opacity(base * fade * falloff)
+        }))
+}
+
 fn render_recorder(
     app: &mut StarlingApp,
     cx: &mut Context<StarlingApp>,
     button: crate::activation::RecordButton,
     has_transcript: bool,
 ) -> Div {
-    let button_size = if has_transcript { 90. } else { 116. };
+    let hex_size = if has_transcript { 76. } else { 104. };
     let recording = button == crate::activation::RecordButton::Stop;
 
+    // Compact, the recorder is as tall as what it holds; otherwise it
+    // takes the stage's free height and centres in it.
     let recorder = if has_transcript {
-        div().h(px(150.)).flex_none()
+        div().flex_none().pt(px(20.)).pb(px(12.))
     } else {
-        div().flex_1().min_h(px(255.))
+        div().flex_1().min_h(px(270.))
     };
+    let ring = 14.;
 
     recorder
-        .relative()
         .w_full()
-        .max_w(px(620.))
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
         .child(
+            // The hex and its ring, with the level field running through
+            // them at the hex's centre line.
             div()
-                .absolute()
-                .top(px(0.))
-                .bottom(px(0.))
-                .left(px(0.))
-                .right(px(0.))
+                .relative()
+                .w_full()
+                .h(px(hex_size + ring * 2.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .opacity(if recording { 0.84 } else { 0.45 })
                 .child(
                     div()
-                        .id("waveform")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(5.))
-                        .h(px(120.))
-                        .w(gpui::relative(0.9))
-                        .max_w(px(620.))
-                        .children(
-                            app.levels
-                                .iter()
-                                .enumerate()
-                                .map(|(index, level)| {
-                                    let height = (level * 106.0).max(5.0);
-                                    div()
-                                        .w(px(2.))
-                                        .h(px(height))
-                                        .rounded(px(99.))
-                                        .bg(if recording {
-                                            theme::LIME
-                                        } else {
-                                            theme::WAVE_IDLE
-                                        })
-                                        .opacity(edge_fade(index))
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .relative()
-                .flex_none()
-                .when(recording, |wrapper| {
-                    wrapper.child(
-                        div()
-                            .absolute()
-                            .top(px(-24.))
-                            .left(px(-24.))
-                            .size(px(button_size + 48.))
-                            .rounded_full()
-                            .bg(rgba(0xFF745B0F))
-                            .with_animation(
-                                ElementId::Name("record-pulse".into()),
-                                Animation::new(Duration::from_millis(2000))
-                                    .repeat()
-                                    .with_easing(ease_in_out),
-                                |el, delta| el.opacity(0.15 + 0.85 * delta),
-                            ),
-                    )
-                })
-                .child(
-                    div()
-                        .id("record-button")
-                        .size(px(button_size))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme::RECORD_BORDER)
-                        .p(px(9.))
+                        .absolute()
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
                         .flex()
                         .items_center()
                         .justify_center()
+                        .child(
+                            div()
+                                .id("level-field")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(COLUMN_GAP))
+                                .children(
+                                    app.levels
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, level)| {
+                                            speck_column(index, *level, recording)
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("record-button")
+                        .relative()
                         .flex_none()
-                        .bg(theme::RECORD_BG)
-                        .shadow(vec![gpui::BoxShadow {
-                            color: rgba(0x0000008C).into(),
-                            offset: point(px(0.), px(16.)),
-                            blur_radius: px(70.),
-                            spread_radius: px(0.),
-                        }])
+                        .size(px(hex_size))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .cursor_pointer()
-                        .hover(|style| {
-                            style.shadow(vec![
-                                gpui::BoxShadow {
-                                    color: rgba(0x000000A6).into(),
-                                    offset: point(px(0.), px(18.)),
-                                    blur_radius: px(75.),
-                                    spread_radius: px(0.),
-                                },
-                                gpui::BoxShadow {
-                                    color: rgba(0xD9FF6A07).into(),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(0.),
-                                    spread_radius: px(9.),
-                                },
-                            ])
-                        })
+                        .hover(|style| style.opacity(0.85))
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.toggle_recording(button, cx);
                         }))
+                        // A hex ring breathes around the control while it
+                        // records.
+                        .when(recording, |hex| {
+                            hex.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-ring))
+                                    .left(px(-ring))
+                                    .child(icon(
+                                        "icons/hex-outline.svg",
+                                        hex_size + ring * 2.,
+                                        theme::ROSE,
+                                    ))
+                                    .with_animation(
+                                        ElementId::Name("record-pulse".into()),
+                                        Animation::new(Duration::from_millis(1800))
+                                            .repeat()
+                                            .with_easing(ease_in_out),
+                                        |el, delta| el.opacity(0.15 + 0.55 * delta),
+                                    ),
+                            )
+                        })
                         .child(
                             div()
-                                .size_full()
-                                .rounded_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(if recording { theme::CORAL } else { theme::LIME })
-                                .child(if recording {
-                                    div()
-                                        .size(px(24.))
-                                        .rounded(px(5.))
-                                        .bg(theme::PAPER_LIGHT)
-                                        .into_any_element()
-                                } else {
-                                    icon("icons/mic.svg", 34., theme::MIC_FG).into_any_element()
-                                }),
-                        ),
+                                .absolute()
+                                .top(px(0.))
+                                .left(px(0.))
+                                .child(icon(
+                                    "icons/hex.svg",
+                                    hex_size,
+                                    if recording { theme::ROSE } else { theme::BEAK },
+                                )),
+                        )
+                        .child(if recording {
+                            div()
+                                .size(px(hex_size * 0.22))
+                                .rounded(px(4.))
+                                .bg(theme::SPECK)
+                                .into_any_element()
+                        } else {
+                            icon("icons/mic.svg", hex_size * 0.32, theme::ON_BEAK)
+                                .into_any_element()
+                        }),
                 ),
         )
         .child(
             div()
-                .mt(px(16.))
+                .mt(px(4.))
                 .flex()
                 .flex_col()
                 .items_center()
                 .gap(px(8.))
-                .text_size(px(11.))
-                .text_color(theme::MUTED)
-                .child(div().child(if recording {
-                    theme::fmt_duration(Some(app.elapsed_ms))
+                .text_size(px(theme::TEXT_SM))
+                .text_color(theme::QUILL)
+                .child(if recording {
+                    div()
+                        .font(theme::mono_font())
+                        .text_size(px(theme::TEXT_LG))
+                        .text_color(theme::SPECK)
+                        .child(theme::fmt_duration(Some(app.elapsed_ms)))
                 } else if app.busy() {
-                    "Transcribing…".to_string()
+                    div().child("Transcribing…")
                 } else {
-                    "Tap to record".to_string()
-                }))
+                    div().child("Click to record, or press")
+                })
                 // #221: how this take ends (held, latched, hands-free).
                 .children(
                     crate::activation::finish_hint(
@@ -384,19 +395,8 @@ fn render_recorder(
                     .map(|hint| div().id("finish-hint").child(hint)),
                 )
                 .children(crate::views::microphone::live_input_line(app))
-                .when(!has_transcript, |meta| {
-                    meta.child(
-                        div()
-                            .px(px(7.))
-                            .py(px(4.))
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(theme::LINE)
-                            .font(theme::mono_font())
-                            .text_size(px(9.))
-                            .text_color(theme::DIM)
-                            .child(app.shortcut.label()),
-                    )
+                .when(!recording && !app.busy(), |meta| {
+                    meta.child(kit::keycaps(&app.shortcut.label(), false))
                 }),
         )
 }
@@ -434,31 +434,30 @@ fn render_engine_card(
         div()
             .id("engine-first-run")
             .w_full()
-            .max_w(px(570.))
+            .max_w(px(600.))
             .flex()
             .flex_col()
             .gap(px(8.))
             .mb(px(18.))
-            .p(px(16.))
-            .bg(theme::PANEL_SOFT)
+            .p(px(18.))
+            .bg(theme::ROOST)
             .border_1()
             .border_color(theme::LINE)
-            .rounded(px(7.))
+            .rounded(px(8.))
             .child(
                 div()
-                    .font(theme::serif_font())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_size(px(16.))
-                    .text_color(theme::INK)
+                    .text_size(px(theme::TEXT_LG))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::SPECK)
                     .child("Choose a speech model to start dictating offline"),
             )
             .child(
                 div()
-                    .text_size(px(11.))
-                    .line_height(px(11. * 1.6))
-                    .text_color(theme::MUTED)
+                    .text_size(px(theme::TEXT_SM))
+                    .line_height(px(theme::TEXT_SM * 1.55))
+                    .text_color(theme::QUILL)
                     .child(format!(
-                        "{} · {} — {}",
+                        "{}, {}. {}",
                         recommended.label,
                         crate::views::settings::fmt_size(recommended.size_bytes),
                         recommended.note
@@ -470,29 +469,21 @@ fn render_engine_card(
                     .flex_row()
                     .items_center()
                     .gap(px(8.))
-                    .text_size(px(11.))
-                    .text_color(theme::MUTED)
-                    .child(spinner("engine-first-run-spinner", 13., theme::MUTED))
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(theme::QUILL)
+                    .child(spinner("engine-first-run-spinner", 14., theme::QUILL))
                     .child(line)
             }))
             .child(
                 div()
+                    .mt(px(4.))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.))
                     .when(!installing, |row| {
                         row.child(
-                            div()
-                                .id("engine-first-run-download")
-                                .px(px(13.))
-                                .py(px(8.))
-                                .rounded(px(4.))
-                                .bg(theme::LIME)
-                                .text_size(px(11.))
-                                .text_color(theme::MIC_FG)
-                                .cursor_pointer()
-                                .hover(|style| style.opacity(0.9))
+                            kit::button("engine-first-run-download", Tone::Primary, false)
                                 .on_click(cx.listener(move |this, _, _window, cx| {
                                     this.engine_activate(&id, cx);
                                 }))
@@ -500,19 +491,9 @@ fn render_engine_card(
                         )
                     })
                     .child(
-                        div()
-                            .id("engine-first-run-more")
-                            .px(px(13.))
-                            .py(px(8.))
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(theme::LINE)
-                            .text_size(px(11.))
-                            .text_color(theme::INK)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme::GEAR_HOVER_BG))
+                        kit::button("engine-first-run-more", Tone::Quiet, false)
                             .on_click(cx.listener(|this, _, _window, cx| {
-                                this.open_settings(cx);
+                                this.open_settings_at(crate::views::SettingsPage::Engine, cx);
                             }))
                             .child("More models"),
                     ),
@@ -523,31 +504,21 @@ fn render_engine_card(
 fn render_import_button(cx: &mut Context<StarlingApp>) -> impl IntoElement {
     div()
         .id("import-audio")
+        .flex_none()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.))
-        .px(px(1.))
         .py(px(6.))
-        .mb(px(2.))
-        .border_b_1()
-        .border_color(theme::IMPORT_LINE)
-        .text_size(px(11.))
-        .text_color(theme::MUTED)
+        .text_size(px(theme::TEXT_SM))
+        .text_color(theme::QUILL)
         .cursor_pointer()
-        .hover(|style| style.text_color(theme::INK).border_color(theme::LIME))
+        .hover(|style| style.text_color(theme::SPECK))
         .on_click(cx.listener(|this, _, _window, cx| {
             this.import_audio(cx);
         }))
-        .child(icon("icons/file-audio.svg", 17., theme::MUTED))
-        .child("Import an audio file")
-        .child(
-            div()
-                .font(theme::mono_font())
-                .text_size(px(8.))
-                .text_color(theme::DIM)
-                .child(".wav"),
-        )
+        .child(icon("icons/file-audio.svg", 16., theme::QUILL))
+        .child("Import a WAV file")
 }
 
 /// What the pinned error/recovery banner shows (R08): the footer line and
@@ -662,24 +633,9 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
     // always a dismiss path for the error itself.
     let surface = error_banner_surface(error.is_some(), unsaved_count);
 
-    let mut banner = div()
-        .id("error-banner")
-        .absolute()
-        .left(px(28.))
-        .right(px(28.))
-        .bottom(px(28.))
-        .flex()
-        .flex_row()
-        .items_start()
-        .gap(px(12.))
-        .p(px(14.))
-        .bg(theme::ERROR_BG)
-        .border_1()
-        .border_color(theme::ERROR_LINE)
-        .rounded(px(7.))
-        .text_size(px(11.))
-        .text_color(theme::ERROR_TEXT)
-        .child(icon("icons/alert-circle.svg", 18., theme::ERROR_TEXT))
+    let mut banner = notice_box("error-banner")
+        .bottom(px(20.))
+        .child(icon("icons/alert-circle.svg", 18., theme::NOTICE_TEXT))
         .child(
             div()
                 .flex()
@@ -688,18 +644,21 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 .flex_1()
                 .min_w_0()
                 .child(
-                    div().text_color(theme::ERROR_TITLE).child(if error.is_some() {
-                        "Action failed"
-                    } else {
-                        "Recording not saved"
-                    }),
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::NOTICE_TITLE)
+                        .child(if error.is_some() {
+                            "Action failed"
+                        } else {
+                            "Recording not saved"
+                        }),
                 )
                 .children(error.clone().map(|message| div().child(message)))
                 .children(crate::views::microphone::input_problem_actions(app, cx))
                 .children(
                     surface
                         .footer
-                        .map(|line| div().text_color(theme::ERROR_SUBTLE).child(line)),
+                        .map(|line| div().text_color(theme::NOTICE_SUBTLE).child(line)),
                 ),
         );
 
@@ -708,16 +667,7 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
         for (index, capture) in app.unsaved.iter().enumerate() {
             let id = capture.id.clone();
             actions = actions.child(
-                div()
-                    .id(gpui::SharedString::from(format!("recover-{index}")))
-                    .px(px(9.))
-                    .py(px(7.))
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(theme::RECOVERY_LINE)
-                    .text_size(px(9.))
-                    .text_color(theme::RECOVERY_TEXT)
-                    .cursor_pointer()
+                notice_action(gpui::SharedString::from(format!("recover-{index}")))
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.export_unsaved_audio(&id, cx);
                     }))
@@ -728,16 +678,7 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
         // batch now in the banner — a take stashed since disarms it.
         let confirm = app.discard_armed();
         actions = actions.child(
-            div()
-                .id("discard-unsaved")
-                .px(px(9.))
-                .py(px(7.))
-                .rounded(px(4.))
-                .border_1()
-                .border_color(theme::RECOVERY_LINE)
-                .text_size(px(9.))
-                .text_color(theme::RECOVERY_TEXT)
-                .cursor_pointer()
+            notice_action("discard-unsaved")
                 .on_click(cx.listener(|this, _, _window, cx| {
                     this.discard_unsaved(cx);
                 }))
@@ -761,7 +702,7 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                     this.error = None;
                     cx.notify();
                 }))
-                .child(icon("icons/x.svg", 16., theme::ERROR_TEXT)),
+                .child(icon("icons/x.svg", 16., theme::NOTICE_TEXT)),
         );
     }
 
@@ -779,24 +720,9 @@ fn quality_banner(
     clear: fn(&mut StarlingApp),
     cx: &mut Context<StarlingApp>,
 ) -> Stateful<Div> {
-    div()
-        .id("quality-banner")
-        .absolute()
-        .left(px(28.))
-        .right(px(28.))
-        .bottom(px(28.))
-        .flex()
-        .flex_row()
-        .items_start()
-        .gap(px(12.))
-        .p(px(14.))
-        .bg(theme::ERROR_BG)
-        .border_1()
-        .border_color(theme::ERROR_LINE)
-        .rounded(px(7.))
-        .text_size(px(11.))
-        .text_color(theme::ERROR_TEXT)
-        .child(icon("icons/alert-circle.svg", 18., theme::ERROR_TEXT))
+    notice_box("quality-banner")
+        .bottom(px(20.))
+        .child(icon("icons/alert-circle.svg", 18., theme::NOTICE_TEXT))
         .child(
             // The text column may shrink below its words' width (a flex
             // item's default minimum is its content), so long notices
@@ -807,9 +733,14 @@ fn quality_banner(
                 .gap(px(3.))
                 .flex_1()
                 .min_w_0()
-                .child(div().text_color(theme::ERROR_TITLE).child(title))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::NOTICE_TITLE)
+                        .child(title),
+                )
                 .child(div().w_full().child(message))
-                .child(div().w_full().text_color(theme::ERROR_SUBTLE).child(footer)),
+                .child(div().w_full().text_color(theme::NOTICE_SUBTLE).child(footer)),
         )
         .child(
             div()
@@ -819,7 +750,58 @@ fn quality_banner(
                     clear(this);
                     cx.notify();
                 }))
-                .child(icon("icons/x.svg", 16., theme::ERROR_TEXT)),
+                .child(icon("icons/x.svg", 16., theme::NOTICE_TEXT)),
         )
 }
 
+/// The box every notice and error shares, floating across the stage;
+/// the caller pins it to the stage's foot or head.
+pub(crate) fn notice_box(id: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .left(px(24.))
+        .right(px(24.))
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(12.))
+        .p(px(14.))
+        .bg(theme::NOTICE_BG)
+        .border_1()
+        .border_color(theme::NOTICE_LINE)
+        .rounded(px(8.))
+        .text_size(px(theme::TEXT_SM))
+        .line_height(px(theme::TEXT_SM * 1.5))
+        .text_color(theme::NOTICE_TEXT)
+}
+
+pub(crate) fn notice_action(id: impl Into<gpui::ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(theme::NOTICE_LINE)
+        .text_size(px(theme::TEXT_XS))
+        .text_color(theme::NOTICE_TITLE)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::HOVER))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::speck_reach;
+
+    #[test]
+    fn a_quiet_room_is_one_speck_per_column_and_speech_reaches_out() {
+        // The idle level the app starts with draws the dotted line.
+        assert_eq!(speck_reach(0.06), 0);
+        assert_eq!(speck_reach(0.5), 4);
+        assert_eq!(speck_reach(1.0), 7);
+        // A level past full never grows the column past the field.
+        assert_eq!(speck_reach(3.0), 7);
+        assert_eq!(speck_reach(-1.0), 0);
+    }
+}

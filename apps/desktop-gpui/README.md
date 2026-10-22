@@ -37,6 +37,9 @@ development builds; notarized installers are a separate release task.
   IPC endpoint the app talks to.
 - `crates/app` (`starling-gpui`) — the gpui app, a client of the host:
   capture pane, history, transcript drawer, settings, hotkeys, overlay.
+  Its type is embedded: Literata and Atkinson Hyperlegible Next/Mono,
+  under the SIL Open Font License (`crates/app/assets/fonts`). The design
+  tokens live in `crates/app/src/theme.rs`.
 - `crates/insertion`, `crates/processing` — text delivery into other apps,
   and transcript processing providers.
 - `GPUI_NOTES.md` — verified gpui 0.2.2 API cheat-sheet used to build the UI.

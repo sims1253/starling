@@ -4,14 +4,13 @@
     android:layout_height="wrap_content"
     android:minWidth="280dp"
     android:orientation="vertical"
-    android:padding="24dp">
+    android:padding="28dp">
 
     <TextView
         android:id="@+id/recognize_prompt"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textColor="@color/starling_ink"
-        android:textSize="20sp" />
+        android:textAppearance="@style/TextAppearance.Starling.Heading" />
 
     <TextView
         android:id="@+id/recognize_status"
@@ -19,8 +18,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
         android:accessibilityLiveRegion="polite"
-        android:textColor="@color/starling_muted"
-        android:textSize="14sp" />
+        android:textAppearance="@style/TextAppearance.Starling.Body" />
 
     <!-- Live partials can grow long: bounded to a few lines that scroll,
          kept at the newest words by RecognizeSpeechActivity. -->
@@ -31,8 +29,7 @@
         android:layout_marginTop="12dp"
         android:maxLines="8"
         android:scrollbars="vertical"
-        android:textColor="@color/starling_ink"
-        android:textSize="16sp"
+        android:textAppearance="@style/TextAppearance.Starling.Transcript"
         android:visibility="gone" />
 
     <LinearLayout

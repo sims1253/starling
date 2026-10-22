@@ -1,11 +1,10 @@
 //! The settings dialog's LIVE PREVIEW section (#357): how early and how
 //! often a take asks the server for live text.
 
-use gpui::{div, prelude::*, px, Context, Div, FontWeight, SharedString};
+use gpui::{div, prelude::*, px, Context, Div, SharedString};
 use starling_dictation::settings::LivePreviewSettings;
 
 use crate::app::StarlingApp;
-use crate::theme;
 use crate::views::settings::{choice_row, helper};
 
 const CADENCE_CHOICES: [(LivePreviewSettings, &str, &str); 2] = [
@@ -61,19 +60,8 @@ pub(crate) fn render_live_preview_section(
     };
 
     div()
-        .mt(px(29.))
-        .pt(px(21.))
-        .border_t_1()
-        .border_color(theme::SETTINGS_LINE)
-        .child(
-            div()
-                .mb(px(13.))
-                .font(theme::mono_font())
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::SETTINGS_EYEBROW)
-                .child("LIVE PREVIEW"),
-        )
+        .flex()
+        .flex_col()
         .child(rows)
         .child(div().mt(px(8.)).child(helper(note)))
 }
