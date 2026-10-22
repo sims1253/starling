@@ -102,6 +102,8 @@ jobs:
           "$python" scripts/licenses/notices.py
       - name: Build the app
         working-directory: apps/desktop-gpui
+        env:
+          STARLING_REQUIRE_THIRD_PARTY_NOTICES: "1"
         run: cargo build --locked --release -p starling-gpui
       - name: Download the Vulkan engine artifact
         # Depends on the starling-serve-<platform>-vulkan artifact uploaded

@@ -170,6 +170,10 @@ abstract class ThirdPartyNoticesTask : DefaultTask() {
 
         @Suppress("UNCHECKED_CAST")
         fun json(path: String) = groovy.json.JsonSlurper().parse(root.resolve(path)) as Map<String, Any?>
+        // Every field the notices carry, as a string ("" allowed): a typo in
+        // the rules or components fails here, not as a null on the screen.
+        fun field(entry: Map<String, Any?>, key: String, file: String): String =
+            entry[key] as? String ?: throw GradleException("$file: ${entry["match"] ?: entry["name"]} has no \"$key\"")
         @Suppress("UNCHECKED_CAST")
         val rules = json("licenses/android-dependencies.json")["rules"] as List<Map<String, Any?>>
         val components = mutableListOf<Map<String, Any?>>()
@@ -182,9 +186,10 @@ abstract class ThirdPartyNoticesTask : DefaultTask() {
             }
             @Suppress("UNCHECKED_CAST")
             val keys = (rule["texts"] as List<String>).mapNotNull { text(it, module) }
+            val rulesFile = "licenses/android-dependencies.json"
             components += mapOf(
-                "name" to "$group:$name", "version" to version, "license" to rule["license"],
-                "url" to rule["url"], "texts" to keys,
+                "name" to "$group:$name", "version" to version, "license" to field(rule, "license", rulesFile),
+                "url" to field(rule, "url", rulesFile), "texts" to keys,
             )
         }
         @Suppress("UNCHECKED_CAST")
@@ -192,7 +197,8 @@ abstract class ThirdPartyNoticesTask : DefaultTask() {
             if ("android" !in (component["apps"] as List<*>)) continue
             @Suppress("UNCHECKED_CAST")
             val keys = (component["texts"] as List<String>).mapNotNull { text(it, component["name"] as String) }
-            components += component.filterKeys { it in setOf("name", "version", "license", "url") } + ("texts" to keys)
+            components += listOf("name", "version", "license", "url")
+                .associateWith { field(component, it, "licenses/components.json") } + ("texts" to keys)
         }
         if (missing.isNotEmpty()) {
             throw GradleException("Third-party notices are incomplete:\n  " + missing.joinToString("\n  "))

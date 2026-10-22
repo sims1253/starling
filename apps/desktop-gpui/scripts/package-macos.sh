@@ -17,7 +17,7 @@ build_number="${GITHUB_RUN_NUMBER:-0}"
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 # The Licenses page's notices, for both architectures (build.rs embeds them).
 python3 ../../scripts/licenses/notices.py --target aarch64-apple-darwin --target x86_64-apple-darwin
-cargo build --release -p starling-gpui \
+STARLING_REQUIRE_THIRD_PARTY_NOTICES=1 cargo build --release -p starling-gpui \
   --target aarch64-apple-darwin --target x86_64-apple-darwin
 
 staging="target/package/Starling.app"
