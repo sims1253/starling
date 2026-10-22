@@ -302,7 +302,7 @@ PkNpuStart pk_npu_start(const pk::ParakeetModel& m) {
     };
     try {
         r.fut = std::async(std::launch::async, std::move(work));
-    } catch (const std::system_error& e) {   // no thread: the GPU encoder stays in charge
+    } catch (const std::exception& e) {   // no thread (system_error, bad_alloc): the GPU encoder stays in charge
         return note(std::string("no worker thread: ") + e.what());
     }
 #else
