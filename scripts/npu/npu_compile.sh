@@ -13,7 +13,7 @@
 # kernel (it rebooted twice on other graphs, see docs/fast-engine.md, Pixel
 # TPU). Save your work on the phone first; npu_compile_phone.sh refuses to
 # compile with less than 4 GB available or a graph larger than its window has
-# been (640 MB 0.6B, 1300 MB 1.7B).
+# been (Qwen3-ASR: 640 MB 0.6B, 1300 MB 1.7B; Parakeet segment: 340 MB).
 #   e.g. scripts/npu/npu_compile.sh models/qwen3-asr-0.6b-q4e8.gguf --app dev.starling.mobile
 #
 # 1. Host: export the encoder graph from MODEL.gguf (export_encoder.py: the
@@ -44,7 +44,7 @@
 # caller already holds /tmp/starling-phone.lock.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || { sed -n 2,42p "$0"; exit 2; }
+[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || { sed -n 2,44p "$0"; exit 2; }
 GGUF=$1; shift
 HASH=""; APP=""; DIR=/data/local/tmp/starling-npu
 while [ $# -gt 0 ]; do

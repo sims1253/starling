@@ -208,7 +208,7 @@ if (len(tensors), n_ops, hist) != (want_tensors, want_ops, want_hist):
     def show(h):
         order = sorted(h, key=lambda c: (isinstance(c, str), str(c).zfill(4)))
         return ", ".join(f"{NAMES.get(c, c)} {h[c]}" for c in order)
-    fail(f"not the encoder window export_encoder.py builds: {len(tensors)} tensors, {n_ops} operators "
+    fail(f"not the encoder graph export_encoder.py / export_parakeet.py builds: {len(tensors)} tensors, {n_ops} operators "
          f"({show(hist)}); expected {want_tensors} tensors, {want_ops} operators ({show(want_hist)})")
 
 
