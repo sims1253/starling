@@ -48,13 +48,15 @@
             </intent-filter>
         </activity>
 
-        <!-- Speech input for apps that call startActivityForResult with
-             RecognizerIntent.ACTION_RECOGNIZE_SPEECH (E22). Handles its own
-             rotation so a configuration change never restarts the capture. -->
+        <!-- Open-source licenses, opened from the main screen. -->
         <activity
             android:name=".LicensesActivity"
             android:exported="false"
             android:label="@string/licenses_heading" />
+
+        <!-- Speech input for apps that call startActivityForResult with
+             RecognizerIntent.ACTION_RECOGNIZE_SPEECH (E22). Handles its own
+             rotation so a configuration change never restarts the capture. -->
         <activity
             android:name=".RecognizeSpeechActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard"
