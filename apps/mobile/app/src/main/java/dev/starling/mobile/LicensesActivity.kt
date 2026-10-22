@@ -95,7 +95,15 @@ class LicensesActivity : Activity() {
             )
             addView(body)
             contentDescription = getString(R.string.licenses_row_description, component.name, component.license)
-            setOnClickListener { body.visibility = if (body.visibility == View.GONE) View.VISIBLE else View.GONE }
+            ViewCompat.setStateDescription(this, getString(R.string.licenses_collapsed))
+            setOnClickListener {
+                val open = body.visibility == View.GONE
+                body.visibility = if (open) View.VISIBLE else View.GONE
+                ViewCompat.setStateDescription(
+                    this,
+                    getString(if (open) R.string.licenses_expanded else R.string.licenses_collapsed),
+                )
+            }
         }
     }
 

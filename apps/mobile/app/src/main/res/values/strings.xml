@@ -168,6 +168,8 @@
     <string name="licenses_components">Open-source components (%1$d)</string>
     <string name="licenses_unavailable">This build carries no third-party notices.</string>
     <string name="licenses_row_description">%1$s, %2$s license</string>
+    <string name="licenses_expanded">License text shown</string>
+    <string name="licenses_collapsed">Tap to show the license text</string>
     <string name="voice_input_intro">Starling also offers an Android speech recognition service for apps that let you choose one. On Pixel phones, the Digital assistant list is a different setting and cannot select Starling for dictation. Use the Starling keyboard above for voice input in any text field.</string>
     <string name="keyboard_record">Record</string>
     <string name="keyboard_stop">Stop</string>

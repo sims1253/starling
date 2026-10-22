@@ -73,6 +73,25 @@ mod tests {
         );
     }
 
+    /// Whenever notices were generated (CI runs notices.py before the
+    /// tests, packaging before the build), the generator's output parses:
+    /// the two sides of the schema cannot drift apart unnoticed.
+    #[test]
+    fn generated_notices_parse() {
+        if EMBEDDED.trim() != "null" {
+            let notices = parse(EMBEDDED).expect("the embedded notices parse");
+            assert!(!notices.components.is_empty());
+            for component in &notices.components {
+                assert_eq!(
+                    notices.texts(component).count(),
+                    component.texts.len(),
+                    "{} has a text key without a text",
+                    component.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_development_build_has_no_notices() {
         assert!(parse("null").is_none());

@@ -184,8 +184,9 @@ abstract class ThirdPartyNoticesTask : DefaultTask() {
                 missing += "$module: no license rule; check its license and add one to licenses/android-dependencies.json"
                 continue
             }
-            @Suppress("UNCHECKED_CAST")
-            val keys = (rule["texts"] as List<String>).mapNotNull { text(it, module) }
+            val specs = (rule["texts"] as? List<*>)?.filterIsInstance<String>()?.takeIf { it.isNotEmpty() }
+                ?: throw GradleException("licenses/android-dependencies.json: ${rule["match"]} has no \"texts\"")
+            val keys = specs.mapNotNull { text(it, module) }
             val rulesFile = "licenses/android-dependencies.json"
             components += mapOf(
                 "name" to "$group:$name", "version" to version, "license" to field(rule, "license", rulesFile),
