@@ -9,7 +9,8 @@
 #  * KEY is one of the supported encoder windows (Qwen3-ASR 0.6B or 1.7B) or
 #    Parakeet pieces (cpp/npu/encoder_contract.hpp), and TFLITE's single subgraph has exactly
 #    that window's inputs and output and the operator signature (operator and
-#    tensor counts, operators per builtin) export_encoder.py produces for it;
+#    tensor counts, operators per builtin) its exporter (export_encoder.py or
+#    export_parakeet.py) produces for it;
 #    the artifact's I/O sizes follow from KEY;
 #  * HASH (0x...) is the model hash export_encoder.py printed for the GGUF
 #    TFLITE's weights came from (the digest of its encoder tensors and
@@ -26,7 +27,7 @@
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 7 ] || { sed -n 2,27p "$0" >&2; exit 2; }
+[ $# -eq 7 ] || { sed -n 2,28p "$0" >&2; exit 2; }
 NPU_TOOL=$1; TFL=$2; HASH=$3; KEY=$4; DIR=$5; APPS=$6; T=$7
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
