@@ -54,6 +54,10 @@ jobs:
               - 'apps/mobile/**'
               - 'packages/contracts/**'
               - 'tests/fixtures/**'
+              # Third-party notices' inputs (build.gradle.kts).
+              - 'licenses/**'
+              - 'LICENSE'
+              - 'apps/desktop-gpui/crates/app/assets/fonts/*.txt'
             ios:
               - 'apps/ios/**'
               - '.github/workflows/apps.yml'
