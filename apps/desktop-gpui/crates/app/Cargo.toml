@@ -18,7 +18,7 @@ starling-insertion = { path = "../insertion" }
 starling-runtime = { path = "../runtime" }
 starling-runtime-host = { path = "../host" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-dirs = "6"
+dirs = "7"
 unicode-segmentation = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
