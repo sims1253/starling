@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
 # Phone half of npu_compile.sh (run under the phone lock):
 #   npu_compile_phone.sh NPU_TOOL TFLITE HASH KEY DIR APPS WORKDIR
-# compiles TFLITE, a Qwen3-ASR audio encoder window from export_encoder.py,
-# into the artifact qwen3-asr-enc-<HASH>.stnpu. The phone's compiler can
+# compiles TFLITE, a Qwen3-ASR audio encoder window from export_encoder.py
+# or one Parakeet-TDT encoder piece from export_parakeet.py, into the artifact
+# qwen3-asr-enc-<HASH>.stnpu or parakeet-enc-<HASH>-<piece>.stnpu. The phone's compiler can
 # exhaust the phone's memory and panic its kernel (graphs below the size cap
 # did), so this entry point checks everything itself, however it is called:
-#  * KEY is one of the supported encoder windows (Qwen3-ASR 0.6B or 1.7B,
-#    cpp/npu/encoder_contract.hpp), and TFLITE's single subgraph has exactly
+#  * KEY is one of the supported encoder windows (Qwen3-ASR 0.6B or 1.7B) or
+#    Parakeet pieces (cpp/npu/encoder_contract.hpp), and TFLITE's single subgraph has exactly
 #    that window's inputs and output and the operator signature (operator and
 #    tensor counts, operators per builtin) export_encoder.py produces for it;
 #    the artifact's I/O sizes follow from KEY;
 #  * HASH (0x...) is the model hash export_encoder.py printed for the GGUF
 #    TFLITE's weights came from (the digest of its encoder tensors and
 #    metadata, which the engine computes from the GGUF it loads); it names
-#    the artifact, and TFLITE must carry it: export_encoder.py stamps the
+#    the artifact, and TFLITE must carry it: the exporter stamps the
 #    model hash and KEY into the graph's metadata (starling_npu_provenance),
 #    so another model's graph cannot be compiled under this one's hash;
 #  * the phone has at least NPU_MIN_MEM_MB (default 4096) available and TFLITE
-#    is no larger than its window's graph has been (0.6B: 640 MB; 1.7B, which
-#    exports with f32 weights: 1300 MB; both compiled cleanly).
+#    is no larger than its window's graph has been (Qwen3-ASR 0.6B: 640 MB;
+#    1.7B, which exports with f32 weights: 1300 MB; Parakeet segment: 340 MB;
+#    all compiled cleanly).
 # APPS: comma-separated packages; a debuggable one gets the artifact in
 # files/npu (run-as), any other in its external files dir
 # (/sdcard/Android/data/<pkg>/files/npu). Both are on the engine's
 # STARLING_NPU_DIR (NativeSupport). Env: PY (python3 for the graph check).
 set -euo pipefail
-[ $# -eq 7 ] || { sed -n 2,25p "$0" >&2; exit 2; }
+[ $# -eq 7 ] || { sed -n 2,27p "$0" >&2; exit 2; }
 NPU_TOOL=$1; TFL=$2; HASH=$3; KEY=$4; DIR=$5; APPS=$6; T=$7
 PY=${PY:-python3}
 IFS=, read -r -a PKGS <<<"$APPS"
