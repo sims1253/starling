@@ -184,8 +184,9 @@ abstract class ThirdPartyNoticesTask : DefaultTask() {
                 missing += "$module: no license rule; check its license and add one to licenses/android-dependencies.json"
                 continue
             }
-            val specs = (rule["texts"] as? List<*>)?.filterIsInstance<String>()?.takeIf { it.isNotEmpty() }
-                ?: throw GradleException("licenses/android-dependencies.json: ${rule["match"]} has no \"texts\"")
+            val specs = (rule["texts"] as? List<*>)?.takeIf { it.isNotEmpty() && it.all { t -> t is String } }
+                ?.map { it as String }
+                ?: throw GradleException("licenses/android-dependencies.json: ${rule["match"]} needs \"texts\", a non-empty list of strings")
             val keys = specs.mapNotNull { text(it, module) }
             val rulesFile = "licenses/android-dependencies.json"
             components += mapOf(
