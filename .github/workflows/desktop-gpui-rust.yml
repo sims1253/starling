@@ -6,9 +6,13 @@ on:
   pull_request:
     # The desktop crates plus what their tests read from outside the
     # workspace: the contract fixture's native sources (cpp/, ggml and its
-    # patches), the shared contracts and the test WAV.
+    # patches), the shared contracts, the test WAV, and the third-party
+    # notices' inputs (the Licenses page).
     paths:
       - 'apps/desktop-gpui/**'
+      - 'licenses/**'
+      - 'scripts/licenses/**'
+      - 'LICENSE'
       - 'packages/contracts/**'
       - 'tests/fixtures/**'
       - 'cpp/**'
@@ -63,6 +67,10 @@ jobs:
         run: |
           cmake --preset native-cpu
           cmake --build build/native-cpu --target starling-serve-contract-fixture -j2
+      - name: Generate the third-party notices
+        # Fails on a dependency whose license has no text to ship, and lets
+        # the Licenses page test click a real component row.
+        run: python3 scripts/licenses/notices.py
       - name: Test the desktop-gpui workspace
         working-directory: apps/desktop-gpui
         env:

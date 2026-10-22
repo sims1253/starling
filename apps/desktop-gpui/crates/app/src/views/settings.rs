@@ -1,8 +1,8 @@
 //! The settings sheet: a scrim over the window, the page list on the
 //! left, the chosen page on the right, and Save always in reach at the
 //! foot. Pages: the Engine (mode, models, switches — #362/#363, or the
-//! manual server's fields), then dictation, input, and what happens to a
-//! take afterwards.
+//! manual server's fields), then dictation, input, what happens to a take
+//! afterwards, and the licenses of what the app ships.
 
 use std::time::Duration;
 
@@ -33,10 +33,11 @@ pub enum SettingsPage {
     HistoryAudio,
     AfterTake,
     AfterTranscription,
+    Licenses,
 }
 
 impl SettingsPage {
-    pub const ALL: [SettingsPage; 9] = [
+    pub const ALL: [SettingsPage; 10] = [
         SettingsPage::Engine,
         SettingsPage::Dictation,
         SettingsPage::Microphone,
@@ -46,6 +47,7 @@ impl SettingsPage {
         SettingsPage::HistoryAudio,
         SettingsPage::AfterTake,
         SettingsPage::AfterTranscription,
+        SettingsPage::Licenses,
     ];
 
     pub fn label(self) -> &'static str {
@@ -59,6 +61,7 @@ impl SettingsPage {
             SettingsPage::HistoryAudio => "History audio",
             SettingsPage::AfterTake => "After a take",
             SettingsPage::AfterTranscription => "After transcription",
+            SettingsPage::Licenses => "Licenses",
         }
     }
 
@@ -73,6 +76,7 @@ impl SettingsPage {
             SettingsPage::HistoryAudio => "settings-page-history-audio",
             SettingsPage::AfterTake => "settings-page-after-take",
             SettingsPage::AfterTranscription => "settings-page-after-transcription",
+            SettingsPage::Licenses => "settings-page-licenses",
         }
     }
 }
@@ -100,6 +104,7 @@ pub fn render_settings_modal(
         SettingsPage::HistoryAudio => crate::views::storage::render_storage_section(app, cx),
         SettingsPage::AfterTake => crate::views::delivery::render_insertion_section(app, cx),
         SettingsPage::AfterTranscription => render_processing_section(app, cx),
+        SettingsPage::Licenses => crate::views::licenses::render_licenses_section(app, cx),
     };
 
     let mut nav = div()

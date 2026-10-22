@@ -140,6 +140,9 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.open_keyboard_button).setOnClickListener {
             startActivity(Intent("android.settings.INPUT_METHOD_SETTINGS"))
         }
+        findViewById<Button>(R.id.open_licenses_button).setOnClickListener {
+            startActivity(Intent(this, LicensesActivity::class.java))
+        }
         showMessage(getString(R.string.ready_to_record))
         refreshOnDeviceStatus()
         refreshRecordings()

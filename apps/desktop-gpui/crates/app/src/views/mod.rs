@@ -9,6 +9,7 @@ pub(crate) mod drawer;
 mod feedback;
 mod history;
 pub(crate) mod kit;
+pub(crate) mod licenses;
 mod live_preview;
 pub(crate) mod microphone;
 pub(crate) mod overlay;

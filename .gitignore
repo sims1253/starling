@@ -107,3 +107,6 @@ apps/mobile/app/.cxx/
 benchmarks/fast_engine/.layout_eval_cache/
 # autoresearch loop scratch state (local only)
 .auto/
+
+# Generated third-party notices (scripts/licenses/notices.py)
+apps/desktop-gpui/crates/app/notices/third-party-notices.json

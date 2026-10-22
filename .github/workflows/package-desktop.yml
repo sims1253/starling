@@ -90,12 +90,21 @@ jobs:
             ~/.cargo/git
             apps/desktop-gpui/target
           key: desktop-${{ runner.os }}-${{ steps.rust.outputs.version }}-${{ hashFiles('apps/desktop-gpui/Cargo.lock') }}
+      - name: Generate the third-party notices
+        # Embedded by the app's build.rs and shown on its Licenses page;
+        # before the tests, so the notices tests check what ships.
+        run: |
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          "$python" scripts/licenses/notices.py
       - name: Test the workspace
         if: matrix.platform == 'linux' && inputs.run-tests
         working-directory: apps/desktop-gpui
         run: cargo test --locked --workspace
       - name: Build the app
         working-directory: apps/desktop-gpui
+        env:
+          STARLING_REQUIRE_THIRD_PARTY_NOTICES: "1"
         run: cargo build --locked --release -p starling-gpui
       - name: Download the Vulkan engine artifact
         # Depends on the starling-serve-<platform>-vulkan artifact uploaded

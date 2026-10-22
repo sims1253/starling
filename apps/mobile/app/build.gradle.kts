@@ -1,3 +1,5 @@
+import java.security.MessageDigest
+
 plugins {
     id("com.android.application")
 }
@@ -120,9 +122,134 @@ val contractAssets = tasks.register<ContractAssetsTask>("contractAssets") {
     )
 }
 
+// Third-party notices (licenses/README.md): every runtime Maven artifact of
+// the variant, licensed by the rules in licenses/android-dependencies.json,
+// plus the engine's C/C++ components and fonts from licenses/components.json,
+// as assets/licenses/third-party-notices.json for the Licenses screen. The
+// same schema scripts/licenses/notices.py writes for the desktop app.
+val repoRoot = layout.projectDirectory.dir("../../..")
+
+abstract class ThirdPartyNoticesTask : DefaultTask() {
+    /** group:artifact:version of every runtime module. */
+    @get:Input
+    abstract val modules: ListProperty<String>
+
+    /** licenses/, the repository LICENSE and the license files components.json names. */
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val licenseFiles: ConfigurableFileCollection
+
+    @get:Internal
+    abstract val root: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val root = root.get().asFile
+        val texts = sortedMapOf<String, String>()
+        val missing = mutableListOf<String>()
+        fun addText(text: String): String {
+            val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
+            val key = digest.joinToString("") { "%02x".format(it) }.take(16)
+            texts.putIfAbsent(key, text)
+            return key
+        }
+        fun read(file: File): String =
+            file.readText().replace("\r\n", "\n").lines().joinToString("\n") { it.trimEnd() }.trim() + "\n"
+        fun text(spec: String, who: String): String? {
+            val file = if (spec.startsWith("spdx:")) root.resolve("licenses/spdx/${spec.removePrefix("spdx:")}.txt")
+            else root.resolve(spec)
+            if (!file.isFile) {
+                missing += "$who: $spec does not exist"
+                return null
+            }
+            return addText(read(file))
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        fun json(path: String) = groovy.json.JsonSlurper().parse(root.resolve(path)) as Map<String, Any?>
+        // Every field the notices carry, as a string ("" allowed): a typo in
+        // the rules or components fails here, not as a null on the screen.
+        fun field(entry: Map<String, Any?>, key: String, file: String): String =
+            entry[key] as? String ?: throw GradleException("$file: ${entry["match"] ?: entry["name"]} has no \"$key\"")
+        @Suppress("UNCHECKED_CAST")
+        val rules = json("licenses/android-dependencies.json")["rules"] as List<Map<String, Any?>>
+        val components = mutableListOf<Map<String, Any?>>()
+        for (module in modules.get()) {
+            val (group, name, version) = module.split(":")
+            val rule = rules.firstOrNull { "$group:$name".startsWith(it["match"] as String) }
+            if (rule == null) {
+                missing += "$module: no license rule; check its license and add one to licenses/android-dependencies.json"
+                continue
+            }
+            val specs = (rule["texts"] as? List<*>)?.takeIf { it.isNotEmpty() && it.all { t -> t is String } }
+                ?.map { it as String }
+                ?: throw GradleException("licenses/android-dependencies.json: ${rule["match"]} needs \"texts\", a non-empty list of strings")
+            val keys = specs.mapNotNull { text(it, module) }
+            val rulesFile = "licenses/android-dependencies.json"
+            components += mapOf(
+                "name" to "$group:$name", "version" to version, "license" to field(rule, "license", rulesFile),
+                "url" to field(rule, "url", rulesFile), "texts" to keys,
+            )
+        }
+        @Suppress("UNCHECKED_CAST")
+        for (component in json("licenses/components.json")["components"] as List<Map<String, Any?>>) {
+            if ("android" !in (component["apps"] as List<*>)) continue
+            @Suppress("UNCHECKED_CAST")
+            val keys = (component["texts"] as List<String>).mapNotNull { text(it, component["name"] as String) }
+            components += listOf("name", "version", "license", "url")
+                .associateWith { field(component, it, "licenses/components.json") } + ("texts" to keys)
+        }
+        if (missing.isNotEmpty()) {
+            throw GradleException("Third-party notices are incomplete:\n  " + missing.joinToString("\n  "))
+        }
+        val notices = mapOf(
+            "schema" to 1,
+            "app" to "android",
+            "starling" to mapOf("license" to "MIT", "text" to addText(read(root.resolve("LICENSE")))),
+            "components" to components.sortedWith(compareBy({ (it["name"] as String).lowercase() }, { it["version"] as String })),
+            "texts" to texts,
+        )
+        val out = outputDir.get().asFile.resolve("licenses")
+        out.deleteRecursively()
+        check(out.mkdirs() || out.isDirectory) { "Unable to create the notices assets directory $out" }
+        out.resolve("third-party-notices.json").writeText(groovy.json.JsonOutput.toJson(notices))
+    }
+}
+
+/** Every external module in a resolved dependency graph, as group:artifact:version. */
+fun runtimeModules(root: org.gradle.api.artifacts.result.ResolvedComponentResult): List<String> {
+    val seen = mutableSetOf<org.gradle.api.artifacts.component.ComponentIdentifier>()
+    val queue = ArrayDeque(listOf(root))
+    val modules = sortedSetOf<String>()
+    while (queue.isNotEmpty()) {
+        val component = queue.removeFirst()
+        if (!seen.add(component.id)) continue
+        (component.id as? org.gradle.api.artifacts.component.ModuleComponentIdentifier)?.let {
+            modules += "${it.group}:${it.module}:${it.version}"
+        }
+        component.dependencies.filterIsInstance<org.gradle.api.artifacts.result.ResolvedDependencyResult>()
+            .forEach { queue += it.selected }
+    }
+    return modules.toList()
+}
+
 androidComponents {
     onVariants { variant ->
         variant.sources.assets?.addGeneratedSourceDirectory(contractAssets, ContractAssetsTask::outputDir)
+        val notices = tasks.register<ThirdPartyNoticesTask>("${variant.name}ThirdPartyNotices") {
+            modules.set(variant.runtimeConfiguration.incoming.resolutionResult.rootComponent.map(::runtimeModules))
+            root.set(repoRoot)
+            licenseFiles.from(
+                repoRoot.dir("licenses"),
+                repoRoot.file("LICENSE"),
+                repoRoot.file("third_party/ggml/LICENSE"),
+                repoRoot.dir("apps/desktop-gpui/crates/app/assets/fonts").asFileTree.matching { include("*.txt") },
+            )
+        }
+        variant.sources.assets?.addGeneratedSourceDirectory(notices, ThirdPartyNoticesTask::outputDir)
     }
 }
 

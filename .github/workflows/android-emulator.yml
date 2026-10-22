@@ -16,6 +16,10 @@ on:
       - CMakeLists.txt
       - CMakePresets.json
       - scripts/apply_ggml_patches.sh
+      # The Licenses screen's notices (app/build.gradle.kts) and its test.
+      - licenses/**
+      - LICENSE
+      - apps/desktop-gpui/crates/app/assets/fonts/*.txt
       - .github/workflows/android-emulator.yml
   pull_request:
     paths:
@@ -27,6 +31,10 @@ on:
       - CMakeLists.txt
       - CMakePresets.json
       - scripts/apply_ggml_patches.sh
+      # The Licenses screen's notices (app/build.gradle.kts) and its test.
+      - licenses/**
+      - LICENSE
+      - apps/desktop-gpui/crates/app/assets/fonts/*.txt
       - .github/workflows/android-emulator.yml
   workflow_dispatch:
 

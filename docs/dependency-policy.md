@@ -58,7 +58,12 @@ buried in an unrelated refactor.
 - License: confirm the license is unchanged and compatible. A checksum or
   lockfile entry is provenance, never a redistribution grant; release
   artifacts additionally need the packaging checklist (issue #21 owns the
-  vendor-code-license questions).
+  vendor-code-license questions). The apps' Licenses pages are generated
+  from the dependency graphs ([licenses/](../licenses/README.md)): a new
+  Android artifact without a rule in `licenses/android-dependencies.json`, or
+  a crate whose license has no text in `licenses/spdx/`, fails the build
+  until it is reviewed and added; anything vendored goes into
+  `licenses/components.json`.
 - Prerelease or build-tool exceptions: a one-line rationale plus a removal
   condition (see the exceptions register).
 - Regeneration: the lockfile is regenerated in the same PR by the commands
