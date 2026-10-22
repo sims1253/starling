@@ -37,7 +37,7 @@ zbus = "5.19"
 # ... and keeps it on top without taking focus on Windows, which gpui's
 # pop-up windows do not do by themselves (same versions as gpui's).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 raw-window-handle = "0.6"
 
 [dev-dependencies]
