@@ -317,6 +317,7 @@ fn render_recorder(
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
+                        .hover(|style| style.opacity(0.85))
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.toggle_recording(button, cx);
                         }))
