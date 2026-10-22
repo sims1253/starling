@@ -386,6 +386,8 @@ pub struct StarlingApp {
     pub settings_open: bool,
     /// The settings page on show; kept between openings.
     pub settings_page: views::SettingsPage,
+    /// The license text open on the Licenses page.
+    pub license_open: Option<views::licenses::OpenLicense>,
     pub draft_endpoint: Entity<TextField>,
     pub draft_model: Entity<TextField>,
     pub draft_terms: Entity<TextField>,
@@ -1003,6 +1005,7 @@ impl StarlingApp {
             user_set_model: settings.user_set_model,
             settings_open: false,
             settings_page: views::SettingsPage::Engine,
+            license_open: None,
             draft_endpoint,
             draft_model,
             draft_terms,

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- The phone's one screen, in the order it is used: record, read what was
-     recorded, then the model, history audio, and the keyboard. -->
+     recorded, then the model, history audio, the keyboard, and the licenses. -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/main_root"
     android:layout_width="match_parent"
@@ -271,6 +271,27 @@
             android:layout_marginTop="18dp"
             android:text="@string/voice_input_intro"
             android:textAppearance="@style/TextAppearance.Starling.Body" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
+            android:text="@string/licenses_heading"
+            android:textAppearance="@style/TextAppearance.Starling.Heading" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/licenses_about"
+            android:textAppearance="@style/TextAppearance.Starling.Body" />
+
+        <Button
+            android:id="@+id/open_licenses_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/open_licenses" />
 
     </LinearLayout>
 </ScrollView>

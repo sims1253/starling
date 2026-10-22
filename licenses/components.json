@@ -1,0 +1,85 @@
+{
+  "_comment": "Components the apps ship that no package manager reports: vendored or submodule C/C++ sources compiled into the engine, fonts and icons. scripts/licenses/notices.py (desktop) and apps/mobile/app/build.gradle.kts (Android) add them to the generated third-party notices. texts: repository-relative files, or spdx:<ID> for the canonical text in licenses/spdx/.",
+  "components": [
+    {
+      "name": "ggml",
+      "version": "0.23.0",
+      "license": "MIT",
+      "url": "https://github.com/ggml-org/ggml",
+      "apps": ["android", "desktop"],
+      "texts": ["third_party/ggml/LICENSE"]
+    },
+    {
+      "name": "dr_wav",
+      "version": "0.14.6",
+      "license": "Unlicense OR MIT-0",
+      "url": "https://github.com/mackron/dr_libs",
+      "apps": ["android", "desktop"],
+      "texts": ["licenses/texts/dr_wav.txt"]
+    },
+    {
+      "name": "cpp-httplib",
+      "version": "0.60.1",
+      "license": "MIT",
+      "url": "https://github.com/yhirose/cpp-httplib",
+      "apps": ["desktop"],
+      "texts": ["licenses/texts/cpp-httplib.txt"]
+    },
+    {
+      "name": "Vulkan-Headers",
+      "version": "",
+      "license": "Apache-2.0 OR MIT",
+      "url": "https://github.com/KhronosGroup/Vulkan-Headers",
+      "apps": ["android", "desktop"],
+      "texts": ["licenses/texts/vulkan-headers.txt", "spdx:Apache-2.0"]
+    },
+    {
+      "name": "LiteRT (Google Tensor dispatch glue)",
+      "version": "",
+      "license": "Apache-2.0",
+      "url": "https://github.com/google-ai-edge/LiteRT",
+      "apps": ["android"],
+      "texts": ["licenses/texts/litert.txt", "spdx:Apache-2.0"]
+    },
+    {
+      "name": "Atkinson Hyperlegible Next",
+      "version": "",
+      "license": "OFL-1.1",
+      "url": "https://github.com/googlefonts/atkinson-hyperlegible-next",
+      "apps": ["android", "desktop"],
+      "texts": ["apps/desktop-gpui/crates/app/assets/fonts/OFL-AtkinsonHyperlegibleNext.txt"]
+    },
+    {
+      "name": "Atkinson Hyperlegible Mono",
+      "version": "",
+      "license": "OFL-1.1",
+      "url": "https://github.com/googlefonts/atkinson-hyperlegible-next-mono",
+      "apps": ["desktop"],
+      "texts": ["apps/desktop-gpui/crates/app/assets/fonts/OFL-AtkinsonHyperlegibleMono.txt"]
+    },
+    {
+      "name": "Literata",
+      "version": "",
+      "license": "OFL-1.1",
+      "url": "https://github.com/googlefonts/literata",
+      "apps": ["android", "desktop"],
+      "texts": ["apps/desktop-gpui/crates/app/assets/fonts/OFL-Literata.txt"]
+    },
+    {
+      "name": "Lucide icons",
+      "version": "",
+      "license": "ISC AND MIT",
+      "url": "https://lucide.dev",
+      "apps": ["desktop"],
+      "texts": ["licenses/texts/lucide.txt"]
+    },
+    {
+      "name": "Rust standard library",
+      "version": "1.99.0",
+      "license": "MIT OR Apache-2.0",
+      "url": "https://github.com/rust-lang/rust",
+      "apps": ["desktop"],
+      "texts": ["licenses/texts/rust-std-mit.txt", "spdx:Apache-2.0"]
+    }
+  ]
+}

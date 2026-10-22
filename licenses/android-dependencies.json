@@ -1,0 +1,13 @@
+{
+  "_comment": "Licenses of the Android app's runtime Maven dependencies, by group:artifact prefix; the first match wins. apps/mobile/app/build.gradle.kts resolves the runtime classpath at build time and fails on an artifact no rule matches: check its license (POM, repository) and add a rule here. texts: as in components.json.",
+  "rules": [
+    {"match": "androidx.", "license": "Apache-2.0", "url": "https://developer.android.com/jetpack/androidx", "texts": ["spdx:Apache-2.0"]},
+    {"match": "com.google.guava:listenablefuture", "license": "Apache-2.0", "url": "https://github.com/google/guava", "texts": ["spdx:Apache-2.0"]},
+    {"match": "com.squareup.okhttp3:", "license": "Apache-2.0", "url": "https://square.github.io/okhttp/", "texts": ["spdx:Apache-2.0"]},
+    {"match": "com.squareup.okio:", "license": "Apache-2.0", "url": "https://square.github.io/okio/", "texts": ["spdx:Apache-2.0"]},
+    {"match": "org.jetbrains.kotlin:", "license": "Apache-2.0", "url": "https://kotlinlang.org", "texts": ["spdx:Apache-2.0"]},
+    {"match": "org.jetbrains.kotlinx:", "license": "Apache-2.0", "url": "https://github.com/Kotlin", "texts": ["spdx:Apache-2.0"]},
+    {"match": "org.jetbrains:annotations", "license": "Apache-2.0", "url": "https://github.com/JetBrains/java-annotations", "texts": ["spdx:Apache-2.0"]},
+    {"match": "org.jspecify:", "license": "Apache-2.0", "url": "https://jspecify.dev", "texts": ["spdx:Apache-2.0"]}
+  ]
+}

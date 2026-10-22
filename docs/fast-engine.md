@@ -164,7 +164,8 @@ both compiles a `.tflite` on the device and runs the result. Compiling only
 works from the adb shell (the firmware's compile service serves just the apps
 on Google's EdgeTPU allowlist), so the user compiles on their own phone over
 adb and nothing precompiled ships: load the Qwen3-ASR model in the app once,
-then run `scripts/npu/npu_compile_all.sh`. It finds the phone
+then run `scripts/npu/npu_compile_all.sh` ([a prompt that lets a coding
+agent do all of it](tpu-setup-for-agents.md)). It finds the phone
 (`ANDROID_SERIAL`, the one `adb devices` entry, or wireless debugging via
 mDNS; `--wait S`), the installed Starling packages (release, `.debug`,
 `.experimental`), reads what each loaded model reported (below), and compiles

@@ -94,6 +94,12 @@ jobs:
         if: matrix.platform == 'linux' && inputs.run-tests
         working-directory: apps/desktop-gpui
         run: cargo test --locked --workspace
+      - name: Generate the third-party notices
+        # Embedded by the app's build.rs and shown on its Licenses page.
+        run: |
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          "$python" scripts/licenses/notices.py
       - name: Build the app
         working-directory: apps/desktop-gpui
         run: cargo build --locked --release -p starling-gpui

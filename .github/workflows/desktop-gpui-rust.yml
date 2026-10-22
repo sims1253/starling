@@ -63,6 +63,10 @@ jobs:
         run: |
           cmake --preset native-cpu
           cmake --build build/native-cpu --target starling-serve-contract-fixture -j2
+      - name: Generate the third-party notices
+        # Fails on a dependency whose license has no text to ship, and lets
+        # the Licenses page test click a real component row.
+        run: python3 scripts/licenses/notices.py
       - name: Test the desktop-gpui workspace
         working-directory: apps/desktop-gpui
         env:
