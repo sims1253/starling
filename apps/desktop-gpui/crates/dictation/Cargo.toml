@@ -20,7 +20,7 @@ bytes = "1.9"
 # All pure Rust, Apache-2.0 / MIT.
 claxon = "0.4.3"
 cpal = "0.18"
-dirs = "6"
+dirs = "7"
 # No `par` (the store encodes one take at a time on a background
 # thread), no `serde`/`log`.
 flacenc = { version = "0.5.1", default-features = false }
