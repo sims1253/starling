@@ -21,7 +21,8 @@ Usage:
   leadin_ab.py prep --src DIR [--src DIR ...] --out CLIPS
   for each model, condition and lead:
     STARLING_ENGINE=ggml STARLING_GGML_DEVICE=cpu starling-bench --model parakeet \\
-      --gguf M.gguf --runs 1 CLIPS/<cond>/<lead>/*.wav > OUT/<tag>.<cond>.<lead>.txt
+      --gguf M.gguf --runs 1 CLIPS/<cond>/<lead>/*.wav > OUT/<tag>.<cond>.<lead>.txt 2>&1
+    echo exit=$? >> OUT/<tag>.<cond>.<lead>.txt   # score rejects files without exit=0
   leadin_ab.py score --clips CLIPS --outputs OUT [--json results.json]
 """
 
