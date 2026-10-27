@@ -1356,11 +1356,13 @@ one 10.4 s run), so every median below carries its range.
 
 n = 6 warm runs per arm for Parakeet (3 invocations × 2) and 3 for the
 2 B-class models (3 × 1). The 2 B-class models ran 1–5× slower than real
-time in both arms while the phone swapped, so their medians are reclaim
-noise in either direction (Qwen3 medium "+69 %"). Load is mmap only and
-under 0.6 s everywhere.
+time in both arms while the phone swapped. Their timings vary too much to
+support a speed verdict in either direction (Qwen3 medium "+69 %").
+Reclaim is a hypothesis for that, not a measurement. Load is mmap only:
+under 0.6 s in the short/medium invocations, at most 0.87 s in the
+long-fixture runs.
 
-**First request** (median, with all three values), off → on: shrink16
+**First request** (median, then all three values or the range), off → on: shrink16
 1325 (1252, 1325, 1364) → 1428 (1311, 1428, 28746) ms; q8_0 1336 (1230,
 1336, 2217) → 18102 (2214, 18102, 34748); q4pw 1612 (1240, 1612, 3120) →
 2700 (1003, 2700, 29181); MOSS 17893 (5489–38909) → 42131 (22927–50805);
