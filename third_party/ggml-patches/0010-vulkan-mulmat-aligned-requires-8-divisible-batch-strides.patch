@@ -1,0 +1,36 @@
+From 585104ddaefd67401c871cfb5758a1ea4b277b4b Mon Sep 17 00:00:00 2001
+From: Maximilian Scholz <dev.scholz@mailbox.org>
+Date: Tue, 27 Oct 2026 09:26:58 +0100
+Subject: [PATCH] vulkan: mul_mat ALIGNED pipelines require 8-divisible batch
+ strides
+
+Upstream 05987856 passes the real nb[2] batch stride to the matmul shaders but still selects the ALIGNED variants from K and the matrix sizes alone. Their vector loads divide the batch stride by the load width, so a dim01-contiguous view with a padded nb[2] (e.g. F32 [128,16,2] with nb[2]=8196) reads shifted data in every batch after the first. Keep the stride check from the old 0010.
+---
+ src/ggml-vulkan/ggml-vulkan.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 436bfe3b..ff338c48 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6397,7 +6397,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     GGML_ASSERT(mmp_map != nullptr);
+ 
+     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
+-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
++    // [starling 0010] The ALIGNED variants do unchecked vector loads whose
++    // batch offsets divide the batch stride by the load width. A strided view
++    // (dim01-contiguous, nb[2] padded) can pass the K/size checks with a batch
++    // stride that is not a multiple of it, and batches after the first then
++    // read shifted data. Require 8-divisible batch strides (at worst this
++    // demotes a case to the unaligned pipeline, which is slower but exact).
++    const uint32_t aligned_stride_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
++    const uint32_t aligned_stride_y = (qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1);
++    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8 &&
++                         aligned_stride_x % 8 == 0 && aligned_stride_y % 8 == 0;
+ 
+     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+ 
+-- 
+2.56.0
+

@@ -27,6 +27,7 @@ that upstream now covers, and adds 0014.
 | 0003 | CPU llamafile dispatch still loops over broadcast batches separately. |
 | 0007 | CUDA still lacks the plain LayerNorm + affine fusion used here. |
 | 0008 | Transient UID-zero graphs still need exclusion from CUDA graph capture. |
+| 0010 | Reduced to its guard: upstream `05987856` passes the real `nb[2]` batch stride, but still picks the ALIGNED `mul_mat` pipelines without checking that the stride divides by the vector-load width. |
 | 0011 | The allocator still permits reuse of input storage needed by repeated graph execution. |
 | 0012 | Vulkan still lacks the LayerNorm + affine fusion, argmax block size and tuning envs used here. |
 | 0013 | CPU graphs still end every tiny node with a full-pool barrier. |
@@ -36,7 +37,6 @@ that upstream now covers, and adds 0014.
 | --- | --- |
 | 0006 | `03f0267b` CUDA: looped PAD kernel for more than 65535 rows or slices. |
 | 0009 | `3cbffc97` vulkan: support mulmat bf16 activations (GEMV widens BF16 to F32). |
-| 0010 | `05987856` vulkan: in-place `mul_mat`, `mul_mat_vec` and both `mul_mat_id` paths read the batch stride from `nb[2]`. |
 
 0002, 0003 and 0012 were rebased onto refactored upstream code without
 changing behavior. In 0012, `GGML_VK_FORCE_PIPE=s|m|l` now selects the
@@ -413,8 +413,9 @@ with `STARLING_GGML_DEVICE=Vulkan0`. Targets the Intel/AMD/ARM GPUs CUDA can't
 reach. Same graph-replay path as CUDA/Metal.
 
 In-tree ggml patch 0011 (galloc INPUT-storage reuse) and the upstream fixes
-that replaced patches 0009/0010 in v0.27.0 (GEMV BF16 activations,
-batch-strided `mul_mat`/`mul_mat_id`) carry the Vulkan-correctness story; the
+that replaced patch 0009 and most of 0010 in v0.27.0 (GEMV BF16
+activations, batch-strided `mul_mat`/`mul_mat_id`), plus 0010's remaining
+ALIGNED-pipeline stride guard, carry the Vulkan-correctness story; the
 per-finding root-cause record is `scripts/diagnostics/vulkan/README.md`.
 
 ### HIP (AMD) / SYCL (Intel)

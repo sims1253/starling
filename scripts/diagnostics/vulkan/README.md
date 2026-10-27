@@ -27,8 +27,9 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
 
 ## Findings (status of the Vulkan unlock)
 
-Patches 0009 and 0010 were dropped with the ggml v0.27.0 upgrade: upstream
-`3cbffc97` and `05987856` cover the same BF16 GEMV and batch-stride fixes.
+With the ggml v0.27.0 upgrade, patch 0009 was dropped (upstream `3cbffc97`
+covers the BF16 GEMV fix), and 0010 shrank to its ALIGNED-pipeline guard
+(upstream `05987856` passes the real batch stride from `nb[2]`).
 The harnesses below remain useful as regression probes.
 
 1. **Patch 0009 (bf16-y GEMV) is exact.** `test_bf16_gemv` compares
