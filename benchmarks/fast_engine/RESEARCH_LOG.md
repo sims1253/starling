@@ -1319,3 +1319,81 @@ encoders the installed app reported (status files), into the release
 (external files dir) or debuggable (run-as) package; the engine reports
 missing / stale / error per piece (status files, one logcat line per
 problem). The phone was on AC throughout: no energy numbers.
+
+## #382: CPU weight repacking on the Pixel, ggml CPU path (2026-10-27)
+
+Repack off vs on (`STARLING_GGML_CPU_REPACK=0` / `=1`) with one binary:
+`starling-bench` at `28d1ff66`, built with the `android_bench.sh` flags
+(NDK r28c, armv8.2-a+dotprod+fp16+i8mm, no OpenMP), and run with
+`STARLING_ENGINE=ggml STARLING_GGML_DEVICE=cpu STARLING_GGML_THREADS=6`.
+Arms alternate ABBA within the session: a fresh process per invocation, a
+20 s pause between invocations, screen off, shell wake lock held, battery
+discharging, thermal status 0. Each invocation transcribes the fixtures in
+order (short, medium, long) with `--runs 3` (Parakeet) or `--runs 2`
+(MOSS, Granite, Qwen3; short and medium only). Labels used below:
+
+- **first request**: run 0 of the *first* clip (short), i.e. the first
+  graph of a fresh process, which includes the one-time repack;
+- **warm**: runs ≥ 1 of each clip (run 0 of medium/long reuses the warm
+  process and is excluded);
+- **load**: `starling-bench`'s `load` line (mmap, before any repack);
+- peak RSS: `/system/bin/time -v`.
+
+**Memory pressure.** The phone was in normal use, with its own apps
+resident: MemAvailable 3.7–6.6 GB, 4.4–6.4 GB of swap in use. Reclaim
+was not instrumented. Outliers of 3–5× show up in both arms, including on
+short and medium clips (q8_0 short on: one 15.8 s run; q4pw medium on:
+one 10.4 s run), so every median below carries its range.
+
+| model | short warm (ms, median and range) | medium warm | long warm | load (median) | peak RSS |
+|---|---|---|---|---|---|
+| parakeet q4_k_m-shrink16 | 800 (712–986) → 382 (379–403), −52 % | 2437 (2251–2907) → 1249 (1234–1310), −49 % | 8314 (7446–24142) → 5679 (5482–6260), −32 % | 57 → 123 ms | 1123 MiB both |
+| parakeet q8_0 (repacks only on ARM) | 693 (672–717) → 364 (323–15825), −48 % | 2033 (1989–2056) → 1049 (987–1114), −48 % | 17645 (8014–36925) → 7972 (4740–32554), −55 % | 122 → 49 ms | 1460 MiB both |
+| parakeet q4pw-fullimx (mobile default) | 833 (806–910) → 328 (285–438), −61 % | 2502 (2449–2710) → 1348 (963–10424), −46 % | 16242 (8930–38973) → 6005 (4590–15008), −63 % | 157 → 123 ms | 942 / 943 MiB |
+| MOSS q4e8-fullimx | 5222 (4573–41273) → 3250 (2938–31784) | 17214 (15552–49607) → 13539 (9883–46337) | (correctness only) | 127 → 129 ms | 2031 MiB both |
+| granite dynq4 | 20787 (9306–35556) → 19805 (10031–37806) | 38160 (35471–42675) → 37787 (33009–46304) | (correctness only) | 190 → 100 ms | 1763 MiB both |
+| qwen3 dynq4 | 13979 (5008–18903) → 4340 (3672–35849) | 20820 (19392–24205) → 35281 (15460–38820) | (correctness only) | 221 → 143 ms | 1977 MiB both |
+
+n = 6 warm runs per arm for Parakeet (3 invocations × 2) and 3 for the
+2 B-class models (3 × 1). The 2 B-class models ran 1–5× slower than real
+time in both arms while the phone swapped. Their timings vary too much to
+support a speed verdict in either direction (Qwen3 medium "+69 %").
+Reclaim is a hypothesis for that, not a measurement. Load is mmap only:
+under 0.6 s in the short/medium invocations, at most 0.87 s in the
+long-fixture runs.
+
+**First request** (median, then all three values or the range), off → on:
+shrink16 1325 (1252, 1325, 1364) → 1428 (1311, 1428, 28746) ms; q8_0 1336
+(1230, 1336, 2217) → 18102 (2214, 18102, 34748); q4pw 1612 (1240, 1612,
+3120) → 2700 (1003, 2700, 29181); MOSS 17893 (5489–38909) → 42131
+(22927–50805); Granite 32285 (15420–40929) → 41004 (20725–44838); Qwen3
+33322 (17447–38838) → 24623 (21514–54807). A separate cold-start A/B on
+q4pw (6 alternating fresh processes per arm, MemAvailable ~6.5 GB, 0 major
+faults in every process) gave a median of 1180 ms off vs 1146 ms on, but
+one repack-on start took 12.1 s. Over all 15 Parakeet cold starts per arm,
+**5 of 15 with repack on took 12–35 s, against 0 of 15 with it off (max
+3.1 s).** Likely mechanism, not verified: the loader maps the GGUF
+`MAP_PRIVATE` + writable (`cpp/runtime/model_loader.cpp`), so repacking a
+weight in place turns clean, droppable file pages into dirty anonymous
+pages, which a swapping phone must allocate and later compress. Filed as
+#496.
+
+**Transcripts.** Fixture transcripts are byte-identical between arms for
+all three Parakeet files (short, medium, long), and for MOSS and Granite
+(short, medium, plus one long run per arm). **Qwen3 dynq4 differs on
+medium**: deterministically per arm, the repack-on output drops the
+quotation marks around one repeated sentence (`"It is … portrait."` → `It
+is … portrait.`, 3 of 3 repeats). Normalized WER on the fixture is
+unchanged. Short and long are identical. The FLEURS-en ±0.2 gate #382
+requires for a changed file was started but did not finish (the phone left
+wireless adb mid-run). Filed as #500.
+
+**Verdict per model.** All three Parakeet files, repack on: 32–63 % faster
+warm, transcripts identical, RSS unchanged. That includes q8_0, which x86
+leaves untouched. MOSS and Granite: transcripts identical, but the speed
+is unresolved under this memory pressure (MOSS minima lower with repack
+on; Granite flat). Qwen3 dynq4: breaks the exact-transcript contract
+(punctuation only), and its FLEURS gate is pending in #500; scope the
+arm64 default for it there. The first-request tail (#496) is the open risk
+for the CPU fallback and the first take after a model load on a phone
+under memory pressure.
