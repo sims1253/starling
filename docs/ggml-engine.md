@@ -17,8 +17,9 @@ parity results describe the tested inputs and backends, not all possible audio.
 
 The submodule is pinned to ggml **v0.27.0**,
 `a05c9922613c6a2230dbb1d0de679519ecafb4f0`, the upstream release checked on
-October 27, 2026. The upgrade from v0.23.0 keeps eight local patches, drops three
-that upstream now covers, and adds 0014.
+October 27, 2026. The upgrade from v0.23.0 keeps eight local patches, reduces
+0010 to its ALIGNED-pipeline guard, drops two that upstream now covers, and adds
+0014.
 
 | Patch | Why it remains |
 | --- | --- |
