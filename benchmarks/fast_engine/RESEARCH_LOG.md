@@ -1362,13 +1362,13 @@ Reclaim is a hypothesis for that, not a measurement. Load is mmap only:
 under 0.6 s in the short/medium invocations, at most 0.87 s in the
 long-fixture runs.
 
-**First request** (median, then all three values or the range), off → on: shrink16
-1325 (1252, 1325, 1364) → 1428 (1311, 1428, 28746) ms; q8_0 1336 (1230,
-1336, 2217) → 18102 (2214, 18102, 34748); q4pw 1612 (1240, 1612, 3120) →
-2700 (1003, 2700, 29181); MOSS 17893 (5489–38909) → 42131 (22927–50805);
-Granite 32285 (15420–40929) → 41004 (20725–44838); Qwen3 33322
-(17447–38838) → 24623 (21514–54807). A separate cold-start A/B on q4pw
-(6 alternating fresh processes per arm, MemAvailable ~6.5 GB, 0 major
+**First request** (median, then all three values or the range), off → on:
+shrink16 1325 (1252, 1325, 1364) → 1428 (1311, 1428, 28746) ms; q8_0 1336
+(1230, 1336, 2217) → 18102 (2214, 18102, 34748); q4pw 1612 (1240, 1612,
+3120) → 2700 (1003, 2700, 29181); MOSS 17893 (5489–38909) → 42131
+(22927–50805); Granite 32285 (15420–40929) → 41004 (20725–44838); Qwen3
+33322 (17447–38838) → 24623 (21514–54807). A separate cold-start A/B on
+q4pw (6 alternating fresh processes per arm, MemAvailable ~6.5 GB, 0 major
 faults in every process) gave a median of 1180 ms off vs 1146 ms on, but
 one repack-on start took 12.1 s. Over all 15 Parakeet cold starts per arm,
 **5 of 15 with repack on took 12–35 s, against 0 of 15 with it off (max
@@ -1382,17 +1382,18 @@ pages, which a swapping phone must allocate and later compress. Filed as
 all three Parakeet files (short, medium, long), and for MOSS and Granite
 (short, medium, plus one long run per arm). **Qwen3 dynq4 differs on
 medium**: deterministically per arm, the repack-on output drops the
-quotation marks around one repeated sentence (`"It is … portrait."` →
-`It is … portrait.`, 3 of 3 repeats). Normalized WER on the fixture is
-unchanged. Short and long are identical. The FLEURS-en ±0.2 gate #382 requires for
-a changed file was started but did not finish (the phone left wireless
-adb mid-run). Filed as #500.
+quotation marks around one repeated sentence (`"It is … portrait."` → `It
+is … portrait.`, 3 of 3 repeats). Normalized WER on the fixture is
+unchanged. Short and long are identical. The FLEURS-en ±0.2 gate #382
+requires for a changed file was started but did not finish (the phone left
+wireless adb mid-run). Filed as #500.
 
-**Verdict per model.** All three Parakeet files, repack on: 32–63 %
-faster warm, transcripts identical, RSS unchanged. That includes q8_0,
-which x86 leaves untouched. MOSS and Granite: transcripts identical, but
-the speed is unresolved under this memory pressure (MOSS minima lower with
-repack on; Granite flat). Qwen3 dynq4: breaks the exact-transcript contract (punctuation only), and
-its FLEURS gate is pending in #500; scope the arm64 default for it there. The first-request
-tail (#496) is the open risk for the CPU fallback and the first take after
-a model load on a phone under memory pressure.
+**Verdict per model.** All three Parakeet files, repack on: 32–63 % faster
+warm, transcripts identical, RSS unchanged. That includes q8_0, which x86
+leaves untouched. MOSS and Granite: transcripts identical, but the speed
+is unresolved under this memory pressure (MOSS minima lower with repack
+on; Granite flat). Qwen3 dynq4: breaks the exact-transcript contract
+(punctuation only), and its FLEURS gate is pending in #500; scope the
+arm64 default for it there. The first-request tail (#496) is the open risk
+for the CPU fallback and the first take after a model load on a phone
+under memory pressure.
