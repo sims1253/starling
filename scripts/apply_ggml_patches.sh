@@ -28,10 +28,12 @@ if [[ ${#PATCHES[@]} -eq 0 ]]; then
 fi
 cd "${GGML_DIR}"
 
-# mkdir is atomic on Linux, macOS and Git Bash; flock is not always available.
+# The lock is a directory; flock is not always available. mkdir alone is not
+# exclusive everywhere: uutils mkdir (Ubuntu 26.04) can report success to two
+# concurrent callers. The owner file, created with O_EXCL (noclobber), decides.
 LOCK_DIR="$(git rev-parse --absolute-git-dir)/starling-patches.lock"
 for ((attempt = 0; ; attempt++)); do
-    if mkdir "${LOCK_DIR}" 2>/dev/null; then
+    if mkdir "${LOCK_DIR}" 2>/dev/null && (set -C; : > "${LOCK_DIR}/owner") 2>/dev/null; then
         break
     fi
     if [[ ! -d "${LOCK_DIR}" || ${attempt} -ge 60 ]]; then
@@ -44,7 +46,10 @@ done
 TEMP_DIR=""
 cleanup() {
     [[ -z "${TEMP_DIR}" ]] || rm -rf "${TEMP_DIR}"
-    rmdir "${LOCK_DIR}"
+    rm -f "${LOCK_DIR}/owner"
+    # A contender may take ownership between these two steps; it then owns
+    # the directory, and its own cleanup removes it.
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
