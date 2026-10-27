@@ -1319,3 +1319,58 @@ encoders the installed app reported (status files), into the release
 (external files dir) or debuggable (run-as) package; the engine reports
 missing / stale / error per piece (status files, one logcat line per
 problem). The phone was on AC throughout: no energy numbers.
+
+## #382: CPU weight repacking on the Pixel, ggml CPU path (2026-10-27)
+
+Repack off vs on (`STARLING_GGML_CPU_REPACK=0` / `=1`) with one binary:
+`starling-bench` at `28d1ff66`, the `android_bench.sh` build flags (NDK
+r28c, armv8.2-a+dotprod+fp16+i8mm, no OpenMP),
+`STARLING_ENGINE=ggml STARLING_GGML_DEVICE=cpu STARLING_GGML_THREADS=6`.
+Arms alternate ABBA in one session (fresh process per invocation, 20 s
+pause between them), screen off, shell wake lock held, battery discharging
+(45 → 29 %), thermal status 0. Each invocation runs every clip `--runs 3`
+(MOSS `--runs 2`): run 0 is the first request of a fresh process, which
+includes the one-time repack, and the later runs are warm. Peak RSS is
+`/system/bin/time -v`.
+
+**Memory pressure caveat.** The phone was in normal use, with its own
+apps resident: MemAvailable 3.7–6.6 GB, 4.4–6.4 GB of swap in use. Clips
+that ran into reclaim show 3–5× outliers in both arms, so medians are
+reported with their ranges. Short and medium clips on the Parakeet files
+are clean; long-clip and 2 B-model numbers are not.
+
+| model | short warm (ms) | medium warm | long warm | transcripts | peak RSS |
+|---|---|---|---|---|---|
+| parakeet q4_k_m-shrink16 (desktop default) | 800 → 382 (−52 %) | 2437 → 1249 (−49 %) | 8314 → 5679 (−32 %) | identical | 1123 MiB both |
+| parakeet q8_0 (repacks only on ARM) | 693 → 364 (−48 %) | 2033 → 1049 (−48 %) | 17645 → 7972 (−55 %, 8–37 s range both arms) | identical | 1460 MiB both |
+| parakeet q4pw-fullimx (mobile default) | 833 → 328 (−61 %) | 2502 → 1348 (−46 %) | 16242 → 6005 (−63 %, noisy) | identical | 942 / 943 MiB |
+| MOSS q4e8-fullimx | 5222 → 3250 (n=3, 2.9–41 s range) | 17214 → 13539 (9.6–50 s range) | — | identical | 2031 MiB both |
+| granite dynq4 | 22431 → 28805 (n=2, RTF 1.2–5, swapping) | 36816 → 42045 (n=2) | — | identical | 1763 MiB both |
+
+n = 6 warm runs per arm for Parakeet (3 invocations × 2), 3 for MOSS, 2 for
+Granite. qwen3 dynq4 was pushed but not run: the session was cut short,
+and the remaining battery went to #476.
+
+**First request.** With the page cache warm and no reclaim, the first
+request is the same in both arms: q4pw, 6 alternating fresh processes
+per arm, MemAvailable 6.5 GB, median 1180 ms off vs 1146 ms on. **Repack
+on has a heavy tail, though.** Over all Parakeet cold starts in this
+session, 5 of 15 took 12–35 s with repack on (12.1 s even at 6.5 GB
+available) against 0 of 15 with it off (max 3.1 s). Likely mechanism, not
+yet verified: the loader maps the GGUF `MAP_PRIVATE` + writable
+(`cpp/runtime/model_loader.cpp`), so repacking a weight in place turns its
+clean, droppable file pages into dirty anonymous pages. On a phone that is
+already swapping, those pages must be allocated, and later compressed to
+zram, instead of being dropped and re-read. Warm-run outliers (15.8 s on a
+q8_0 short clip) appeared on the repack arm too, but not only there.
+
+**Verdict per model.** All three Parakeet files are kept on: 32–63 %
+faster warm, transcripts identical, RSS unchanged. That includes q8_0,
+which x86 leaves untouched. MOSS: no change; the minimum times are
+consistently lower with repack on (short 2.9 vs 4.6 s, medium 9.6 vs
+13.9 s), but the medians are reclaim noise. Granite dynq4: inconclusive.
+It ran slower than real time in both arms while swapping, n = 2. No
+transcript changed, so the FLEURS ±0.2 gate does not apply. The
+first-request tail is filed as #496, a follow-up to scope (#382's "file an
+issue before the next release" clause). It matters for the CPU fallback
+and the first take after a model load on a phone under memory pressure.
