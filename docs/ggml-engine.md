@@ -53,10 +53,29 @@ reports "already applied" on a second run. The CPU engine, C API library,
 quantizer and native server build, and the CPU unit tests that need no golden
 data pass. CPU transcripts for Parakeet Q8_0, Parakeet Q4 and MOSS Q4 are
 byte-identical to v0.23.0 on the short, medium and long fixtures; Parakeet Q8_0
-with weight repacking off also matches on the short fixture. CUDA (sm_120) and
-Vulkan sources compile. The Vulkan check used Khronos headers, a stub loader
-and the NDK's glslc, so its executables were not linked. CUDA and Vulkan were not run for
-this upgrade.
+with weight repacking off also matches on the short fixture.
+
+On CUDA (RTX 5090, sm_120), transcripts match v0.23.0 byte for byte on the
+short, medium and long fixtures for every local ASR model: Parakeet BF16, Q4_K_M,
+Q8_0 and Q4 (token ids included), MOSS BF16 and Q4, ARK 3B and 0.6B, Granite
+BF16 and dynamic Q4, Qwen3 1.7B BF16 and dynamic Q4, and Qwen3 0.6B.
+`tests/test_ggml_parity.py` gives the same result on both versions: the MOSS
+medium and long exact-text gates fail on CUDA before and after; the manifest
+marks this CUDA contract unvalidated (`moss.intree.text` is `cuda:-`). ggml's
+`test-backend-ops` passes FLASH_ATTN_EXT, NORM, NORM_MUL_ADD, RMS_NORM, PAD,
+MUL_MAT and ARGMAX on CUDA0.
+
+Vulkan was built and linked against the LunarG SDK 1.4.357.0 and run on two
+Mesa drivers: Dozen (Vulkan over D3D12, on the same RTX 5090 under WSL2) and
+lavapipe. No RADV run was possible. Parakeet Q8_0 short and medium transcripts
+and token ids match v0.23.0 on both drivers, and on Dozen also match CUDA.
+Parakeet Q8_0 long is rejected on both drivers in both versions, and MOSS Q4
+aborts inside `ggml_backend_sched` on both drivers in both versions.
+`test-backend-ops` passes NORM, NORM_MUL_ADD, ARGMAX and RMS_NORM on both
+drivers. MUL_MAT fails nondeterministically in lavapipe's
+cooperative-matrix path and crashes on Dozen, the same with or without the
+patch series; with `GGML_VK_DISABLE_COOPMAT=1` all 2274 lavapipe MUL_MAT cases
+pass.
 
 v0.27.0 Vulkan builds also need the SPIRV-Headers CMake package, and its
 `spirv/unified1/spirv.hpp` must be on the default include path. The Vulkan
