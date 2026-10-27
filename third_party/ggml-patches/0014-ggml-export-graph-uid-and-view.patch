@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maximilian Scholz <dev.scholz@mailbox.org>
+Date: Tue, 27 Oct 2026 09:04:08 +0100
+Subject: [PATCH] ggml: export ggml_graph_next_uid and ggml_graph_view
+
+Shared ggml builds hide symbols by default since upstream 1308ac7b, so
+only GGML_API declarations leave libggml-base. Starling's ReplayGraph
+uses these two ggml-impl.h helpers: ggml_graph_next_uid gives each
+persistent graph the stable nonzero uid that the CUDA graph patches key
+on, and ggml_graph_view slices a graph for split compute. Mark both
+GGML_API like the other ggml-impl.h helpers used outside ggml-base.
+---
+ src/ggml-impl.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/ggml-impl.h b/src/ggml-impl.h
+index ae26e0c2..4487aec3 100644
+--- a/src/ggml-impl.h
++++ b/src/ggml-impl.h
+@@ -30,7 +30,7 @@ extern "C" {
+ 
+ void ggml_print_backtrace(void);
+ 
+-uint64_t ggml_graph_next_uid(void);
++GGML_API uint64_t ggml_graph_next_uid(void);
+ 
+ #ifndef MIN
+ #    define MIN(a, b) ((a) < (b) ? (a) : (b))
+@@ -361,7 +361,7 @@ struct ggml_cgraph {
+ // returns a slice of cgraph with nodes [i0, i1)
+ // the slice does not have leafs or gradients
+ // if you need the gradients, get them from the original graph
+-struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
++GGML_API struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
+ 
+ // ggml-alloc.c: true if the operation can reuse memory from its sources
+ GGML_API bool ggml_op_can_inplace(enum ggml_op op);

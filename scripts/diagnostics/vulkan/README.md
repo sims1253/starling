@@ -27,6 +27,10 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
 
 ## Findings (status of the Vulkan unlock)
 
+Patches 0009 and 0010 were dropped with the ggml v0.27.0 upgrade: upstream
+`3cbffc97` and `05987856` cover the same BF16 GEMV and batch-stride fixes.
+The harnesses below remain useful as regression probes.
+
 1. **Patch 0009 (bf16-y GEMV) is exact.** `test_bf16_gemv` compares
    `mul_mat(BF16 W, BF16 x)` CPU-vs-Vulkan: maxdiff 3.6e-07 (float epsilon;
    tighter than the f32-y control's f16-storage noise 4e-03). Before the
@@ -152,7 +156,6 @@ comparison. granite: same with `/tmp/stage_cmp_granite` and
   #43/#44/#45/#46 (the gate), and re-check the K-step K-sweep with patch
   0011 applied — the K=48/K=128 "topology-defect" inexactness may have
   been the same gallocr input-reuse bug (finding 5).
-- Optional upstream follow-up: ggml_vk_mul_mat_id_q_f16 /
-  ggml_vk_mul_mat_vec_id_q_f16 (MoE expert matmuls) still derive batch
-  strides from the contiguous assumption; no starling engine feeds them a
-  batch-strided operand, but the 0010 fix pattern applies.
+- ggml_vk_mul_mat_id_q_f16 / ggml_vk_mul_mat_vec_id_q_f16 (MoE expert
+  matmuls) read the batch stride from `nb[2]` since upstream `05987856`
+  (ggml v0.27.0).

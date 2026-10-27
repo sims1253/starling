@@ -1,9 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maximilian Scholz <dev.scholz@mailbox.org>
+Date: Tue, 27 Oct 2026 08:55:39 +0100
+Subject: [PATCH] cuda fused LayerNorm affine NORM MUL ADD
+
+---
+ src/ggml-cuda/ggml-cuda.cu |  63 +++++++
+ src/ggml-cuda/norm.cu      | 336 +++++++++++++++++++++++++++++++++++++
+ src/ggml-cuda/norm.cuh     |   7 +
+ 3 files changed, 406 insertions(+)
+
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index d22b5657..7a68fe2b 100644
+index 38387d6a..f4f1a69e 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -3024,6 +3024,54 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
-         return true;
+@@ -3535,6 +3535,59 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return bias == 0.0f && scale->type == GGML_TYPE_F32;
      }
  
 +    // Fused plain LayerNorm + affine: GGML_OP_NORM -> GGML_OP_MUL[+GGML_OP_ADD].
@@ -51,13 +62,18 @@ index d22b5657..7a68fe2b 100644
 +            return false;
 +        }
 +
++        //layer_norm_f32 maps channels/samples 1:1 to grid.y/z; leave larger shapes to the looping norm_f32
++        if (norm->ne[2] > UINT16_MAX || norm->ne[3] > UINT16_MAX) {
++            return false;
++        }
++
 +        return true;
 +    }
 +
      if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
       && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
          const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
-@@ -3836,6 +3884,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4416,6 +4469,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -75,10 +91,10 @@ index d22b5657..7a68fe2b 100644
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
 diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
-index 09d9f3a7..1e81a039 100644
+index d804b933..7775ff38 100644
 --- a/src/ggml-cuda/norm.cu
 +++ b/src/ggml-cuda/norm.cu
-@@ -38,6 +38,99 @@ static __global__ void norm_f32(
+@@ -46,6 +46,99 @@ static __global__ void norm_f32(
      }
  }
  
@@ -178,7 +194,7 @@ index 09d9f3a7..1e81a039 100644
  template <int block_size>
  static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
      // blockIdx.x: num_groups idx
-@@ -290,6 +383,97 @@ static void norm_f32_cuda(
+@@ -321,6 +414,97 @@ static void norm_f32_cuda(
      }
  }
  
@@ -276,7 +292,7 @@ index 09d9f3a7..1e81a039 100644
  static void group_norm_f32_cuda(
          const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
      if (group_size < 1024) {
-@@ -456,6 +640,158 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -489,6 +673,158 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
  }
  
@@ -436,7 +452,7 @@ index 09d9f3a7..1e81a039 100644
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *)src0->data;
 diff --git a/src/ggml-cuda/norm.cuh b/src/ggml-cuda/norm.cuh
-index a74f6376..c0ae32e0 100644
+index 95618df5..4d281d05 100644
 --- a/src/ggml-cuda/norm.cuh
 +++ b/src/ggml-cuda/norm.cuh
 @@ -2,6 +2,13 @@

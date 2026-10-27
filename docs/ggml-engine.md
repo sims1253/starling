@@ -15,36 +15,51 @@ parity results describe the tested inputs and backends, not all possible audio.
 
 ## ggml version and local patches
 
-The submodule is pinned to ggml **v0.23.0**,
-`e91ded11bdcd78c42f9c8d3978ff6686eb4c1226`, the upstream release and default-branch
-head checked on September 6, 2026. The upgrade from v0.22.0 retains all nine
-local patches: upstream has not replaced their behavior.
+The submodule is pinned to ggml **v0.27.0**,
+`a05c9922613c6a2230dbb1d0de679519ecafb4f0`, the upstream release checked on
+October 27, 2026. The upgrade from v0.23.0 keeps eight local patches, drops three
+that upstream now covers, and adds 0014.
 
 | Patch | Why it remains |
 | --- | --- |
 | 0001 | CUDA flash attention still needs per-head additive-mask addressing and dispatch. |
 | 0002 | Stable graph UIDs still need the shortcut around per-node replay validation. |
 | 0003 | CPU llamafile dispatch still loops over broadcast batches separately. |
-| 0006 | CUDA PAD still needs bounded grid dimensions with grid-stride iteration. |
 | 0007 | CUDA still lacks the plain LayerNorm + affine fusion used here. |
 | 0008 | Transient UID-zero graphs still need exclusion from CUDA graph capture. |
-| 0009 | Vulkan GEMV still rejects BF16 activations without the F32 staging conversion. |
-| 0010 | Vulkan matmul still assumes contiguous batch strides for in-place operands. |
 | 0011 | The allocator still permits reuse of input storage needed by repeated graph execution. |
+| 0012 | Vulkan still lacks the LayerNorm + affine fusion, argmax block size and tuning envs used here. |
+| 0013 | CPU graphs still end every tiny node with a full-pool barrier. |
+| 0014 | Shared ggml libraries hide internal symbols since upstream `1308ac7b`; Starling's graph replay needs `ggml_graph_next_uid` and `ggml_graph_view` exported. |
 
-Patches 0009 and 0010 use the renamed upstream staging flag
-`prealloc_y_last_k_padded`; their behavior is unchanged. The other seven apply
-without changes. Apply patches in filename order: 0008 depends on 0002, and
-0010 depends on 0009. Successful application alone does not establish runtime
-parity; CUDA and other accelerator changes require tests on those backends.
+| Dropped | Upstream replacement |
+| --- | --- |
+| 0006 | `03f0267b` CUDA: looped PAD kernel for more than 65535 rows or slices. |
+| 0009 | `3cbffc97` vulkan: support mulmat bf16 activations (GEMV widens BF16 to F32). |
+| 0010 | `05987856` vulkan: in-place `mul_mat`, `mul_mat_vec` and both `mul_mat_id` paths read the batch stride from `nb[2]`. |
 
-Upgrade checks on Linux: CPU and Vulkan engines, C API libraries, and native
-servers build. Native unit tests and 45 HTTP/WebSocket contract checks pass.
-Vulkan BF16 GEMV, batched/cache-view matmul, op, and mask probes pass on RADV
-RENOIR. Parakeet Q8_0 reproduces the short fixture transcript on two consecutive
-calls on both CPU and Vulkan; CPU also passes with llamafile enabled. CUDA
-compilation and runtime parity remain unverified on this machine, which has
-no CUDA toolkit or GPU.
+0002, 0003 and 0012 were rebased onto refactored upstream code without
+changing behavior. In 0012, `GGML_VK_FORCE_PIPE=s|m|l` now selects the
+smallest, middle or largest entry of upstream's ordered matmul tile list.
+0007 now declines the fusion when a tensor has more than 65535 channels or
+samples, leaving those shapes to upstream's looping norm kernel. Apply patches
+in filename order: 0008 depends on 0002. Successful application alone does not
+establish runtime parity; CUDA and other accelerator changes require tests on
+those backends.
+
+Upgrade checks on Linux: the series applies to a clean v0.27.0 checkout and
+reports "already applied" on a second run. The CPU engine, C API library,
+quantizer and native server build, and the CPU unit tests that need no golden
+data pass. CPU transcripts for Parakeet Q8_0, Parakeet Q4 and MOSS Q4 are
+byte-identical to v0.23.0 on the short, medium and long fixtures; Parakeet Q8_0
+with weight repacking off also matches on the short fixture. CUDA (sm_120) and
+Vulkan sources compile. The Vulkan check used Khronos headers, a stub loader
+and the NDK's glslc, so its executables were not linked. CUDA and Vulkan were not run for
+this upgrade.
+
+v0.27.0 Vulkan builds also need the SPIRV-Headers CMake package, and its
+`spirv/unified1/spirv.hpp` must be on the default include path. The Vulkan
+SDK provides both.
 
 ## Model and backend lifetime
 
@@ -397,20 +412,10 @@ Built with `-DSTARLING_GGML_VULKAN=ON` (`third_party/ggml/src/ggml-vulkan/`). Se
 with `STARLING_GGML_DEVICE=Vulkan0`. Targets the Intel/AMD/ARM GPUs CUDA can't
 reach. Same graph-replay path as CUDA/Metal.
 
-In-tree ggml patches 0009/0010/0011 (GEMV bf16 upcast, batch-strided
-mul_mat, galloc INPUT-storage reuse) carry the Vulkan-correctness story;
-the per-finding root-cause record is `scripts/diagnostics/vulkan/README.md`.
-Known upstream gap, deliberately NOT patched here: the `mul_mat_id`
-(MoE dispatch) variants `ggml_vk_mul_mat_id_q_f16` (wide) and
-`ggml_vk_mul_mat_vec_id_q_f16` (GEMV) still hardcode contiguous batch
-strides (`ne00*ne01` / `ne10*ne11`) for in-place operands, and the wide
-variant also falls back to `nb[0]`, which is not a batch stride.
-Patch 0010 removed these two defects from `mul_mat`. (The GEMV
-variant's y-stride fallback is already `nb[2]`-derived; its x batch
-stride is hardcoded inline in the push constants with no fallback.)
-Starling's engines never emit `mul_mat_id` (no MoE models), so it is
-untriggered; a MoE engine would need the same nb[2]-derived-stride
-treatment before its KV-cache views are trustworthy on Vulkan.
+In-tree ggml patch 0011 (galloc INPUT-storage reuse) and the upstream fixes
+that replaced patches 0009/0010 in v0.27.0 (GEMV BF16 activations,
+batch-strided `mul_mat`/`mul_mat_id`) carry the Vulkan-correctness story; the
+per-finding root-cause record is `scripts/diagnostics/vulkan/README.md`.
 
 ### HIP (AMD) / SYCL (Intel)
 
