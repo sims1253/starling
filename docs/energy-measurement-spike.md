@@ -64,7 +64,7 @@ subtracted, and a nominal 3.87 V to convert µAh to mWh.
 | 1 | 32 500 µAh / 230 s (141 µAh/s) | 90 000 / 57 500 µAh | 62 500 / 35 370 µAh over 192 s | 573 / 482 ms |
 | 2 | 12 500 µAh / 227 s (55 µAh/s) | 75 000 / 62 500 µAh | 65 000 / 56 134 µAh over 161 s | 570 / 392 ms |
 
-Per transcription that is: fast **0.56 / 0.61 mWh** net (0.87 / 0.73 raw)
+Per transcription that is: fast **0.56 / 0.60 mWh** net (0.87 / 0.73 raw)
 and ggml **0.34 / 0.54 mWh** net (0.60 / 0.63 raw). Per audio minute
 (× 60 / 7.43): fast 4.5–4.9 mWh (16–18 J) and ggml 2.8–4.4 mWh (10–16 J)
 net. The raw drain bounds them from above at 5.9–7.0 and 4.9–5.1 mWh.
