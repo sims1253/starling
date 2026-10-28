@@ -13,7 +13,7 @@ wayland-client = "0.31.15"
 wayland-scanner = "0.31.11"
 # The focused field's text over AT-SPI (#341); already in the app's tree,
 # same version and default features.
-zbus = "5.19"
+zbus = "6.1"
 serde = "1"
 
 [target."cfg(windows)".dependencies]
