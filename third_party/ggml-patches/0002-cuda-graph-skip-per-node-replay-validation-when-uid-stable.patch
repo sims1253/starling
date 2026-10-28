@@ -1,7 +1,7 @@
-From 6e795b67e3c85faab4bb83b02b53adbcbe067b85 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Maximilian Scholz <dev.scholz@mailbox.org>
 Date: Fri, 17 Jul 2026 10:22:18 +0200
-Subject: [PATCH 2/2] cuda/graph: skip per-node replay validation when uid is
+Subject: [PATCH] cuda/graph: skip per-node replay validation when uid is
  stable
 
 In ggml_backend_cuda_graph_compute, add a steady-state replay fast-path:
@@ -22,14 +22,14 @@ This mirrors the existing uid fast-path inside ggml_cuda_graph_update_required
 runs before it. Steady-state replay now collapses to a single cudaGraphLaunch
 with zero per-node host work, matching PyTorch graph.replay().
 ---
- src/ggml-cuda/ggml-cuda.cu | 68 ++++++++++++++++++++++++++------------
- 1 file changed, 47 insertions(+), 21 deletions(-)
+ src/ggml-cuda/ggml-cuda.cu | 74 +++++++++++++++++++++++++-------------
+ 1 file changed, 50 insertions(+), 24 deletions(-)
 
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index e25be359..c30cb336 100644
+index 7c45d0d1..38387d6a 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -4467,28 +4467,54 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4697,32 +4697,58 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
      if (graph->is_enabled()) {
@@ -41,7 +41,9 @@ index e25be359..c30cb336 100644
 -                // Warmup: need at least 2 calls with no property change on the 2nd call
 -                if (!properties_changed) {
 -                    graph->warmup_complete = true;
--                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+-                    if (ggml_cuda_graph_debug_enabled()) {
+-                        GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+-                    }
 -                    use_cuda_graph = true;
 -                    cuda_graph_update_required = true;
 -                }
@@ -51,7 +53,8 @@ index e25be359..c30cb336 100644
 -                if (properties_changed) {
 -                    // Properties changed - reset warmup, execute directly until stable again
 -                    graph->warmup_complete = false;
--                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+-                    if (ggml_cuda_graph_debug_enabled()) {
+-                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
 +        // Steady-state replay fast-path. When a graph has already completed
 +        // warmup AND carries a stable nonzero uid that matches the uid we saw
 +        // on the previous call, the graph is provably unchanged: its topology
@@ -85,10 +88,12 @@ index e25be359..c30cb336 100644
 +                    // Warmup: need at least 2 calls with no property change on the 2nd call
 +                    if (!properties_changed) {
 +                        graph->warmup_complete = true;
-+                        GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
++                        if (ggml_cuda_graph_debug_enabled()) {
++                            GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
++                        }
 +                        use_cuda_graph = true;
 +                        cuda_graph_update_required = true;
-+                    }
+                     }
 +                    // else: properties changed or first call - execute directly (use_cuda_graph stays false)
                  } else {
 -                    use_cuda_graph = true;
@@ -97,7 +102,9 @@ index e25be359..c30cb336 100644
 +                    if (properties_changed) {
 +                        // Properties changed - reset warmup, execute directly until stable again
 +                        graph->warmup_complete = false;
-+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
++                        if (ggml_cuda_graph_debug_enabled()) {
++                            GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
++                        }
 +                    } else {
 +                        use_cuda_graph = true;
 +                        cuda_graph_update_required = graph->instance == nullptr;
@@ -105,6 +112,3 @@ index e25be359..c30cb336 100644
                  }
              }
          }
--- 
-2.54.0
-

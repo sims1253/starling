@@ -1,6 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maximilian Scholz <dev.scholz@mailbox.org>
 Date: Thu, 3 Sep 2026 20:10:00 +0200
 Subject: [PATCH] galloc: never recycle INPUT-flagged tensor storage
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 ggml_gallocr's live-range reuse frees a tensor's chunk for reuse the
 moment its last in-graph consumer has been walked (n_children and
@@ -57,7 +61,7 @@ starling-issue: vulkan backend unlock
  1 file changed, 21 insertions(+)
 
 diff --git a/src/ggml-alloc.c b/src/ggml-alloc.c
-index a71838e..6cd954a 100644
+index b0c067b4..e7f7f8d6 100644
 --- a/src/ggml-alloc.c
 +++ b/src/ggml-alloc.c
 @@ -648,6 +648,15 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor

@@ -1,8 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maximilian Scholz <dev.scholz@mailbox.org>
+Date: Tue, 27 Oct 2026 08:55:39 +0100
+Subject: [PATCH] cuda fattn per head additive mask
+
+---
+ src/ggml-cuda/fattn-mma-f16.cuh | 14 ++++++++++----
+ src/ggml-cuda/fattn.cu          | 32 +++++++++++++++++++++++++++-----
+ 2 files changed, 37 insertions(+), 9 deletions(-)
+
 diff --git a/src/ggml-cuda/fattn-mma-f16.cuh b/src/ggml-cuda/fattn-mma-f16.cuh
-index 7f4cfd55..088a164e 100644
+index 296aa2b3..da119d52 100644
 --- a/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1814,8 +1814,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1918,8 +1918,11 @@ static __global__ void flash_attn_ext_f16(
  
          const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
          const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
@@ -16,7 +26,7 @@ index 7f4cfd55..088a164e 100644
          float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
  
          const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
-@@ -1860,8 +1863,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1967,8 +1970,11 @@ static __global__ void flash_attn_ext_f16(
  
      const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
      const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
@@ -31,10 +41,10 @@ index 7f4cfd55..088a164e 100644
  
      const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
 diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
-index ab7a3b29..389b9612 100644
+index 5fa3e530..1476d45a 100644
 --- a/src/ggml-cuda/fattn.cu
 +++ b/src/ggml-cuda/fattn.cu
-@@ -45,9 +45,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+@@ -202,9 +202,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
      float max_bias = 0.0f;
      memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
  
@@ -47,7 +57,7 @@ index ab7a3b29..389b9612 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -375,7 +376,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -557,7 +558,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
  
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -57,7 +67,7 @@ index ab7a3b29..389b9612 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -449,13 +451,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -625,13 +627,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
          return BEST_FATTN_KERNEL_NONE;
      }
  
@@ -83,7 +93,7 @@ index ab7a3b29..389b9612 100644
  
      // If Turing tensor cores are available, use them:
      if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-@@ -492,6 +504,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -673,6 +685,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
          if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
              return BEST_FATTN_KERNEL_VEC;
          }
@@ -94,7 +104,7 @@ index ab7a3b29..389b9612 100644
          if (Q->ne[1] * gqa_ratio_eff <= 16) {
              return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
          }
-@@ -530,6 +546,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -715,6 +731,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              }
          }
      }

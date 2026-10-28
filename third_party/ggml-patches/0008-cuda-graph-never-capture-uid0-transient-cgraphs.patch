@@ -12,9 +12,11 @@ engine rebuilds per call; capturing them replays stale buffer addresses
  src/ggml-cuda/ggml-cuda.cu | 11 +++++++++--
  1 file changed, 9 insertions(+), 2 deletions(-)
 
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index f4f1a69e..628c6163 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -4745,10 +4745,17 @@
+@@ -4756,10 +4756,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  #ifdef USE_CUDA_GRAPH
      graph_key = ggml_cuda_graph_get_key(cgraph);
  

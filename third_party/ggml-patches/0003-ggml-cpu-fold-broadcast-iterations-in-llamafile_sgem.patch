@@ -1,7 +1,7 @@
-From df85e58e4cb2e266ca23d0f62cd7c0e341f6d326 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ettore Di Giacinto <mudler@localai.io>
 Date: Tue, 26 May 2026 14:48:29 +0000
-Subject: [PATCH 1/2] ggml-cpu: fold broadcast iterations in llamafile_sgemm
+Subject: [PATCH] ggml-cpu: fold broadcast iterations in llamafile_sgemm
  dispatch
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -33,10 +33,10 @@ repo. Profile shows MUL_MAT per-iteration time drops from ~367ms to
  1 file changed, 124 insertions(+), 6 deletions(-)
 
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index cd5c61a8..51c2a18c 100644
+index ab82e3d6..64c458a3 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1290,17 +1290,87 @@ void ggml_compute_forward_mul_mat(
+@@ -1305,17 +1305,87 @@ void ggml_compute_forward_mul_mat(
  
      const bool src1_cont = ggml_is_contiguous(src1);
  
@@ -50,7 +50,7 @@ index cd5c61a8..51c2a18c 100644
 +     * thread utilization on small N strictly dominate the actual FMA work.
 +     * Folding the 16 windows into a single N=1616 call gives 4-5x speedup on
 +     * those shapes (see git log for measurements). */
-     if (src1_cont) {
+     if (!params->use_ref && src1_cont) {
 +        const size_t ts_src0 = ggml_type_size(src0->type);
 +        const size_t ts_src1 = ggml_type_size(src1->type);
 +        const size_t ts_dst  = ggml_type_size(dst->type);
@@ -127,8 +127,8 @@ index cd5c61a8..51c2a18c 100644
                                       src0->type,
                                       src1->type,
                                       dst->type))
-@@ -1358,17 +1428,65 @@ UseGgmlGemm1:;
-     if (src1->type != vec_dot_type) {
+@@ -1387,17 +1457,65 @@ UseGgmlGemm1:;
+     if (!params->use_ref && src1->type != vec_dot_type) {
          const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 +        const size_t ts_src0 = ggml_type_size(src0->type);
@@ -196,6 +196,3 @@ index cd5c61a8..51c2a18c 100644
                                       src0->type,
                                       vec_dot_type,
                                       dst->type))
--- 
-2.43.0
-
