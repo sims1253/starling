@@ -777,7 +777,7 @@ mod live {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use zbus::blocking::{Connection, Proxy};
+    use zbus::{Connection, Proxy};
 
     use super::{
         AudioFacts, GLOBAL_SHORTCUTS, PortalBackend, PortalFacts, env, parse_portal_file,
@@ -788,38 +788,48 @@ mod live {
     const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 
     pub(super) fn portal() -> Result<PortalFacts, String> {
-        let connection = Connection::session().map_err(|err| format!("no session bus ({err})"))?;
-        let introspectable = Proxy::new(
-            &connection,
-            PORTAL,
-            PORTAL_PATH,
-            "org.freedesktop.DBus.Introspectable",
-        )
-        .map_err(|err| err.to_string())?;
-        let xml: String = introspectable
-            .call("Introspect", &())
-            .map_err(|err| format!("xdg-desktop-portal does not answer ({err})"))?;
-        let interfaces = interface_names(&xml);
-        let global_shortcuts_version = interfaces
-            .iter()
-            .any(|name| name == GLOBAL_SHORTCUTS)
-            .then(|| {
-                let properties = Proxy::new(
-                    &connection,
-                    PORTAL,
-                    PORTAL_PATH,
-                    "org.freedesktop.DBus.Properties",
-                )
-                .ok()?;
-                let value: zbus::zvariant::OwnedValue = properties
-                    .call("Get", &(GLOBAL_SHORTCUTS, "version"))
+        zbus::block_on(async {
+            let connection = Connection::session()
+                .await
+                .map_err(|err| format!("no session bus ({err})"))?;
+            let introspectable = Proxy::new(
+                &connection,
+                PORTAL,
+                PORTAL_PATH,
+                "org.freedesktop.DBus.Introspectable",
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            let xml: String = introspectable
+                .call("Introspect", &())
+                .await
+                .map_err(|err| format!("xdg-desktop-portal does not answer ({err})"))?;
+            let interfaces = interface_names(&xml);
+            let global_shortcuts_version = if interfaces.iter().any(|name| name == GLOBAL_SHORTCUTS)
+            {
+                async {
+                    let properties = Proxy::new(
+                        &connection,
+                        PORTAL,
+                        PORTAL_PATH,
+                        "org.freedesktop.DBus.Properties",
+                    )
+                    .await
                     .ok()?;
-                u32::try_from(value).ok()
+                    let value: zbus::zvariant::OwnedValue = properties
+                        .call("Get", &(GLOBAL_SHORTCUTS, "version"))
+                        .await
+                        .ok()?;
+                    u32::try_from(value).ok()
+                }
+                .await
+            } else {
+                None
+            };
+            Ok(PortalFacts {
+                interfaces,
+                global_shortcuts_version,
             })
-            .flatten();
-        Ok(PortalFacts {
-            interfaces,
-            global_shortcuts_version,
         })
     }
 
@@ -834,36 +844,43 @@ mod live {
     }
 
     pub(super) fn atspi() -> Result<(), String> {
-        let connection = Connection::session().map_err(|err| format!("no session bus ({err})"))?;
-        let bus = Proxy::new(&connection, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
-            .map_err(|err| err.to_string())?;
-        let address: String = bus
-            .call("GetAddress", &())
-            .map_err(|err| format!("org.a11y.Bus does not answer ({err})"))?;
-        zbus::blocking::connection::Builder::address(address.as_str())
-            .and_then(|builder| builder.build())
-            .map(drop)
-            .map_err(|err| format!("its bus at {address} refused the connection ({err})"))
+        zbus::block_on(async {
+            let connection = Connection::session()
+                .await
+                .map_err(|err| format!("no session bus ({err})"))?;
+            let bus = Proxy::new(&connection, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
+                .await
+                .map_err(|err| err.to_string())?;
+            let address: String = bus
+                .call("GetAddress", &())
+                .await
+                .map_err(|err| format!("org.a11y.Bus does not answer ({err})"))?;
+            zbus::connection::Builder::address(address.as_str())
+                .build()
+                .await
+                .map(drop)
+                .map_err(|err| format!("its bus at {address} refused the connection ({err})"))
+        })
     }
 
     /// Whether IBus and Fcitx 5 own their names on the session bus.
     pub(super) fn input_method_names() -> (bool, bool) {
-        let Ok(connection) = Connection::session() else {
-            return (false, false);
-        };
-        let Ok(bus) = zbus::blocking::fdo::DBusProxy::new(&connection) else {
-            return (false, false);
-        };
-        let owned = |name: &str| {
-            zbus::names::BusName::try_from(name)
-                .ok()
-                .and_then(|name| bus.name_has_owner(name).ok())
-                .unwrap_or(false)
-        };
-        (
-            owned("org.freedesktop.IBus") || owned("org.freedesktop.portal.IBus"),
-            owned("org.fcitx.Fcitx5"),
-        )
+        zbus::block_on(async {
+            let Ok(connection) = Connection::session().await else {
+                return (false, false);
+            };
+            let Ok(bus) = zbus::fdo::DBusProxy::new(&connection).await else {
+                return (false, false);
+            };
+            let owned = async |name: &str| match zbus::names::BusName::try_from(name) {
+                Ok(name) => bus.name_has_owner(name).await.unwrap_or(false),
+                Err(_) => false,
+            };
+            (
+                owned("org.freedesktop.IBus").await || owned("org.freedesktop.portal.IBus").await,
+                owned("org.fcitx.Fcitx5").await,
+            )
+        })
     }
 
     pub(super) fn portal_backends(desktops: &[String]) -> Vec<PortalBackend> {
@@ -973,4 +990,3 @@ impl StarlingApp {
         ))
     }
 }
-

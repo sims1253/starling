@@ -561,7 +561,7 @@ mod dbus {
         let connecting = async {
             match address {
                 Some(address) => {
-                    zbus::connection::Builder::address(address.as_str())?
+                    zbus::connection::Builder::address(address.as_str())
                         .build()
                         .await
                 }
@@ -1053,9 +1053,8 @@ mod dbus {
             let portal = bounded(async {
                 zbus::proxy::Builder::<Proxy<'static>>::new(&connection)
                     .destination(DESTINATION)
-                    .and_then(|b| b.path(PATH))
-                    .and_then(|b| b.interface(INTERFACE))
-                    .map_err(|err| err.to_string())?
+                    .path(PATH)
+                    .interface(INTERFACE)
                     .cache_properties(CacheProperties::No)
                     .build()
                     .await
@@ -1109,8 +1108,8 @@ mod dbus {
                         .await?;
                     let rule = zbus::MatchRule::builder()
                         .msg_type(zbus::message::Type::Signal)
-                        .sender(owner)?
-                        .build();
+                        .sender(owner)
+                        .build()?;
                     let signals =
                         zbus::MessageStream::for_match_rule(rule, &connection, None).await?;
                     Ok::<_, zbus::Error>((signals, owner_changes))

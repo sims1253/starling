@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use starling_insertion::atspi::{
-    AtspiReader, States, ROLE_PASSWORD_TEXT, STATE_ACTIVE, STATE_EDITABLE, STATE_FOCUSED,
-    STATE_READ_ONLY, STATE_SHOWING,
+    AtspiReader, ROLE_PASSWORD_TEXT, STATE_ACTIVE, STATE_EDITABLE, STATE_FOCUSED, STATE_READ_ONLY,
+    STATE_SHOWING, States,
 };
 use starling_insertion::{BackendKind, FieldReader, Surrounding, SurroundingText, TargetSnapshot};
-use zbus::blocking::Connection;
+use zbus::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
 const ROOT: &str = "/org/a11y/atspi/accessible/root";
@@ -72,10 +72,12 @@ impl PrivateBus {
     }
 
     fn connect(&self) -> Connection {
-        zbus::blocking::connection::Builder::address(self.address.as_str())
-            .unwrap()
-            .build()
-            .unwrap()
+        zbus::block_on(async {
+            zbus::connection::Builder::address(self.address.as_str())
+                .build()
+                .await
+                .unwrap()
+        })
     }
 }
 
@@ -236,134 +238,141 @@ impl App {
 /// `roles`: one field per role, the first focused. `collection`: whether
 /// the window implements `Collection` (GTK 3 does, GTK 4 does not).
 fn app(bus: &PrivateBus, roles: &[u32], collection: bool) -> App {
-    let connection = bus.connect();
-    let name = connection.unique_name().unwrap().to_string();
-    let server = connection.object_server();
-    let path = |p: &str| OwnedObjectPath::try_from(p.to_string()).unwrap();
-    let shared = |v: Vec<u32>| Arc::new(Mutex::new(v));
+    zbus::block_on(async {
+        let connection = bus.connect();
+        let name = connection.unique_name().unwrap().to_string();
+        let server = connection.object_server();
+        let path = |p: &str| OwnedObjectPath::try_from(p.to_string()).unwrap();
+        let shared = |v: Vec<u32>| Arc::new(Mutex::new(v));
 
-    let mut fields = Vec::new();
-    for (index, role) in roles.iter().enumerate() {
-        let field_path = format!("/org/a11y/atspi/accessible/field{index}");
-        let mut states = vec![STATE_SHOWING, STATE_EDITABLE];
-        if index == 0 {
-            states.push(STATE_FOCUSED);
+        let mut fields = Vec::new();
+        for (index, role) in roles.iter().enumerate() {
+            let field_path = format!("/org/a11y/atspi/accessible/field{index}");
+            let mut states = vec![STATE_SHOWING, STATE_EDITABLE];
+            if index == 0 {
+                states.push(STATE_FOCUSED);
+            }
+            let field = Field {
+                path: field_path.clone(),
+                states: shared(states),
+                content: Arc::new(Mutex::new(String::new())),
+                caret: Arc::new(Mutex::new(0)),
+                selection: Arc::new(Mutex::new(None)),
+                text_calls: Arc::new(AtomicUsize::new(0)),
+                caret_moves: Arc::default(),
+            };
+            server
+                .at(
+                    field_path.as_str(),
+                    Node {
+                        role: *role,
+                        states: field.states.clone(),
+                        children: Arc::default(),
+                    },
+                )
+                .await
+                .unwrap();
+            server
+                .at(
+                    field_path.as_str(),
+                    Text {
+                        content: field.content.clone(),
+                        caret: field.caret.clone(),
+                        selection: field.selection.clone(),
+                        text_calls: field.text_calls.clone(),
+                        caret_moves: field.caret_moves.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            fields.push(field);
         }
-        let field = Field {
-            path: field_path.clone(),
-            states: shared(states),
-            content: Arc::new(Mutex::new(String::new())),
-            caret: Arc::new(Mutex::new(0)),
-            selection: Arc::new(Mutex::new(None)),
-            text_calls: Arc::new(AtomicUsize::new(0)),
-            caret_moves: Arc::default(),
-        };
+
+        let panel = "/org/a11y/atspi/accessible/panel";
+        let field_children: Children = fields
+            .iter()
+            .map(|field| (name.clone(), path(&field.path)))
+            .collect();
         server
             .at(
-                field_path.as_str(),
+                panel,
                 Node {
-                    role: *role,
-                    states: field.states.clone(),
-                    children: Arc::default(),
+                    role: 39,
+                    states: shared(vec![STATE_SHOWING]),
+                    children: Arc::new(Mutex::new(field_children)),
                 },
             )
+            .await
             .unwrap();
-        server
-            .at(
-                field_path.as_str(),
-                Text {
-                    content: field.content.clone(),
-                    caret: field.caret.clone(),
-                    selection: field.selection.clone(),
-                    text_calls: field.text_calls.clone(),
-                    caret_moves: field.caret_moves.clone(),
-                },
-            )
-            .unwrap();
-        fields.push(field);
-    }
 
-    let panel = "/org/a11y/atspi/accessible/panel";
-    let field_children: Children = fields
-        .iter()
-        .map(|field| (name.clone(), path(&field.path)))
-        .collect();
-    server
-        .at(
-            panel,
-            Node {
-                role: 39,
-                states: shared(vec![STATE_SHOWING]),
-                children: Arc::new(Mutex::new(field_children)),
-            },
-        )
-        .unwrap();
-
-    let window = "/org/a11y/atspi/accessible/window";
-    let window_states = shared(vec![STATE_SHOWING, STATE_ACTIVE]);
-    server
-        .at(
-            window,
-            Node {
-                role: 23,
-                states: window_states.clone(),
-                children: Arc::new(Mutex::new(vec![(name.clone(), path(panel))])),
-            },
-        )
-        .unwrap();
-    if collection {
+        let window = "/org/a11y/atspi/accessible/window";
+        let window_states = shared(vec![STATE_SHOWING, STATE_ACTIVE]);
         server
             .at(
                 window,
-                Collection {
-                    fields: fields
-                        .iter()
-                        .map(|field| (path(&field.path), field.states.clone()))
-                        .collect(),
-                    owner: name.clone(),
+                Node {
+                    role: 23,
+                    states: window_states.clone(),
+                    children: Arc::new(Mutex::new(vec![(name.clone(), path(panel))])),
                 },
             )
+            .await
             .unwrap();
-    }
-    server
-        .at(
-            ROOT,
-            Node {
-                role: 75,
-                states: shared(Vec::new()),
-                children: Arc::new(Mutex::new(vec![(name.clone(), path(window))])),
-            },
-        )
-        .unwrap();
-    drop(server);
-    App {
-        connection,
-        window_states,
-        fields,
-    }
+        if collection {
+            server
+                .at(
+                    window,
+                    Collection {
+                        fields: fields
+                            .iter()
+                            .map(|field| (path(&field.path), field.states.clone()))
+                            .collect(),
+                        owner: name.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        server
+            .at(
+                ROOT,
+                Node {
+                    role: 75,
+                    states: shared(Vec::new()),
+                    children: Arc::new(Mutex::new(vec![(name.clone(), path(window))])),
+                },
+            )
+            .await
+            .unwrap();
+        App {
+            connection,
+            window_states,
+            fields,
+        }
+    })
 }
 
 /// The registry root listing `apps`.
 fn registry(bus: &PrivateBus, apps: &[&App]) -> Connection {
-    let children: Children = apps
-        .iter()
-        .map(|app| (app.name(), OwnedObjectPath::try_from(ROOT).unwrap()))
-        .collect();
-    zbus::blocking::connection::Builder::address(bus.address.as_str())
-        .unwrap()
-        .name("org.a11y.atspi.Registry")
-        .unwrap()
-        .serve_at(
-            ROOT,
-            Node {
-                role: 14,
-                states: Arc::default(),
-                children: Arc::new(Mutex::new(children)),
-            },
-        )
-        .unwrap()
-        .build()
-        .unwrap()
+    zbus::block_on(async {
+        let children: Children = apps
+            .iter()
+            .map(|app| (app.name(), OwnedObjectPath::try_from(ROOT).unwrap()))
+            .collect();
+        zbus::connection::Builder::address(bus.address.as_str())
+            .name("org.a11y.atspi.Registry")
+            .serve_at(
+                ROOT,
+                Node {
+                    role: 14,
+                    states: Arc::default(),
+                    children: Arc::new(Mutex::new(children)),
+                },
+            )
+            .build()
+            .await
+            .unwrap()
+    })
 }
 
 /// A target of this process (every scripted app runs in it), or without a

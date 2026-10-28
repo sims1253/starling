@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 # default features.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.14.0", features = ["randr"] }
-zbus = "5.19"
+zbus = "6.1"
 
 # ... and keeps it on top without taking focus on Windows, which gpui's
 # pop-up windows do not do by themselves (same versions as gpui's).

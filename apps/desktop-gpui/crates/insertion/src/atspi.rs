@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use zbus::blocking::Connection;
+use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use crate::{FieldAnchor, FieldReader, Surrounding, SurroundingText, TargetSnapshot};
@@ -122,23 +122,31 @@ impl AtspiReader {
     pub fn new(excluded_pids: Vec<u32>) -> AtspiReader {
         AtspiReader::with_connect(
             Box::new(|| {
-                let address = match std::env::var("AT_SPI_BUS_ADDRESS") {
-                    Ok(address) if !address.is_empty() => address,
-                    _ => {
-                        let session = zbus::blocking::connection::Builder::session()?
-                            .method_timeout(CALL_TIMEOUT)
-                            .build()?;
-                        let reply = session.call_method(
-                            Some("org.a11y.Bus"),
-                            "/org/a11y/bus",
-                            Some("org.a11y.Bus"),
-                            "GetAddress",
-                            &(),
-                        )?;
-                        reply.body().deserialize::<String>()?
-                    }
-                };
-                open(&address)
+                zbus::block_on(async {
+                    let address = match std::env::var("AT_SPI_BUS_ADDRESS") {
+                        Ok(address) if !address.is_empty() => address,
+                        _ => {
+                            let session = zbus::connection::Builder::session()
+                                .method_timeout(CALL_TIMEOUT)
+                                .build()
+                                .await?;
+                            let reply = session
+                                .call_method(
+                                    Some("org.a11y.Bus"),
+                                    "/org/a11y/bus",
+                                    Some("org.a11y.Bus"),
+                                    "GetAddress",
+                                    &(),
+                                )
+                                .await?;
+                            reply.body().deserialize::<String>()?
+                        }
+                    };
+                    zbus::connection::Builder::address(address.as_str())
+                        .method_timeout(CALL_TIMEOUT)
+                        .build()
+                        .await
+                })
             }),
             excluded_pids,
         )
@@ -180,7 +188,7 @@ impl AtspiReader {
         };
         match body(&Bus(&connection)) {
             Ok(value) => Some(value),
-            Err(error @ zbus::Error::MethodError(..)) => {
+            Err(error @ (zbus::Error::MethodError(..) | zbus::Error::FDO(_))) => {
                 log::debug!("AT-SPI call failed: {error}");
                 None
             }
@@ -293,9 +301,11 @@ impl FieldReader for AtspiReader {
 }
 
 fn open(address: &str) -> zbus::Result<Connection> {
-    zbus::blocking::connection::Builder::address(address)?
-        .method_timeout(CALL_TIMEOUT)
-        .build()
+    zbus::block_on(
+        zbus::connection::Builder::address(address)
+            .method_timeout(CALL_TIMEOUT)
+            .build(),
+    )
 }
 
 /// The last `count` characters of `text` (a toolkit counting offsets in
@@ -338,9 +348,11 @@ impl Bus<'_> {
         B: serde::Serialize + zbus::zvariant::DynamicType,
         R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
     {
-        let reply = self
-            .0
-            .call_method(Some(name), path, Some(interface), method, body)?;
+        let reply =
+            zbus::block_on(
+                self.0
+                    .call_method(Some(name), path, Some(interface), method, body),
+            )?;
         reply.body().deserialize::<R>()
     }
 
@@ -362,7 +374,7 @@ impl Bus<'_> {
             "Get",
             &(interface, property),
         )?;
-        T::try_from(value).map_err(|error| zbus::Error::Variant(error.into()))
+        T::try_from(value).map_err(|error| error.into())
     }
 
     fn pid(&self, name: &str) -> zbus::Result<u32> {
@@ -431,7 +443,9 @@ impl Bus<'_> {
                 Ok(first)
             }
             // No Collection (GTK 4, some Qt versions): walk the tree.
-            Err(zbus::Error::MethodError(..)) => self.walk_for_focus(name, window),
+            Err(zbus::Error::MethodError(..) | zbus::Error::FDO(_)) => {
+                self.walk_for_focus(name, window)
+            }
             Err(error) => Err(error),
         }
     }
