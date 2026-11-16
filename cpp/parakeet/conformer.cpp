@@ -252,7 +252,9 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
                                             /*s0*/1, /*s1*/1, /*p0*/pad, /*p1*/0,
                                             /*d0*/1, /*d1*/1);
     // r is [OW=T, OH=1, C, 1] with cwhn strides: element (c, t) at t*D + c.
-    ggml_tensor* dwt = ggml_view_2d(ctx, r, D, T, (size_t)D * sizeof(float), 0);
+    // Permuting C back to axis 0 restores contiguous [C,T] strides (a free
+    // view); ggml >= 1.0 rejects a strided view of r itself (nb[0] != 4).
+    ggml_tensor* dwt = ggml_reshape_2d(ctx, ggml_permute(ctx, r, 1, 2, 0, 3), D, T);
     ggml_tensor* dwb = clone_weight_opt_s(ctx, ml, pre + "conv.depthwise_conv.bias");
     if (dwb) dwt = ggml_add(ctx, dwt, dwb);                      // broadcast [C] over T
 

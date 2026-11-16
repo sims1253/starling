@@ -27,7 +27,7 @@
 // ggml-impl.h is ggml's internal header (under third_party/ggml/src/); it's the
 // only place the cgraph `uid` field is declared. The public ggml.h leaves
 // ggml_cgraph opaque. The uid lets ggml-cuda skip its O(n_nodes) per-replay
-// memcmp (patch 0002) — load-bearing for ReplayGraph's steady-state perf.
+// compatibility walk and memcmp — load-bearing for ReplayGraph's steady-state perf.
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -878,8 +878,8 @@ ReplayGraph::ReplayGraph(Backend& backend,
         if (out_) {
             ggml_set_output(out_);
             gf_ = ggml_new_graph_custom(ctx_, kGraphSize, false);
-            // Stable uid: lets ggml-cuda skip its O(n_nodes) per-replay memcmp
-            // (patch 0002: "skip per-node replay validation when uid is stable").
+            // Stable uid: lets ggml-cuda skip its O(n_nodes) per-replay
+            // validation, and only uid != 0 graphs may be captured (patch 0008).
             gf_->uid = ggml_graph_next_uid();
             ggml_build_forward_expand(gf_, out_);
             for (const auto& c : pcap) ggml_build_forward_expand(gf_, c.t);

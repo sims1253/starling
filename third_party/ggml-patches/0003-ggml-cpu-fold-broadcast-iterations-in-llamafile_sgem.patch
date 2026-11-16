@@ -33,10 +33,10 @@ repo. Profile shows MUL_MAT per-iteration time drops from ~367ms to
  1 file changed, 124 insertions(+), 6 deletions(-)
 
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index ab82e3d6..64c458a3 100644
+index a76af848..a3aad420 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1305,17 +1305,87 @@ void ggml_compute_forward_mul_mat(
+@@ -1317,17 +1317,87 @@ void ggml_compute_forward_mul_mat(
  
      const bool src1_cont = ggml_is_contiguous(src1);
  
@@ -127,7 +127,7 @@ index ab82e3d6..64c458a3 100644
                                       src0->type,
                                       src1->type,
                                       dst->type))
-@@ -1387,17 +1457,65 @@ UseGgmlGemm1:;
+@@ -1399,17 +1469,65 @@ UseGgmlGemm1:;
      if (!params->use_ref && src1->type != vec_dot_type) {
          const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
