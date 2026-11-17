@@ -92,7 +92,7 @@ index fed14ddf..169f0c19 100644
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
 diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
-index 3f0ea6f2..f2e00ff3 100644
+index 3f0ea6f2..86bf9578 100644
 --- a/src/ggml-cuda/norm.cu
 +++ b/src/ggml-cuda/norm.cu
 @@ -46,6 +46,100 @@ static __global__ void norm_f32(
@@ -105,8 +105,8 @@ index 3f0ea6f2..f2e00ff3 100644
 +// and then applies the per-row affine y = (x-mean)*inv_std[*mul][+add] in fp32 in
 +// the SAME kernel. Byte-exact with running GGML_OP_NORM -> GGML_OP_MUL ->
 +// [GGML_OP_ADD] as separate nodes: the reduction matches norm_f32 bit-for-bit
-+// (same float2 partial sums, same block_reduce), and the affine is a plain fp32
-+// multiply/add on the already-normalized value. The mul/add tensor strides
++// (same float2 partial sums, same block_reduce), and the affine rounds the mul
++// and add separately (__fmul_rn/__fadd_rn: no FMA). The mul/add tensor strides
 +// mirror rms_norm_f32 (broadcast via fastmodulo over row/channel/sample/col).
 +template <int block_size, bool do_multiply = false, bool do_add = false>
 +static __global__ void layer_norm_f32(const float * x,
