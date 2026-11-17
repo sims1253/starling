@@ -15,69 +15,70 @@ parity results describe the tested inputs and backends, not all possible audio.
 
 ## ggml version and local patches
 
-The submodule is pinned to ggml **v0.27.0**,
-`a05c9922613c6a2230dbb1d0de679519ecafb4f0`, the upstream release checked on
-October 27, 2026. The upgrade from v0.23.0 keeps eight local patches, reduces
-0010 to its ALIGNED-pipeline guard, drops two that upstream now covers, and adds
-0014.
+The submodule is pinned to ggml **v1.0.0**,
+`417a024b4fb6bc3116d41af7c067166a039bdf12`, tagged upstream on November 13,
+2026. The upgrade from v0.27.0 keeps nine local patches and drops 0002.
 
 | Patch | Why it remains |
 | --- | --- |
 | 0001 | CUDA flash attention still needs per-head additive-mask addressing and dispatch. |
-| 0002 | Stable graph UIDs still need the shortcut around per-node replay validation. |
 | 0003 | CPU llamafile dispatch still loops over broadcast batches separately. |
 | 0007 | CUDA still lacks the plain LayerNorm + affine fusion used here. |
 | 0008 | Transient UID-zero graphs still need exclusion from CUDA graph capture. |
-| 0010 | Reduced to its guard: upstream `05987856` passes the real `nb[2]` batch stride, but still picks the ALIGNED `mul_mat` pipelines without checking that the stride divides by the vector-load width. |
+| 0010 | Upstream still picks the ALIGNED `mul_mat` pipelines without checking that the batch stride divides by the vector-load width. |
 | 0011 | The allocator still permits reuse of input storage needed by repeated graph execution. |
 | 0012 | Vulkan still lacks the LayerNorm + affine fusion, argmax block size and tuning envs used here. |
 | 0013 | CPU graphs still end every tiny node with a full-pool barrier. |
-| 0014 | Shared ggml libraries hide internal symbols since upstream `1308ac7b`; Starling's graph replay needs `ggml_graph_next_uid` and `ggml_graph_view` exported. |
+| 0014 | Starling's graph replay needs `ggml_graph_next_uid` and `ggml_graph_view` exported from the shared libraries. |
 
 | Dropped | Upstream replacement |
 | --- | --- |
-| 0006 | `03f0267b` CUDA: looped PAD kernel for more than 65535 rows or slices. |
-| 0009 | `3cbffc97` vulkan: support mulmat bf16 activations (GEMV widens BF16 to F32). |
+| 0002 | `1c9ac9d8` CUDA: skip graph compat check when graph is being reused. A matching nonzero graph UID now skips the per-node walk upstream. |
 
-0002, 0003 and 0012 were rebased onto refactored upstream code without
-changing behavior. In 0012, `GGML_VK_FORCE_PIPE=s|m|l` now selects the
-smallest, middle or largest entry of upstream's ordered matmul tile list.
-0007 now declines the fusion when a tensor has more than 65535 channels or
-samples, leaving those shapes to upstream's looping norm kernel. Apply patches
-in filename order: 0008 depends on 0002. Successful application alone does not
-establish runtime parity; CUDA and other accelerator changes require tests on
-those backends.
+0001, 0008 and 0012 were rebased onto refactored upstream code without
+changing behavior. 0001 keeps upstream's new sparse K/V row gather
+(`kv_rows`) on its MMA-only path and applies the per-head mask only where that
+path does not. 0008 now sits on upstream's per-key CUDA graph state. Apply
+patches in filename order. Successful application alone does not establish
+runtime parity; CUDA and other accelerator changes require tests on those
+backends.
 
-Upgrade checks on Linux: the series applies to a clean v0.27.0 checkout and
+v1.0.0 asserts that a strided view's source is contiguous along axis 0
+(`8bdd9c3f`). Parakeet's GPU depthwise convolution therefore permutes the
+channels-last convolution output back to `[C, T]` before reshaping it, instead
+of viewing it with strides. The bytes and the graph cost are unchanged.
+
+Upgrade checks on Linux: the series applies to a clean v1.0.0 checkout and
 reports "already applied" on a second run. The CPU engine, C API library,
 quantizer and native server build, and the CPU unit tests that need no golden
-data pass. CPU transcripts for Parakeet Q8_0, Parakeet Q4 and MOSS Q4 are
-byte-identical to v0.23.0 on the short, medium and long fixtures; Parakeet Q8_0
-with weight repacking off also matches on the short fixture.
+data pass. CPU transcripts match v0.27.0 byte for byte for Parakeet Q8_0 and Q4
+on the short, medium and long fixtures, Parakeet Q8_0 with weight repacking off
+on short, MOSS Q4 and Granite dynamic Q4 on short and medium, and Qwen3 0.6B
+and ARK 0.6B on short.
 
-On CUDA (RTX 5090, sm_120), transcripts match v0.23.0 byte for byte on the
-short, medium and long fixtures for every local ASR model: Parakeet BF16, Q4_K_M,
-Q8_0 and Q4 (token ids included), MOSS BF16 and Q4, ARK 3B and 0.6B, Granite
-BF16 and dynamic Q4, Qwen3 1.7B BF16 and dynamic Q4, and Qwen3 0.6B.
-`tests/test_ggml_parity.py` gives the same result on both versions: the MOSS
-medium and long exact-text gates fail on CUDA before and after; the manifest
-marks this CUDA contract unvalidated (`moss.intree.text` is `cuda:-`). ggml's
-`test-backend-ops` passes FLASH_ATTN_EXT, NORM, NORM_MUL_ADD, RMS_NORM, PAD,
-MUL_MAT and ARGMAX on CUDA0.
+Vulkan was run on RADV (AMD Renoir iGPU, Mesa). Transcripts match v0.27.0 byte
+for byte for Parakeet Q8_0 on the short, medium and long fixtures, Parakeet Q4,
+MOSS Q4, Granite dynamic Q4, Qwen3 0.6B and ARK 0.6B on short and medium.
+`test-backend-ops` passes NORM, NORM_MUL_ADD, RMS_NORM, ARGMAX,
+FLASH_ATTN_EXT and MUL_MAT on Vulkan0.
 
-Vulkan was built and linked against the LunarG SDK 1.4.357.0 and run on two
-Mesa drivers: Dozen (Vulkan over D3D12, on the same RTX 5090 under WSL2) and
-lavapipe. No RADV run was possible. Parakeet Q8_0 short and medium transcripts
-and token ids match v0.23.0 on both drivers, and on Dozen also match CUDA.
-Parakeet Q8_0 long is rejected on both drivers in both versions, and MOSS Q4
-aborts inside `ggml_backend_sched` on both drivers in both versions.
-`test-backend-ops` passes NORM, NORM_MUL_ADD, ARGMAX and RMS_NORM on both
-drivers. MUL_MAT fails nondeterministically in lavapipe's
-cooperative-matrix path and crashes on Dozen, the same with or without the
-patch series; with `GGML_VK_DISABLE_COOPMAT=1` all 2274 lavapipe MUL_MAT cases
-pass.
+CUDA was run on an RTX 5090 (CUDA 13.4). Transcripts match v0.27.0 for
+Parakeet BF16, Q8_0, Q4 and Q4_K_M, Bark Pro Q4, Granite Q8_0 and MOSS Q8_0 on
+the short, medium and long fixtures. `test-backend-ops` passes FLASH_ATTN_EXT,
+NORM, NORM_MUL_ADD, RMS_NORM, MUL_MAT, ARGMAX and PAD on CUDA0. CUDA graphs still cut
+Parakeet Q8_0 long from about 610 ms to 78 ms. MOSS BF16 and Q4, ARK, Granite
+BF16 and dynamic Q4, and Qwen3 were not run on CUDA.
 
-v0.27.0 Vulkan builds also need the SPIRV-Headers CMake package, and its
+0007's fused LayerNorm used to compute `normed * mul + add` in one expression,
+which nvcc contracts into a single FMA. The fused result then differed from
+separate MUL and ADD by up to 1 ulp. On v1.0.0 that was enough to change one
+word of the MOSS Q8_0 long transcript, after upstream's vectorized RMS norm
+(`02c69c40`) moved the decoder's rounding. The kernel now rounds the multiply
+and the add separately with `__fmul_rn` and `__fadd_rn`. All 65 fused sites
+then match the unfused ops bit for bit, and MOSS long matches v0.27.0 and the
+BF16 reference again.
+
+Vulkan builds need the SPIRV-Headers CMake package, and its
 `spirv/unified1/spirv.hpp` must be on the default include path. The Vulkan
 SDK provides both.
 

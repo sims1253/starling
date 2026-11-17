@@ -4,23 +4,24 @@ Date: Tue, 27 Oct 2026 08:55:39 +0100
 Subject: [PATCH] cuda fused LayerNorm affine NORM MUL ADD
 
 ---
- src/ggml-cuda/ggml-cuda.cu |  63 +++++++
- src/ggml-cuda/norm.cu      | 336 +++++++++++++++++++++++++++++++++++++
+ src/ggml-cuda/ggml-cuda.cu |  64 +++++++
+ src/ggml-cuda/norm.cu      | 337 +++++++++++++++++++++++++++++++++++++
  src/ggml-cuda/norm.cuh     |   7 +
- 3 files changed, 406 insertions(+)
+ 3 files changed, 408 insertions(+)
 
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 38387d6a..f4f1a69e 100644
+index fed14ddf..169f0c19 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -3535,6 +3535,59 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4211,6 +4211,60 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
          return bias == 0.0f && scale->type == GGML_TYPE_F32;
      }
  
 +    // Fused plain LayerNorm + affine: GGML_OP_NORM -> GGML_OP_MUL[+GGML_OP_ADD].
 +    // Mirrors the GGML_OP_RMS_NORM branch above; dispatched to layer_norm_f32,
 +    // which is byte-exact with running the three ops separately (same fp32
-+    // mean/var reduction as norm_f32, same fp32 affine as mul/add). Strictness is
++    // mean/var reduction as norm_f32, and the affine uses __fmul_rn/__fadd_rn so
++    // nvcc cannot contract it into an FMA that mul/add would not do). Strictness is
 +    // the same as the rms_norm fusion: only fp32, only contiguous-rows operands,
 +    // and no broadcast when norm is the B operand of the mul.
 +    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL) {
@@ -73,7 +74,7 @@ index 38387d6a..f4f1a69e 100644
      if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
       && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
          const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
-@@ -4416,6 +4469,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5134,6 +5188,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -91,10 +92,10 @@ index 38387d6a..f4f1a69e 100644
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
 diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
-index d804b933..7775ff38 100644
+index 3f0ea6f2..86bf9578 100644
 --- a/src/ggml-cuda/norm.cu
 +++ b/src/ggml-cuda/norm.cu
-@@ -46,6 +46,99 @@ static __global__ void norm_f32(
+@@ -46,6 +46,100 @@ static __global__ void norm_f32(
      }
  }
  
@@ -104,8 +105,8 @@ index d804b933..7775ff38 100644
 +// and then applies the per-row affine y = (x-mean)*inv_std[*mul][+add] in fp32 in
 +// the SAME kernel. Byte-exact with running GGML_OP_NORM -> GGML_OP_MUL ->
 +// [GGML_OP_ADD] as separate nodes: the reduction matches norm_f32 bit-for-bit
-+// (same float2 partial sums, same block_reduce), and the affine is a plain fp32
-+// multiply/add on the already-normalized value. The mul/add tensor strides
++// (same float2 partial sums, same block_reduce), and the affine rounds the mul
++// and add separately (__fmul_rn/__fadd_rn: no FMA). The mul/add tensor strides
 +// mirror rms_norm_f32 (broadcast via fastmodulo over row/channel/sample/col).
 +template <int block_size, bool do_multiply = false, bool do_add = false>
 +static __global__ void layer_norm_f32(const float * x,
@@ -181,7 +182,8 @@ index d804b933..7775ff38 100644
 +        if constexpr (do_multiply && do_add) {
 +            const int mul_col = fastmodulo(col, mul_ncols_packed);
 +            const int add_col = fastmodulo(col, add_ncols_packed);
-+            dst[col]          = normed * mul[mul_col] + add[add_col];
++            // Explicit rounding: no FMA contraction, so this matches separate MUL and ADD.
++            dst[col]          = __fadd_rn(__fmul_rn(normed, mul[mul_col]), add[add_col]);
 +        } else if constexpr (do_multiply) {
 +            const int mul_col = fastmodulo(col, mul_ncols_packed);
 +            dst[col]          = normed * mul[mul_col];
@@ -194,7 +196,7 @@ index d804b933..7775ff38 100644
  template <int block_size>
  static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
      // blockIdx.x: num_groups idx
-@@ -321,6 +414,97 @@ static void norm_f32_cuda(
+@@ -372,6 +466,97 @@ static void norm_f32_cuda(
      }
  }
  
@@ -292,7 +294,7 @@ index d804b933..7775ff38 100644
  static void group_norm_f32_cuda(
          const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
      if (group_size < 1024) {
-@@ -489,6 +673,158 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -569,6 +754,158 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
  }
  

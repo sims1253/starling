@@ -26,28 +26,28 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
 ---
  src/ggml-vulkan/ggml-vulkan-types.h           |   1 +
  src/ggml-vulkan/ggml-vulkan.cpp               | 161 +++++++++++++++++-
- .../vulkan-shaders/norm_affine.comp           |  67 ++++++++
+ .../vulkan-shaders/norm_affine.comp           |  69 ++++++++
  .../vulkan-shaders/vulkan-shaders-gen.cpp     |   2 +
- 4 files changed, 227 insertions(+), 4 deletions(-)
+ 4 files changed, 229 insertions(+), 4 deletions(-)
  create mode 100644 src/ggml-vulkan/vulkan-shaders/norm_affine.comp
 
 diff --git a/src/ggml-vulkan/ggml-vulkan-types.h b/src/ggml-vulkan/ggml-vulkan-types.h
-index a41ce596..b8c3b0b5 100644
+index 81fd5b8a..10ede647 100644
 --- a/src/ggml-vulkan/ggml-vulkan-types.h
 +++ b/src/ggml-vulkan/ggml-vulkan-types.h
-@@ -845,6 +845,7 @@ struct vk_device_struct {
+@@ -877,6 +877,7 @@ struct vk_device_struct {
      vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
      vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
      vk_pipeline pipeline_norm_f32;
 +    vk_pipeline pipeline_norm_mul_add_f32;   // [starling] fused LN + affine
      vk_pipeline pipeline_group_norm_f32;
-     vk_pipeline pipeline_rms_norm_f32;
-     vk_pipeline pipeline_rms_norm_mul_f32;
+     std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
+     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index 436bfe3b..439a5118 100644
+index 1548997f..44811951 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -1141,6 +1141,13 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
+@@ -1150,6 +1150,13 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
      return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
  }
  
@@ -61,7 +61,7 @@ index 436bfe3b..439a5118 100644
  void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
      VK_LOG_DEBUG("ggml_vk_sync_buffers()");
  
-@@ -1150,6 +1157,22 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
+@@ -1159,6 +1166,22 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
          ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
      }
  
@@ -84,25 +84,25 @@ index 436bfe3b..439a5118 100644
      subctx->s->buffer->buf.pipelineBarrier(
          subctx->p->q->stage_flags,
          subctx->p->q->stage_flags,
-@@ -3252,6 +3275,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -3453,6 +3476,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
      ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
  
-     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1, true);
 +        // [starling] fused LayerNorm + affine: A=x, B=g, C=bias, D=dst
 +        ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_mul_add_f32_len, norm_mul_add_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
      ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
  
-     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
-@@ -3549,7 +3574,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     const bool rms_subgroups = (device->vendor_id == VK_VENDOR_ID_INTEL || device->vendor_id == VK_VENDOR_ID_NVIDIA || device->vendor_id == VK_VENDOR_ID_AMD) && device->subgroup_arithmetic && device->subgroup_require_full_support;
+@@ -3760,7 +3785,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
      }
  
 -    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { 512 }, 1);
  
-     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
      ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
-@@ -6024,12 +6049,36 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipel
+@@ -6361,12 +6386,36 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipel
      return &it->second;
  }
  
@@ -139,7 +139,7 @@ index 436bfe3b..439a5118 100644
      return (aligned && configs[idx].aligned) ? configs[idx].aligned : configs[idx].unaligned;
  }
  
-@@ -6039,6 +6088,7 @@ static uint32_t ggml_vk_guess_matmul_pipeline_align_map(ggml_backend_vk_context
+@@ -6376,6 +6425,7 @@ static uint32_t ggml_vk_guess_matmul_pipeline_align_map(ggml_backend_vk_context
      auto& selector = mul_mat_id ? ctx->device->matmul_id_tile_selector : ctx->device->matmul_tile_selector;
      uint32_t idx = selector(m, n, 0, ctx->device->shader_core_count, configs);
      if (idx >= configs.size()) idx = (uint32_t)configs.size() - 1;
@@ -147,7 +147,7 @@ index 436bfe3b..439a5118 100644
      return configs[idx].align;
  }
  
-@@ -10744,6 +10794,51 @@ void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
+@@ -11198,6 +11248,51 @@ void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
      ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, std::move(p));
  }
  
@@ -199,7 +199,7 @@ index 436bfe3b..439a5118 100644
  void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
      const int * int_op_params = (const int *)dst->op_params;
      const float * float_op_params = (const float *)dst->op_params;
-@@ -12551,7 +12646,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+@@ -12985,7 +13080,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
  
          break;
      case GGML_OP_NORM:
@@ -212,7 +212,7 @@ index 436bfe3b..439a5118 100644
  
          break;
      case GGML_OP_GROUP_NORM:
-@@ -13587,6 +13686,45 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
+@@ -14067,6 +14166,45 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
          return false;
      }
  
@@ -258,9 +258,9 @@ index 436bfe3b..439a5118 100644
      if ((ops.size() == 2 || ops.size() == 3 || ops.size() == 4) &&
          ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
          // additional constraints specific to this fusion
-@@ -14363,6 +14501,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
-     }
-     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+@@ -14845,6 +14983,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     uint64_t flops_per_submit = ctx->last_total_flops < 1'000'000'000ULL ? 0 :
+         std::clamp(ctx->last_total_flops / 40u, std::min<uint64_t>(100'000'000ULL, flops_cap), flops_cap);
  
 +    // [starling] env override for the submit batching threshold: a large value
 +    // (e.g. 999999) effectively disables mid-graph submits -> one command
@@ -273,7 +273,7 @@ index 436bfe3b..439a5118 100644
      auto const submit_after = [&](int start, int end) {
          if (ctx->device->serialize_submissions) {
              try {
-@@ -14429,8 +14575,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14911,8 +15057,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
          ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
          const char *fusion_string {};
          if (!ctx->device->disable_fusion) {
@@ -293,10 +293,10 @@ index 436bfe3b..439a5118 100644
                  std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
 diff --git a/src/ggml-vulkan/vulkan-shaders/norm_affine.comp b/src/ggml-vulkan/vulkan-shaders/norm_affine.comp
 new file mode 100644
-index 00000000..62982b09
+index 00000000..44885e48
 --- /dev/null
 +++ b/src/ggml-vulkan/vulkan-shaders/norm_affine.comp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,69 @@
 +#version 450
 +
 +#include "types.glsl"
@@ -335,6 +335,8 @@ index 00000000..62982b09
 +    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
 +    const uint tid = gl_LocalInvocationID.x;
 +
++    if (row >= p.ne01 * p.ne02 * p.ne03) { return; }
++
 +    const uint a_base = row * p.ne00;
 +    const uint d_base = row * p.ne20;
 +
@@ -365,7 +367,7 @@ index 00000000..62982b09
 +    }
 +}
 diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index f5450154..063c2ef7 100644
+index 7ccccfa1..cbeaa824 100644
 --- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 @@ -852,6 +852,8 @@ void process_shaders() {
@@ -375,5 +377,5 @@ index f5450154..063c2ef7 100644
 +    // [starling] fused LayerNorm + affine (NORM -> MUL -> ADD)
 +    string_to_spv("norm_mul_add_f32", "norm_affine.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
      string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
-     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
-     string_to_spv("rms_norm_mul_add_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
+     for (bool use_subgroups : {false, true}) {
+         const std::string suffix = use_subgroups ? "_subgroup" : "";

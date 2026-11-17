@@ -61,10 +61,10 @@ starling-issue: vulkan backend unlock
  1 file changed, 21 insertions(+)
 
 diff --git a/src/ggml-alloc.c b/src/ggml-alloc.c
-index b0c067b4..e7f7f8d6 100644
+index 65d2bea2..93c25610 100644
 --- a/src/ggml-alloc.c
 +++ b/src/ggml-alloc.c
-@@ -648,6 +648,15 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+@@ -645,6 +645,15 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                      continue;
                  }
  
@@ -80,7 +80,7 @@ index b0c067b4..e7f7f8d6 100644
                  if (!ggml_are_same_layout(node, parent)) {
                      AT_PRINTF("not reusing parent %s for %s as layouts are different\n", parent->name, node->name);
                      continue;
-@@ -695,6 +704,18 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
+@@ -692,6 +701,18 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
          return;
      }
  

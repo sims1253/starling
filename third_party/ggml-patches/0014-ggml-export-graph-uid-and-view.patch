@@ -14,7 +14,7 @@ GGML_API like the other ggml-impl.h helpers used outside ggml-base.
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/src/ggml-impl.h b/src/ggml-impl.h
-index ae26e0c2..4487aec3 100644
+index 7c6a605a..806ccc18 100644
 --- a/src/ggml-impl.h
 +++ b/src/ggml-impl.h
 @@ -30,7 +30,7 @@ extern "C" {
@@ -26,7 +26,7 @@ index ae26e0c2..4487aec3 100644
  
  #ifndef MIN
  #    define MIN(a, b) ((a) < (b) ? (a) : (b))
-@@ -361,7 +361,7 @@ struct ggml_cgraph {
+@@ -368,7 +368,7 @@ struct ggml_cgraph {
  // returns a slice of cgraph with nodes [i0, i1)
  // the slice does not have leafs or gradients
  // if you need the gradients, get them from the original graph
