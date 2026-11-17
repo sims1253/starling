@@ -62,8 +62,23 @@ MOSS Q4, Granite dynamic Q4, Qwen3 0.6B and ARK 0.6B on short and medium.
 `test-backend-ops` passes NORM, NORM_MUL_ADD, RMS_NORM, ARGMAX,
 FLASH_ATTN_EXT and MUL_MAT on Vulkan0.
 
-CUDA was only compiled (CUDA 13.0, sm_120); no NVIDIA GPU was available, so
-0001, 0007 and 0008 are untested at runtime on v1.0.0.
+CUDA was run on an RTX 5090 (CUDA 13.4). Transcripts match v0.27.0 for
+Parakeet BF16, Q8_0, Q4 and Q4_K_M, Bark Pro Q4, Granite Q8_0 and MOSS Q8_0 on
+the short, medium and long fixtures. The one exception is Parakeet Q4_K_M
+long, where the versions differ only at blank positions whose scores nearly
+tie. `test-backend-ops` passes FLASH_ATTN_EXT, NORM,
+NORM_MUL_ADD, RMS_NORM, MUL_MAT, ARGMAX and PAD on CUDA0. CUDA graphs still cut
+Parakeet Q8_0 long from about 610 ms to 78 ms. MOSS BF16 and Q4, ARK, Granite
+BF16 and dynamic Q4, and Qwen3 were not run on CUDA.
+
+0007's fused LayerNorm used to compute `normed * mul + add` in one expression,
+which nvcc contracts into a single FMA. The fused result then differed from
+separate MUL and ADD by up to 1 ulp. On v1.0.0 that was enough to change one
+word of the MOSS Q8_0 long transcript, after upstream's vectorized RMS norm
+(`02c69c40`) moved the decoder's rounding. The kernel now rounds the multiply
+and the add separately with `__fmul_rn` and `__fadd_rn`. All 65 fused sites
+then match the unfused ops bit for bit, and MOSS long matches v0.27.0 and the
+BF16 reference again.
 
 Vulkan builds need the SPIRV-Headers CMake package, and its
 `spirv/unified1/spirv.hpp` must be on the default include path. The Vulkan
