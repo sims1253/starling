@@ -100,7 +100,7 @@ jobs:
       - name: Read the native dependency revision
         id: ggml
         run: echo "sha=$(git rev-parse HEAD:third_party/ggml)" >> "$GITHUB_OUTPUT"
-      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607 # v1.2.25
         with:
           # Shared with android-emulator.yml; compiler/ABI/flags are part
           # of ccache's object identity, not just this archive key.
