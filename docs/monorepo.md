@@ -161,6 +161,7 @@ not copied into the apps or substituted for Starling's own engine.
 | [llamafile](https://github.com/mozilla-ai/llamafile) | How can native serving and model distribution become easier to install? |
 | [handy-keys](https://github.com/handy-computer/handy-keys) | How should shortcuts behave across platform constraints? |
 | [Wispr Flow](https://wisprflow.ai/), [Monologue](https://www.monologue.to/) | Where do polished dictation workflows help, and where can automatic edits undermine trust? |
+| [Superwhisper](https://superwhisper.com/) (teardown: [superwhisper-teardown.md](superwhisper-teardown.md)) | What does a shipped multi-platform dictation product teach about cleanup contracts, insertion verification, model capability metadata, and vocabulary biasing? |
 
 ## Next product milestones
 
