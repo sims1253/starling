@@ -77,7 +77,7 @@ jobs:
       # through ccache once it is on PATH (GGML_CCACHE). A ggml or patch
       # change starts a new key but still restores the previous cache;
       # only master pushes save.
-      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607
+      - uses: hendrikmuhs/ccache-action@e91f31892a1d1b8c44424b1a94c0b7f52d337168
         with:
           key: arm64-${{ matrix.arch }}-${{ steps.ggml.outputs.sha }}-${{ hashFiles('third_party/ggml-patches/**') }}
           restore-keys: arm64-${{ matrix.arch }}
@@ -130,7 +130,7 @@ jobs:
       # through ccache once it is on PATH (GGML_CCACHE). A ggml or patch
       # change starts a new key but still restores the previous cache;
       # only master pushes save.
-      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607
+      - uses: hendrikmuhs/ccache-action@e91f31892a1d1b8c44424b1a94c0b7f52d337168
         with:
           key: build-cpu-${{ steps.ggml.outputs.sha }}-${{ hashFiles('third_party/ggml-patches/**') }}
           restore-keys: build-cpu
